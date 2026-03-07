@@ -3,6 +3,8 @@ import secrets
 from pymongo import MongoClient
 from config import MANGODB_URI
 
+GUILD_ID = 1241797935100989594
+
 client = MongoClient(MANGODB_URI)
 db = client["vadrifts_bots"]
 keys_collection = db["discord_keys"]
