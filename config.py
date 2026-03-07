@@ -3,3 +3,4 @@ import os
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 STICKIED_BOT_TOKEN = os.environ.get("STICKIED_BOT_TOKEN")
 DISCORD_KEY_API_SECRET = os.environ.get("DISCORD_KEY_API_SECRET")
+MANGODB_URI = os.environ.get("MANGODB_URI")
