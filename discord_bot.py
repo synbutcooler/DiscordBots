@@ -281,8 +281,10 @@ async def on_ready():
         print(f"Cleaned up {expired} expired keys from database")
 
     try:
-        await asyncio.sleep(2)
-        synced = await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+        await asyncio.sleep(5)
+        guild = discord.Object(id=GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
         print(f"Synced {len(synced)} guild commands")
     except discord.HTTPException as e:
         if e.status == 429:
