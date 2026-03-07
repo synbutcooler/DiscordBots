@@ -20,7 +20,6 @@ GUILD_ID = 1241797935100989594
 DELAY_SECONDS = 1
 BOOST_TEST_CHANNEL_ID = 1270301984897110148
 
-DISCORD_KEYS_FILE = "discord_keys.json"
 DISCORD_KEY_EXPIRY_HOURS = 24
 
 intents = discord.Intents.default()
@@ -34,22 +33,6 @@ pending_tasks = {}
 last_meow_count = None
 cute_symbols = [">///<", "^-^", "o///o", "x3"]
 submitted_hwids = {}
-
-
-def load_discord_keys():
-    if os.path.exists(DISCORD_KEYS_FILE):
-        try:
-            with open(DISCORD_KEYS_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-
-def save_discord_keys(data):
-    with open(DISCORD_KEYS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
 
 def generate_discord_key():
     return secrets.token_hex(16)
