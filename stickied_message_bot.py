@@ -1,25 +1,10 @@
 import os
-import json
 import time
-import redis
 import discord
 import asyncio
 from discord.ext import commands
 from discord import Embed, app_commands
 from config import STICKIED_TOKEN
-
-REDIS_URL = os.environ.get("REDIS_URL")
-if not REDIS_URL:
-    print("❌ REDIS_URL not set! Data will NOT persist between restarts.")
-    r = None
-else:
-    try:
-        r = redis.from_url(REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
-        r.ping()
-        print("✅ Connected to Redis")
-    except Exception as e:
-        print(f"❌ Redis connection failed: {e}")
-        r = None
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -29,28 +14,8 @@ bot = commands.Bot(command_prefix="?", intents=intents)
 
 stickied_messages = {}
 
-def save_data():
-    if r:
-        try:
-            r.set("stickied_messages", json.dumps(stickied_messages))
-        except Exception as e:
-            print(f"❌ Redis save failed: {e}")
-
-def load_data():
-    global stickied_messages
-    if r:
-        try:
-            raw = r.get("stickied_messages")
-            stickied_messages = json.loads(raw) if raw else {}
-            print(f"✅ Loaded {len(stickied_messages)} stickied channels from Redis")
-            return
-        except Exception as e:
-            print(f"❌ Redis load failed: {e}")
-    stickied_messages = {}
-
 @bot.event
 async def on_ready():
-    load_data()
     print(f'Stickied bot logged in as {bot.user}')
     try:
         await asyncio.sleep(3)
@@ -127,7 +92,6 @@ async def stick(
         "webhook_name": webhook_name,
         "webhook_avatar": webhook_avatar
     }
-    save_data()
 
     try:
         if use_webhook:
@@ -143,7 +107,6 @@ async def stick(
 
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-        save_data()
 
         await interaction.followup.send(f"✅ Stickied message set in {target_channel.mention}!")
     except Exception as e:
@@ -164,7 +127,6 @@ async def stick_prefix(ctx, *, message: str):
         "webhook_name": None,
         "webhook_avatar": None
     }
-    save_data()
 
     try:
         await ctx.message.delete()
@@ -175,7 +137,6 @@ async def stick_prefix(ctx, *, message: str):
         msg = await ctx.channel.send(message)
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-        save_data()
 
         confirm = await ctx.send("✅ Stickied message set!")
         await confirm.delete(delay=3)
@@ -196,7 +157,6 @@ async def set_cooldown(ctx, seconds: int):
         return
 
     stickied_messages[channel_key]["cooldown"] = seconds
-    save_data()
 
     try:
         await ctx.message.delete()
@@ -221,7 +181,6 @@ async def stick_webhook_prefix(ctx, webhook_name: str, *, message: str):
         "webhook_name": webhook_name,
         "webhook_avatar": None
     }
-    save_data()
 
     try:
         await ctx.message.delete()
@@ -237,7 +196,6 @@ async def stick_webhook_prefix(ctx, webhook_name: str, *, message: str):
         )
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-        save_data()
 
         confirm = await ctx.send("✅ Stickied webhook message set!")
         await confirm.delete(delay=3)
@@ -258,7 +216,6 @@ async def unstick_prefix(ctx):
                 pass
 
         del stickied_messages[channel_key]
-        save_data()
 
         try:
             await ctx.message.delete()
@@ -310,7 +267,6 @@ async def stickembed(
         "webhook_name": webhook_name,
         "webhook_avatar": webhook_avatar
     }
-    save_data()
 
     try:
         embed = create_embed_from_data(embed_data)
@@ -328,7 +284,6 @@ async def stickembed(
 
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-        save_data()
 
         await interaction.followup.send(f"✅ Stickied embed set in {target_channel.mention}!")
     except Exception as e:
@@ -351,7 +306,6 @@ async def unstick(interaction: discord.Interaction, channel: discord.TextChannel
                 pass
 
         del stickied_messages[channel_key]
-        save_data()
         await interaction.followup.send(f"✅ Stickied message removed from {target_channel.mention}.")
     else:
         await interaction.followup.send(f"❌ No stickied message in {target_channel.mention}.")
@@ -513,7 +467,6 @@ async def on_message(message):
 
             stickied_messages[channel_key]["last_message"] = new_msg.id
             stickied_messages[channel_key]["last_sent"] = time.time()
-            save_data()
         except Exception as e:
             print(f"Error sending stickied message: {e}")
 
