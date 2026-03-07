@@ -22,7 +22,7 @@ OWNER_ID = 1144213765424947251
 DELAY_SECONDS = 1
 BOOST_TEST_CHANNEL_ID = 1270301984897110148
 
-DISCORD_KEY_EXPIRY_HOURS = 24
+DISCORD_KEY_EXPIRY_HOURS = 336
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -124,8 +124,9 @@ async def authenticate(interaction: discord.Interaction):
 
 @bot.tree.command(name="getkey", description="Generate your unique script key.", guild=discord.Object(id=GUILD_ID))
 async def getkey(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("This command is currently restricted to administrators.", ephemeral=True)
+    verified_role = interaction.guild.get_role(1270298463078453249)
+    if verified_role not in interaction.user.roles:
+        await interaction.response.send_message("You need the Verified role to use this command.", ephemeral=True)
         return
 
     key = create_key_for_user(interaction.user.id, interaction.user.name, DISCORD_KEY_EXPIRY_HOURS)
@@ -145,11 +146,11 @@ async def getkey(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
 @bot.tree.command(name="resetkey", description="Reset your key and HWID lock.", guild=discord.Object(id=GUILD_ID))
 async def resetkey(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("This command is currently restricted to administrators.", ephemeral=True)
+    verified_role = interaction.guild.get_role(1270298463078453249)
+    if verified_role not in interaction.user.roles:
+        await interaction.response.send_message("You need the Verified role to use this command.", ephemeral=True)
         return
 
     count = delete_keys_by_discord_id(interaction.user.id)
