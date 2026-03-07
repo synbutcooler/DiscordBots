@@ -11,14 +11,14 @@ from key_store import (
     create_key_for_user,
     delete_keys_by_discord_id,
     get_stats,
-    cleanup_expired
+    cleanup_expired,
+    GUILD_ID
 )
 
 TARGET_CHANNEL_ID = 1389210900489044048
 AUTH_CHANNEL_ID = 1287714060716081183
 LOG_CHANNEL_ID = 1270314848764559494
 OWNER_ID = 1144213765424947251
-GUILD_ID = 1241797935100989594
 DELAY_SECONDS = 1
 BOOST_TEST_CHANNEL_ID = 1270301984897110148
 
@@ -129,6 +129,11 @@ async def getkey(interaction: discord.Interaction):
         return
 
     key = create_key_for_user(interaction.user.id, interaction.user.name, DISCORD_KEY_EXPIRY_HOURS)
+
+    if not key:
+        await interaction.response.send_message("Key generation failed. Database may be unavailable. Contact the owner.", ephemeral=True)
+        return
+
     expires_timestamp = int(time.time() + (DISCORD_KEY_EXPIRY_HOURS * 3600))
 
     embed = discord.Embed(title="\U0001f511 Your Script Key", color=discord.Color.green())
