@@ -86,7 +86,7 @@ def validate_discord_key():
 if __name__ == '__main__':
     import threading
 
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
 
     def start_bots_delayed():
         time.sleep(5)
