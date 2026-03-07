@@ -1,11 +1,11 @@
 import os
 import time
-import json
 import logging
 import requests
 from flask import Flask, request, jsonify
 from config import DISCORD_TOKEN, DISCORD_KEY_API_SECRET
-from discord_bot import start_bot, load_discord_keys, save_discord_keys, GUILD_ID
+from key_store import get_key, delete_key, lock_hwid, GUILD_ID
+from discord_bot import start_bot
 from stickied_message_bot import start_stickied_bot
 
 logging.basicConfig(
@@ -16,22 +16,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
-
-def check_discord_membership(discord_id):
-    try:
-        headers = {
-            "Authorization": f"Bot {DISCORD_TOKEN}"
-        }
-        url = f"https://discord.com/api/v10/guilds/{GUILD_ID}/members/{discord_id}"
-        resp = requests.get(url, headers=headers, timeout=10)
-        logger.info(f"Discord membership check for {discord_id}: status {resp.status_code}")
-        if resp.status_code != 200:
-            logger.warning(f"Discord membership check failed: {resp.text[:200]}")
-        return resp.status_code == 200
-    except Exception as e:
-        logger.error(f"Discord membership check exception: {e}")
-        return False
 
 
 @app.route('/health')
@@ -52,24 +36,22 @@ def validate_discord_key():
         return jsonify({"valid": False, "message": "No data provided"})
 
     secret = data.get("secret", "")
-    key = data.get("key", "")
+    key_value = data.get("key", "")
     hwid = data.get("hwid", "")
 
     if secret != DISCORD_KEY_API_SECRET:
         return jsonify({"valid": False, "message": "Unauthorized"})
 
-    if not key or not hwid:
+    if not key_value or not hwid:
         return jsonify({"valid": False, "message": "Missing key or HWID"})
 
-    keys = load_discord_keys()
-    key_data = keys.get(key)
+    key_data = get_key(key_value)
 
     if not key_data:
         return jsonify({"valid": False, "message": "Invalid key"})
 
     if time.time() > key_data.get("expires_at", 0):
-        del keys[key]
-        save_discord_keys(keys)
+        delete_key(key_value)
         return jsonify({"valid": False, "message": "Key expired. Run /getkey in Discord."})
 
     discord_id = key_data.get("discord_id")
@@ -83,8 +65,7 @@ def validate_discord_key():
         logger.info(f"Discord membership check for {discord_id}: status {resp.status_code}")
 
         if resp.status_code == 404:
-            del keys[key]
-            save_discord_keys(keys)
+            delete_key(key_value)
             return jsonify({"valid": False, "message": "You must be in the Discord server."})
         elif resp.status_code != 200:
             logger.warning(f"Discord API returned {resp.status_code}, not deleting key")
@@ -97,9 +78,7 @@ def validate_discord_key():
         return jsonify({"valid": False, "message": "Key is locked to a different device. Use /resetkey in Discord."})
 
     if not key_data.get("hwid"):
-        key_data["hwid"] = hwid
-        keys[key] = key_data
-        save_discord_keys(keys)
+        lock_hwid(key_value, hwid)
 
     return jsonify({"valid": True, "message": "Authenticated"})
 
