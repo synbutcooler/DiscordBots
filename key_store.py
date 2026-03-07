@@ -2,7 +2,7 @@ import time
 import secrets
 import logging
 from pymongo import MongoClient
-from config import MANGODB_URI
+from config import MONGODB_URI
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +15,10 @@ keys_collection = None
 def init_db():
     global client, db, keys_collection
     try:
-        if not MANGODB_URI:
-            logger.error("MANGODB_URI is not set!")
+        if not MONGODB_URI:
+            logger.error("MONGODB_URI is not set!")
             return False
-        client = MongoClient(MANGODB_URI, serverSelectionTimeoutMS=5000)
+        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         client.admin.command('ping')
         db = client["vadrifts_bots"]
         keys_collection = db["discord_keys"]
