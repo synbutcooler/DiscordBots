@@ -6,7 +6,7 @@ import asyncio
 import logging
 from discord.ext import commands
 from discord import Embed, app_commands
-from config import STICKIED_TOKEN, MANGODB_URI
+from config import STICKIED_TOKEN, MONGODB_URI
 from pymongo import MongoClient
 
 logger = logging.getLogger(__name__)
@@ -14,15 +14,15 @@ logger = logging.getLogger(__name__)
 stickied_collection = None
 
 try:
-    if MANGODB_URI:
-        mongo_client = MongoClient(MANGODB_URI, serverSelectionTimeoutMS=5000)
+    if MONGODB_URI:
+        mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         mongo_client.admin.command('ping')
         stickied_db = mongo_client["vadrifts_bots"]
         stickied_collection = stickied_db["stickied_messages"]
         stickied_collection.create_index("channel_key", unique=True)
         logger.info("Stickied bot connected to MongoDB")
     else:
-        logger.warning("MANGODB_URI not set, stickied data will not persist")
+        logger.warning("MONGODB_URI not set, stickied data will not persist")
 except Exception as e:
     logger.error(f"Stickied bot MongoDB connection failed: {e}")
 
