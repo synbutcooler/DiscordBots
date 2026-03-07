@@ -33,7 +33,7 @@ stickied_messages = {}
 
 def load_data():
     global stickied_messages
-    if not stickied_collection:
+    if stickied_collection is None:
         return
     try:
         stickied_messages = {}
@@ -46,7 +46,7 @@ def load_data():
 
 
 def save_entry(channel_key):
-    if not stickied_collection:
+    if stickied_collection is None:
         return
     try:
         data = stickied_messages.get(channel_key)
@@ -61,7 +61,7 @@ def save_entry(channel_key):
 
 
 def delete_entry(channel_key):
-    if not stickied_collection:
+    if stickied_collection is None:
         return
     try:
         stickied_collection.delete_one({"_id": channel_key})
