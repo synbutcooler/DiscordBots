@@ -13,10 +13,12 @@ if MONGODB_URI:
         print("✅ Connected to MongoDB for Discord keys")
     except Exception as e:
         print(f"❌ MongoDB Discord keys connection failed: {e}")
+else:
+    print("⚠️ MONGODB_URI not set for Discord keys")
 
 
 def load_discord_keys():
-    if not keys_collection:
+    if keys_collection is None:
         return {}
     try:
         keys = {}
@@ -30,7 +32,7 @@ def load_discord_keys():
 
 
 def save_discord_keys(keys):
-    if not keys_collection:
+    if keys_collection is None:
         return
     try:
         keys_collection.delete_many({})
@@ -42,7 +44,7 @@ def save_discord_keys(keys):
 
 
 def save_single_key(key, data):
-    if not keys_collection:
+    if keys_collection is None:
         return
     try:
         keys_collection.update_one(
@@ -55,7 +57,7 @@ def save_single_key(key, data):
 
 
 def delete_single_key(key):
-    if not keys_collection:
+    if keys_collection is None:
         return
     try:
         keys_collection.delete_one({"_id": key})
