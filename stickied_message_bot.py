@@ -2,9 +2,25 @@ import os
 import time
 import discord
 import asyncio
+from pymongo import MongoClient
 from discord.ext import commands
 from discord import Embed, app_commands
 from config import STICKIED_TOKEN
+
+MONGODB_URI = os.environ.get("MONGODB_URI")
+stickied_collection = None
+
+if MONGODB_URI:
+    try:
+        mongo_client = MongoClient(MONGODB_URI)
+        db = mongo_client["vadrifts"]
+        stickied_collection = db["stickied_messages"]
+        mongo_client.admin.command('ping')
+        print("✅ Connected to MongoDB for stickied bot")
+    except Exception as e:
+        print(f"❌ MongoDB connection failed: {e}")
+else:
+    print("⚠️ MONGODB_URI not set - stickied messages won't persist between restarts")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -14,8 +30,48 @@ bot = commands.Bot(command_prefix="?", intents=intents)
 
 stickied_messages = {}
 
+
+def load_data():
+    global stickied_messages
+    if not stickied_collection:
+        return
+    try:
+        stickied_messages = {}
+        for doc in stickied_collection.find():
+            key = doc["_id"]
+            stickied_messages[key] = {k: v for k, v in doc.items() if k != "_id"}
+        print(f"✅ Loaded {len(stickied_messages)} stickied messages from MongoDB")
+    except Exception as e:
+        print(f"❌ MongoDB load failed: {e}")
+
+
+def save_entry(channel_key):
+    if not stickied_collection:
+        return
+    try:
+        data = stickied_messages.get(channel_key)
+        if data:
+            stickied_collection.update_one(
+                {"_id": channel_key},
+                {"$set": data},
+                upsert=True
+            )
+    except Exception as e:
+        print(f"❌ MongoDB save failed: {e}")
+
+
+def delete_entry(channel_key):
+    if not stickied_collection:
+        return
+    try:
+        stickied_collection.delete_one({"_id": channel_key})
+    except Exception as e:
+        print(f"❌ MongoDB delete failed: {e}")
+
+
 @bot.event
 async def on_ready():
+    load_data()
     print(f'Stickied bot logged in as {bot.user}')
     try:
         await asyncio.sleep(3)
@@ -29,12 +85,12 @@ async def on_ready():
     except Exception as e:
         print(f"Slash command sync failed: {e}")
 
+
 def create_embed_from_data(data):
     embed = Embed(
         title=data.get("title"),
         description=data.get("description")
     )
-
     if data.get("color"):
         try:
             embed.color = int(data["color"].replace("#", ""), 16)
@@ -42,29 +98,26 @@ def create_embed_from_data(data):
             embed.color = 0x9c88ff
     else:
         embed.color = 0x9c88ff
-
     if data.get("footer"):
         embed.set_footer(text=data["footer"])
-
     if data.get("image"):
         embed.set_image(url=data["image"])
-
     if data.get("thumbnail"):
         embed.set_thumbnail(url=data["thumbnail"])
-
     return embed
+
 
 async def get_or_create_webhook(channel):
     webhooks = await channel.webhooks()
     webhook = discord.utils.get(webhooks, name="Stickied Bot")
-
     if webhook is None:
         webhook = await channel.create_webhook(name="Stickied Bot")
-
     return webhook
+
 
 def get_channel_key(guild_id, channel_id):
     return f"{guild_id}_{channel_id}"
+
 
 @bot.tree.command(name="stick", description="Set a stickied text message.")
 @app_commands.default_permissions(manage_messages=True)
@@ -78,7 +131,6 @@ async def stick(
     webhook_avatar: str = None
 ):
     await interaction.response.defer(ephemeral=True)
-
     target_channel = channel or interaction.channel
     channel_key = get_channel_key(interaction.guild_id, target_channel.id)
 
@@ -92,6 +144,7 @@ async def stick(
         "webhook_name": webhook_name,
         "webhook_avatar": webhook_avatar
     }
+    save_entry(channel_key)
 
     try:
         if use_webhook:
@@ -107,10 +160,11 @@ async def stick(
 
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-
+        save_entry(channel_key)
         await interaction.followup.send(f"✅ Stickied message set in {target_channel.mention}!")
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}")
+
 
 @bot.command(name="stick")
 @commands.has_permissions(manage_messages=True)
@@ -127,6 +181,7 @@ async def stick_prefix(ctx, *, message: str):
         "webhook_name": None,
         "webhook_avatar": None
     }
+    save_entry(channel_key)
 
     try:
         await ctx.message.delete()
@@ -137,34 +192,34 @@ async def stick_prefix(ctx, *, message: str):
         msg = await ctx.channel.send(message)
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-
+        save_entry(channel_key)
         confirm = await ctx.send("✅ Stickied message set!")
         await confirm.delete(delay=3)
     except Exception as e:
         await ctx.send(f"❌ Error: {str(e)}")
 
+
 @bot.command(name="cooldown")
 @commands.has_permissions(manage_messages=True)
 async def set_cooldown(ctx, seconds: int):
     channel_key = get_channel_key(ctx.guild.id, ctx.channel.id)
-
     if channel_key not in stickied_messages:
         await ctx.send("❌ No stickied message in this channel. Use `?stick` first.")
         return
-
     if seconds < 0:
         await ctx.send("❌ Cooldown must be 0 or greater.")
         return
 
     stickied_messages[channel_key]["cooldown"] = seconds
+    save_entry(channel_key)
 
     try:
         await ctx.message.delete()
     except:
         pass
-
     confirm = await ctx.send(f"✅ Cooldown set to {seconds} seconds!")
     await confirm.delete(delay=3)
+
 
 @bot.command(name="stickwh")
 @commands.has_permissions(manage_messages=True)
@@ -181,6 +236,7 @@ async def stick_webhook_prefix(ctx, webhook_name: str, *, message: str):
         "webhook_name": webhook_name,
         "webhook_avatar": None
     }
+    save_entry(channel_key)
 
     try:
         await ctx.message.delete()
@@ -189,24 +245,20 @@ async def stick_webhook_prefix(ctx, webhook_name: str, *, message: str):
 
     try:
         webhook = await get_or_create_webhook(ctx.channel)
-        msg = await webhook.send(
-            content=message,
-            username=webhook_name,
-            wait=True
-        )
+        msg = await webhook.send(content=message, username=webhook_name, wait=True)
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-
+        save_entry(channel_key)
         confirm = await ctx.send("✅ Stickied webhook message set!")
         await confirm.delete(delay=3)
     except Exception as e:
         await ctx.send(f"❌ Error: {str(e)}")
 
+
 @bot.command(name="unstick")
 @commands.has_permissions(manage_messages=True)
 async def unstick_prefix(ctx):
     channel_key = get_channel_key(ctx.guild.id, ctx.channel.id)
-
     if channel_key in stickied_messages:
         if stickied_messages[channel_key].get("last_message"):
             try:
@@ -214,18 +266,18 @@ async def unstick_prefix(ctx):
                 await msg.delete()
             except:
                 pass
-
         del stickied_messages[channel_key]
+        delete_entry(channel_key)
 
         try:
             await ctx.message.delete()
         except:
             pass
-
         confirm = await ctx.send("✅ Stickied message removed!")
         await confirm.delete(delay=3)
     else:
         await ctx.send("❌ No stickied message in this channel.")
+
 
 @bot.tree.command(name="stickembed", description="Set a stickied embed message.")
 @app_commands.default_permissions(manage_messages=True)
@@ -244,17 +296,12 @@ async def stickembed(
     webhook_avatar: str = None
 ):
     await interaction.response.defer(ephemeral=True)
-
     target_channel = channel or interaction.channel
     channel_key = get_channel_key(interaction.guild_id, target_channel.id)
 
     embed_data = {
-        "title": title,
-        "description": description,
-        "color": color,
-        "footer": footer,
-        "image": image_url,
-        "thumbnail": thumbnail_url
+        "title": title, "description": description, "color": color,
+        "footer": footer, "image": image_url, "thumbnail": thumbnail_url
     }
 
     stickied_messages[channel_key] = {
@@ -267,10 +314,10 @@ async def stickembed(
         "webhook_name": webhook_name,
         "webhook_avatar": webhook_avatar
     }
+    save_entry(channel_key)
 
     try:
         embed = create_embed_from_data(embed_data)
-
         if use_webhook:
             webhook = await get_or_create_webhook(target_channel)
             msg = await webhook.send(
@@ -284,16 +331,16 @@ async def stickembed(
 
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-
+        save_entry(channel_key)
         await interaction.followup.send(f"✅ Stickied embed set in {target_channel.mention}!")
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}")
+
 
 @bot.tree.command(name="unstick", description="Remove stickied message from a channel.")
 @app_commands.default_permissions(manage_messages=True)
 async def unstick(interaction: discord.Interaction, channel: discord.TextChannel = None):
     await interaction.response.defer(ephemeral=True)
-
     target_channel = channel or interaction.channel
     channel_key = get_channel_key(interaction.guild_id, target_channel.id)
 
@@ -304,17 +351,17 @@ async def unstick(interaction: discord.Interaction, channel: discord.TextChannel
                 await msg.delete()
             except:
                 pass
-
         del stickied_messages[channel_key]
+        delete_entry(channel_key)
         await interaction.followup.send(f"✅ Stickied message removed from {target_channel.mention}.")
     else:
         await interaction.followup.send(f"❌ No stickied message in {target_channel.mention}.")
+
 
 @bot.tree.command(name="list", description="List all active stickied messages in this server.")
 @app_commands.default_permissions(manage_messages=True)
 async def list_stickied(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-
     server_stickied = {k: v for k, v in stickied_messages.items() if k.startswith(f"{interaction.guild_id}_")}
 
     if not server_stickied:
@@ -334,7 +381,6 @@ async def list_stickied(interaction: discord.Interaction):
             content_preview = data.get("content") or f"Embed: {data['embed']['title']}"
             if len(content_preview) > 50:
                 content_preview = content_preview[:50] + "..."
-
             cooldown_text = f" • {data['cooldown']}s cooldown" if data.get('cooldown', 0) > 0 else ""
             webhook_text = " • Webhook" if data.get('use_webhook') else ""
             embed.add_field(
@@ -346,6 +392,7 @@ async def list_stickied(interaction: discord.Interaction):
     embed.set_footer(text="Use /unstick or ?unstick to remove")
     await interaction.followup.send(embed=embed)
 
+
 @bot.tree.command(name="help", description="Show bot commands and info.")
 async def help_command(interaction: discord.Interaction):
     embed = Embed(
@@ -353,7 +400,6 @@ async def help_command(interaction: discord.Interaction):
         description="Keep important messages pinned at the bottom of your channels!",
         color=0x9c88ff
     )
-
     embed.add_field(
         name="📝 Slash Commands",
         value=(
@@ -364,7 +410,6 @@ async def help_command(interaction: discord.Interaction):
         ),
         inline=False
     )
-
     embed.add_field(
         name="📝 Prefix Commands (multi-line support)",
         value=(
@@ -375,7 +420,6 @@ async def help_command(interaction: discord.Interaction):
         ),
         inline=False
     )
-
     embed.add_field(
         name="✨ Slash Command Options",
         value=(
@@ -391,7 +435,6 @@ async def help_command(interaction: discord.Interaction):
         ),
         inline=False
     )
-
     embed.add_field(
         name="💡 Tips",
         value=(
@@ -403,16 +446,14 @@ async def help_command(interaction: discord.Interaction):
         ),
         inline=False
     )
-
     embed.set_footer(text="Made with 💜 by Vadrifts • Requires Manage Messages")
-
     await interaction.response.send_message(embed=embed)
+
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
-
     if not message.guild:
         return
 
@@ -425,7 +466,6 @@ async def on_message(message):
 
     if channel_key in stickied_messages:
         data = stickied_messages[channel_key]
-
         cooldown = data.get("cooldown", 0)
         last_sent = data.get("last_sent", 0)
 
@@ -442,7 +482,6 @@ async def on_message(message):
         try:
             if data.get("use_webhook"):
                 webhook = await get_or_create_webhook(message.channel)
-
                 if data["embed"]:
                     embed = create_embed_from_data(data["embed"])
                     new_msg = await webhook.send(
@@ -467,8 +506,10 @@ async def on_message(message):
 
             stickied_messages[channel_key]["last_message"] = new_msg.id
             stickied_messages[channel_key]["last_sent"] = time.time()
+            save_entry(channel_key)
         except Exception as e:
             print(f"Error sending stickied message: {e}")
+
 
 def start_stickied_bot():
     if not STICKIED_TOKEN:
@@ -478,6 +519,7 @@ def start_stickied_bot():
         bot.run(STICKIED_TOKEN)
     except Exception as e:
         print(f"Stickied bot error: {e}")
+
 
 if __name__ == "__main__":
     start_stickied_bot()
