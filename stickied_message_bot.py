@@ -1,25 +1,30 @@
 import os
 import json
 import time
-import redis
 import discord
 import asyncio
+import logging
 from discord.ext import commands
 from discord import Embed, app_commands
-from config import STICKIED_TOKEN
+from config import STICKIED_TOKEN, MANGODB_URI
+from pymongo import MongoClient
 
-REDIS_URL = os.environ.get("REDIS_URL")
-if not REDIS_URL:
-    print("❌ REDIS_URL not set! Data will NOT persist between restarts.")
-    r = None
-else:
-    try:
-        r = redis.from_url(REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
-        r.ping()
-        print("✅ Connected to Redis")
-    except Exception as e:
-        print(f"❌ Redis connection failed: {e}")
-        r = None
+logger = logging.getLogger(__name__)
+
+stickied_collection = None
+
+try:
+    if MANGODB_URI:
+        mongo_client = MongoClient(MANGODB_URI, serverSelectionTimeoutMS=5000)
+        mongo_client.admin.command('ping')
+        stickied_db = mongo_client["vadrifts_bots"]
+        stickied_collection = stickied_db["stickied_messages"]
+        stickied_collection.create_index("channel_key", unique=True)
+        logger.info("Stickied bot connected to MongoDB")
+    else:
+        logger.warning("MANGODB_URI not set, stickied data will not persist")
+except Exception as e:
+    logger.error(f"Stickied bot MongoDB connection failed: {e}")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -30,23 +35,40 @@ bot = commands.Bot(command_prefix="?", intents=intents)
 stickied_messages = {}
 
 def save_data():
-    if r:
-        try:
-            r.set("stickied_messages", json.dumps(stickied_messages))
-        except Exception as e:
-            print(f"❌ Redis save failed: {e}")
+    if not stickied_collection:
+        return
+    try:
+        for channel_key, data in stickied_messages.items():
+            stickied_collection.update_one(
+                {"channel_key": channel_key},
+                {"$set": {"channel_key": channel_key, "data": data}},
+                upsert=True
+            )
+    except Exception as e:
+        logger.error(f"MongoDB save failed: {e}")
+
+def delete_data(channel_key):
+    if not stickied_collection:
+        return
+    try:
+        stickied_collection.delete_one({"channel_key": channel_key})
+    except Exception as e:
+        logger.error(f"MongoDB delete failed: {e}")
 
 def load_data():
     global stickied_messages
-    if r:
-        try:
-            raw = r.get("stickied_messages")
-            stickied_messages = json.loads(raw) if raw else {}
-            print(f"✅ Loaded {len(stickied_messages)} stickied channels from Redis")
-            return
-        except Exception as e:
-            print(f"❌ Redis load failed: {e}")
-    stickied_messages = {}
+    if not stickied_collection:
+        stickied_messages = {}
+        return
+    try:
+        docs = stickied_collection.find()
+        stickied_messages = {}
+        for doc in docs:
+            stickied_messages[doc["channel_key"]] = doc["data"]
+        logger.info(f"Loaded {len(stickied_messages)} stickied channels from MongoDB")
+    except Exception as e:
+        logger.error(f"MongoDB load failed: {e}")
+        stickied_messages = {}
 
 @bot.event
 async def on_ready():
@@ -58,7 +80,7 @@ async def on_ready():
         print(f"Synced {len(synced)} global commands")
     except discord.HTTPException as e:
         if e.status == 429:
-            print("⚠️ Rate limited - commands already synced, skipping")
+            print("Rate limited - commands already synced, skipping")
         else:
             print(f"Command sync error: {e}")
     except Exception as e:
@@ -145,9 +167,9 @@ async def stick(
         stickied_messages[channel_key]["last_sent"] = time.time()
         save_data()
 
-        await interaction.followup.send(f"✅ Stickied message set in {target_channel.mention}!")
+        await interaction.followup.send(f"Stickied message set in {target_channel.mention}!")
     except Exception as e:
-        await interaction.followup.send(f"❌ Error: {str(e)}")
+        await interaction.followup.send(f"Error: {str(e)}")
 
 @bot.command(name="stick")
 @commands.has_permissions(manage_messages=True)
@@ -177,10 +199,10 @@ async def stick_prefix(ctx, *, message: str):
         stickied_messages[channel_key]["last_sent"] = time.time()
         save_data()
 
-        confirm = await ctx.send("✅ Stickied message set!")
+        confirm = await ctx.send("Stickied message set!")
         await confirm.delete(delay=3)
     except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
+        await ctx.send(f"Error: {str(e)}")
 
 @bot.command(name="cooldown")
 @commands.has_permissions(manage_messages=True)
@@ -188,11 +210,11 @@ async def set_cooldown(ctx, seconds: int):
     channel_key = get_channel_key(ctx.guild.id, ctx.channel.id)
 
     if channel_key not in stickied_messages:
-        await ctx.send("❌ No stickied message in this channel. Use `?stick` first.")
+        await ctx.send("No stickied message in this channel. Use `?stick` first.")
         return
 
     if seconds < 0:
-        await ctx.send("❌ Cooldown must be 0 or greater.")
+        await ctx.send("Cooldown must be 0 or greater.")
         return
 
     stickied_messages[channel_key]["cooldown"] = seconds
@@ -203,7 +225,7 @@ async def set_cooldown(ctx, seconds: int):
     except:
         pass
 
-    confirm = await ctx.send(f"✅ Cooldown set to {seconds} seconds!")
+    confirm = await ctx.send(f"Cooldown set to {seconds} seconds!")
     await confirm.delete(delay=3)
 
 @bot.command(name="stickwh")
@@ -239,10 +261,10 @@ async def stick_webhook_prefix(ctx, webhook_name: str, *, message: str):
         stickied_messages[channel_key]["last_sent"] = time.time()
         save_data()
 
-        confirm = await ctx.send("✅ Stickied webhook message set!")
+        confirm = await ctx.send("Stickied webhook message set!")
         await confirm.delete(delay=3)
     except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
+        await ctx.send(f"Error: {str(e)}")
 
 @bot.command(name="unstick")
 @commands.has_permissions(manage_messages=True)
@@ -258,17 +280,17 @@ async def unstick_prefix(ctx):
                 pass
 
         del stickied_messages[channel_key]
-        save_data()
+        delete_data(channel_key)
 
         try:
             await ctx.message.delete()
         except:
             pass
 
-        confirm = await ctx.send("✅ Stickied message removed!")
+        confirm = await ctx.send("Stickied message removed!")
         await confirm.delete(delay=3)
     else:
-        await ctx.send("❌ No stickied message in this channel.")
+        await ctx.send("No stickied message in this channel.")
 
 @bot.tree.command(name="stickembed", description="Set a stickied embed message.")
 @app_commands.default_permissions(manage_messages=True)
@@ -330,9 +352,9 @@ async def stickembed(
         stickied_messages[channel_key]["last_sent"] = time.time()
         save_data()
 
-        await interaction.followup.send(f"✅ Stickied embed set in {target_channel.mention}!")
+        await interaction.followup.send(f"Stickied embed set in {target_channel.mention}!")
     except Exception as e:
-        await interaction.followup.send(f"❌ Error: {str(e)}")
+        await interaction.followup.send(f"Error: {str(e)}")
 
 @bot.tree.command(name="unstick", description="Remove stickied message from a channel.")
 @app_commands.default_permissions(manage_messages=True)
@@ -351,10 +373,10 @@ async def unstick(interaction: discord.Interaction, channel: discord.TextChannel
                 pass
 
         del stickied_messages[channel_key]
-        save_data()
-        await interaction.followup.send(f"✅ Stickied message removed from {target_channel.mention}.")
+        delete_data(channel_key)
+        await interaction.followup.send(f"Stickied message removed from {target_channel.mention}.")
     else:
-        await interaction.followup.send(f"❌ No stickied message in {target_channel.mention}.")
+        await interaction.followup.send(f"No stickied message in {target_channel.mention}.")
 
 @bot.tree.command(name="list", description="List all active stickied messages in this server.")
 @app_commands.default_permissions(manage_messages=True)
@@ -368,7 +390,7 @@ async def list_stickied(interaction: discord.Interaction):
         return
 
     embed = Embed(
-        title="📌 Active Stickied Messages",
+        title="Active Stickied Messages",
         description=f"Total: {len(server_stickied)} channel(s)",
         color=0x9c88ff
     )
@@ -381,8 +403,8 @@ async def list_stickied(interaction: discord.Interaction):
             if len(content_preview) > 50:
                 content_preview = content_preview[:50] + "..."
 
-            cooldown_text = f" • {data['cooldown']}s cooldown" if data.get('cooldown', 0) > 0 else ""
-            webhook_text = " • Webhook" if data.get('use_webhook') else ""
+            cooldown_text = f" | {data['cooldown']}s cooldown" if data.get('cooldown', 0) > 0 else ""
+            webhook_text = " | Webhook" if data.get('use_webhook') else ""
             embed.add_field(
                 name=f"#{channel.name}",
                 value=f"`{content_preview}`{cooldown_text}{webhook_text}",
@@ -395,13 +417,13 @@ async def list_stickied(interaction: discord.Interaction):
 @bot.tree.command(name="help", description="Show bot commands and info.")
 async def help_command(interaction: discord.Interaction):
     embed = Embed(
-        title="📌 Stickied Bot",
+        title="Stickied Bot",
         description="Keep important messages pinned at the bottom of your channels!",
         color=0x9c88ff
     )
 
     embed.add_field(
-        name="📝 Slash Commands",
+        name="Slash Commands",
         value=(
             "`/stick` - Set text stickied (single line)\n"
             "`/stickembed` - Set embed stickied\n"
@@ -412,7 +434,7 @@ async def help_command(interaction: discord.Interaction):
     )
 
     embed.add_field(
-        name="📝 Prefix Commands (multi-line support)",
+        name="Prefix Commands (multi-line support)",
         value=(
             "`?stick <message>` - Set text stickied with line breaks\n"
             "`?stickwh <name> <message>` - Same but with webhook name\n"
@@ -423,7 +445,7 @@ async def help_command(interaction: discord.Interaction):
     )
 
     embed.add_field(
-        name="✨ Slash Command Options",
+        name="Slash Command Options",
         value=(
             "`channel` - Target channel\n"
             "`cooldown` - Seconds between re-sticks\n"
@@ -439,18 +461,18 @@ async def help_command(interaction: discord.Interaction):
     )
 
     embed.add_field(
-        name="💡 Tips",
+        name="Tips",
         value=(
-            "• Use `?stick` for multi-line messages\n"
-            "• Use `?cooldown` to adjust cooldown after sticking\n"
-            "• `cooldown` prevents spam\n"
-            "• Messages send instantly when set\n"
-            "• Colors use hex codes (e.g. 9c88ff)"
+            "Use `?stick` for multi-line messages\n"
+            "Use `?cooldown` to adjust cooldown after sticking\n"
+            "`cooldown` prevents spam\n"
+            "Messages send instantly when set\n"
+            "Colors use hex codes (e.g. 9c88ff)"
         ),
         inline=False
     )
 
-    embed.set_footer(text="Made with 💜 by Vadrifts • Requires Manage Messages")
+    embed.set_footer(text="Made with love by Vadrifts | Requires Manage Messages")
 
     await interaction.response.send_message(embed=embed)
 
