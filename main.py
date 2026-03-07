@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-PING_URL = "https://vadriftzbots.onrender.com/health"
+PING_URL = os.environ.get("PING_URL", "https://vadriftzbots.onrender.com/health")
 
 
 @app.route('/health')
