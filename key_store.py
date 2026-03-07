@@ -39,7 +39,7 @@ def generate_key():
 
 
 def create_key_for_user(discord_id, username, expiry_hours=24):
-    if not keys_collection:
+    if keys_collection is None:
         return None
     delete_keys_by_discord_id(discord_id)
     key = generate_key()
@@ -55,20 +55,20 @@ def create_key_for_user(discord_id, username, expiry_hours=24):
 
 
 def get_key(key):
-    if not keys_collection:
+    if keys_collection is None:
         return None
     return keys_collection.find_one({"key": key})
 
 
 def delete_key(key):
-    if not keys_collection:
+    if keys_collection is None:
         return 0
     result = keys_collection.delete_one({"key": key})
     return result.deleted_count
 
 
 def delete_keys_by_discord_id(discord_id):
-    if not keys_collection:
+    if keys_collection is None:
         return 0
     discord_id = str(discord_id)
     result = keys_collection.delete_many({"discord_id": discord_id})
@@ -76,13 +76,13 @@ def delete_keys_by_discord_id(discord_id):
 
 
 def lock_hwid(key, hwid):
-    if not keys_collection:
+    if keys_collection is None:
         return
     keys_collection.update_one({"key": key}, {"$set": {"hwid": hwid}})
 
 
 def get_stats():
-    if not keys_collection:
+    if keys_collection is None:
         return {"total": 0, "active": 0, "expired": 0, "hwid_locked": 0}
     now = time.time()
     total = keys_collection.count_documents({})
@@ -98,7 +98,7 @@ def get_stats():
 
 
 def cleanup_expired():
-    if not keys_collection:
+    if keys_collection is None:
         return 0
     now = time.time()
     result = keys_collection.delete_many({"expires_at": {"$lt": now}})
