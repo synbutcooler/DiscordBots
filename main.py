@@ -14,7 +14,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PING_URL = "https://vadriftzbots.onrender.com/health"
+PING_URL = "https://vadrifts.onrender.com/health"
 
 def server_pinger():
     while True:
