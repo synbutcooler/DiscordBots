@@ -1,17 +1,37 @@
 import time
 import secrets
+import logging
 from pymongo import MongoClient
 from config import MANGODB_URI
 
+logger = logging.getLogger(__name__)
+
 GUILD_ID = 1241797935100989594
 
-client = MongoClient(MANGODB_URI)
-db = client["vadrifts_bots"]
-keys_collection = db["discord_keys"]
+client = None
+db = None
+keys_collection = None
 
-keys_collection.create_index("key", unique=True)
-keys_collection.create_index("discord_id")
-keys_collection.create_index("expires_at")
+def init_db():
+    global client, db, keys_collection
+    try:
+        if not MANGODB_URI:
+            logger.error("MANGODB_URI is not set!")
+            return False
+        client = MongoClient(MANGODB_URI, serverSelectionTimeoutMS=5000)
+        client.admin.command('ping')
+        db = client["vadrifts_bots"]
+        keys_collection = db["discord_keys"]
+        keys_collection.create_index("key", unique=True)
+        keys_collection.create_index("discord_id")
+        keys_collection.create_index("expires_at")
+        logger.info("MongoDB connected successfully")
+        return True
+    except Exception as e:
+        logger.error(f"MongoDB connection failed: {e}")
+        return False
+
+init_db()
 
 
 def generate_key():
@@ -19,6 +39,8 @@ def generate_key():
 
 
 def create_key_for_user(discord_id, username, expiry_hours=24):
+    if not keys_collection:
+        return None
     delete_keys_by_discord_id(discord_id)
     key = generate_key()
     keys_collection.insert_one({
@@ -33,25 +55,35 @@ def create_key_for_user(discord_id, username, expiry_hours=24):
 
 
 def get_key(key):
+    if not keys_collection:
+        return None
     return keys_collection.find_one({"key": key})
 
 
 def delete_key(key):
+    if not keys_collection:
+        return 0
     result = keys_collection.delete_one({"key": key})
     return result.deleted_count
 
 
 def delete_keys_by_discord_id(discord_id):
+    if not keys_collection:
+        return 0
     discord_id = str(discord_id)
     result = keys_collection.delete_many({"discord_id": discord_id})
     return result.deleted_count
 
 
 def lock_hwid(key, hwid):
+    if not keys_collection:
+        return
     keys_collection.update_one({"key": key}, {"$set": {"hwid": hwid}})
 
 
 def get_stats():
+    if not keys_collection:
+        return {"total": 0, "active": 0, "expired": 0, "hwid_locked": 0}
     now = time.time()
     total = keys_collection.count_documents({})
     active = keys_collection.count_documents({"expires_at": {"$gt": now}})
@@ -66,6 +98,8 @@ def get_stats():
 
 
 def cleanup_expired():
+    if not keys_collection:
+        return 0
     now = time.time()
     result = keys_collection.delete_many({"expires_at": {"$lt": now}})
     return result.deleted_count
