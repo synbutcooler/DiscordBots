@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import threading
 import requests
 from flask import Flask, request, jsonify
 from config import DISCORD_TOKEN, DISCORD_KEY_API_SECRET
@@ -16,6 +17,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+def keep_alive_loop():
+    while True:
+        time.sleep(600)
+        if SELF_URL:
+            try:
+                resp = requests.get(f"https://vadriftzbots.onrender.com/health", timeout=15)
+                logger.info(f"Keep-alive ping: {resp.status_code}")
+            except Exception as e:
+                logger.warning(f"Keep-alive ping failed: {e}")
 
 
 @app.route('/health')
@@ -84,8 +95,6 @@ def validate_discord_key():
 
 
 if __name__ == '__main__':
-    import threading
-
     port = int(os.environ.get("PORT", 10000))
 
     def start_bots_delayed():
@@ -102,6 +111,9 @@ if __name__ == '__main__':
 
     bots_thread = threading.Thread(target=start_bots_delayed, daemon=True)
     bots_thread.start()
+
+    keep_alive_thread = threading.Thread(target=keep_alive_loop, daemon=True)
+    keep_alive_thread.start()
 
     logger.info(f"Bot server starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
