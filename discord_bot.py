@@ -14,6 +14,14 @@ from key_store import (
     cleanup_expired,
     GUILD_ID
 )
+from guild_key_system import (
+    get_guild_config, init_guild_config, save_guild_config,
+    delete_guild_config, create_session, get_session,
+    update_session, get_pending_session, get_active_session,
+    create_guild_key, delete_guild_keys_by_user,
+    get_guild_key_stats, cleanup_expired_guild_keys,
+    get_destination_url, SERVER_BASE_URL
+)
 
 TARGET_CHANNEL_ID = 1389210900489044048
 AUTH_CHANNEL_ID = 1287714060716081183
@@ -146,6 +154,7 @@ async def getkey(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
 @bot.tree.command(name="resetkey", description="Reset your key and HWID lock.", guild=discord.Object(id=GUILD_ID))
 async def resetkey(interaction: discord.Interaction):
     verified_role = interaction.guild.get_role(1270298463078453249)
@@ -194,19 +203,431 @@ async def keystats(interaction: discord.Interaction):
 BOOST_TYPES = {discord.MessageType.premium_guild_subscription}
 
 
+class KeyClaimView(discord.ui.View):
+    def __init__(self, session_token, gateway_url, guild_id):
+        super().__init__(timeout=1800)
+        self.session_token = session_token
+        self.gateway_url = gateway_url
+        self.guild_id = guild_id
+
+        self.add_item(discord.ui.Button(
+            label="🔗 Open Verification",
+            style=discord.ButtonStyle.link,
+            url=gateway_url
+        ))
+
+    @discord.ui.button(label="✅ Claim Key", style=discord.ButtonStyle.success, custom_id="claim_key")
+    async def claim_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = get_session(self.session_token)
+
+        if not session:
+            await interaction.response.send_message(
+                "❌ Session expired. Run `/ks getkey` again.", ephemeral=True)
+            return
+
+        if str(interaction.user.id) != session.get('discord_id'):
+            await interaction.response.send_message(
+                "❌ This isn't your session.", ephemeral=True)
+            return
+
+        if not session.get('completed'):
+            await interaction.response.send_message(
+                "⏳ You haven't completed verification yet.\n"
+                "Click **Open Verification**, complete the task, then try again.",
+                ephemeral=True)
+            return
+
+        if session.get('key_claimed'):
+            await interaction.response.send_message(
+                "⚠️ Key already claimed for this session.", ephemeral=True)
+            return
+
+        config = get_guild_config(self.guild_id)
+        duration = config.get('key_duration_hours', 24) if config else 24
+
+        key = create_guild_key(
+            self.guild_id,
+            interaction.user.id,
+            interaction.user.name,
+            duration
+        )
+
+        if not key:
+            await interaction.response.send_message(
+                "❌ Failed to generate key. Try again or contact an admin.",
+                ephemeral=True)
+            return
+
+        update_session(self.session_token, {"key_claimed": True})
+
+        expires_ts = int(time.time() + (duration * 3600))
+
+        embed = discord.Embed(title="🔑 Your Key", color=discord.Color.green())
+        embed.description = f"```{key}```"
+        embed.add_field(name="Expires", value=f"<t:{expires_ts}:R>", inline=True)
+        embed.add_field(name="HWID Lock", value="Locks on first use", inline=True)
+        embed.set_footer(text="Do not share your key. Leave the server = key revoked.")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        button.disabled = True
+        button.label = "✅ Key Claimed"
+        try:
+            await interaction.message.edit(view=self)
+        except:
+            pass
+
+    @discord.ui.button(label="📊 Check Status", style=discord.ButtonStyle.secondary, custom_id="check_status")
+    async def check_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = get_session(self.session_token)
+
+        if not session:
+            await interaction.response.send_message(
+                "❌ Session expired. Run `/ks getkey` again.", ephemeral=True)
+            return
+
+        if str(interaction.user.id) != session.get('discord_id'):
+            await interaction.response.send_message(
+                "❌ This isn't your session.", ephemeral=True)
+            return
+
+        if session.get('key_claimed'):
+            status = "✅ Key already claimed"
+        elif session.get('completed'):
+            status = "✅ Verification complete — click **Claim Key**!"
+        elif session.get('timer_started'):
+            status = "⏳ Timer started — complete the verification task"
+        else:
+            status = "🔗 Click **Open Verification** to start"
+
+        await interaction.response.send_message(status, ephemeral=True)
+
+
+ks_group = app_commands.Group(name="ks", description="Key System commands")
+
+
+@ks_group.command(name="setup", description="[Admin] Initialize the key system for this server.")
+@app_commands.describe(
+    key_duration="How long keys last in hours (default: 24)",
+    min_time="Minimum seconds to complete verification (default: 25)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def ks_setup(
+    interaction: discord.Interaction,
+    key_duration: int = 24,
+    min_time: int = 25
+):
+    config = init_guild_config(
+        interaction.guild.id,
+        interaction.guild.name,
+        interaction.user.id,
+        key_duration,
+        min_time
+    )
+
+    if not config:
+        await interaction.response.send_message(
+            "❌ Failed to initialize. Database may be unavailable.", ephemeral=True)
+        return
+
+    dest_url = get_destination_url(interaction.guild.id)
+
+    embed = discord.Embed(title="⚙️ Key System Initialized", color=discord.Color.blurple())
+    embed.description = (
+        "Your key system is ready! Follow these steps:\n\n"
+        "**Step 1:** Create a campaign on your monetization platform "
+        "(Work.ink, LootLabs, etc.) and set the **destination URL** to:\n"
+        f"```\n{dest_url}\n```\n"
+        "**Step 2:** Copy your campaign link and run:\n"
+        "```\n/ks setlink workink: <your-campaign-url>\n```\n"
+        "**Step 3:** Users can now run `/ks getkey` to get keys!\n\n"
+        "**For your Roblox script**, use this API secret:"
+    )
+    embed.add_field(name="🔐 API Secret", value=f"||{config['api_secret']}||", inline=False)
+    embed.add_field(name="⏱️ Key Duration", value=f"{key_duration} hours", inline=True)
+    embed.add_field(name="⏳ Min Completion Time", value=f"{min_time} seconds", inline=True)
+    embed.add_field(
+        name="🔗 Validation URL",
+        value=f"```\n{SERVER_BASE_URL}/api/validate-guild-key\n```",
+        inline=False
+    )
+    embed.set_footer(text="Keep your API secret private! Use /ks config to view settings later.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@ks_group.command(name="setlink", description="[Admin] Set monetization provider links.")
+@app_commands.describe(
+    workink="Your Work.ink campaign URL",
+    lootlabs="Your LootLabs campaign URL",
+    linkvertise="Your Linkvertise campaign URL"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def ks_setlink(
+    interaction: discord.Interaction,
+    workink: str = None,
+    lootlabs: str = None,
+    linkvertise: str = None
+):
+    config = get_guild_config(interaction.guild.id)
+    if not config:
+        await interaction.response.send_message(
+            "❌ Run `/ks setup` first.", ephemeral=True)
+        return
+
+    if not workink and not lootlabs and not linkvertise:
+        await interaction.response.send_message(
+            "❌ Provide at least one link.", ephemeral=True)
+        return
+
+    updates = {}
+    set_links = []
+
+    if workink:
+        if not workink.startswith('http'):
+            await interaction.response.send_message("❌ Work.ink URL must start with http.", ephemeral=True)
+            return
+        updates['workink_url'] = workink
+        display = f"{workink[:60]}..." if len(workink) > 60 else workink
+        set_links.append(f"⚡ Work.ink: `{display}`")
+
+    if lootlabs:
+        if not lootlabs.startswith('http'):
+            await interaction.response.send_message("❌ LootLabs URL must start with http.", ephemeral=True)
+            return
+        updates['lootlabs_url'] = lootlabs
+        display = f"{lootlabs[:60]}..." if len(lootlabs) > 60 else lootlabs
+        set_links.append(f"🎁 LootLabs: `{display}`")
+
+    if linkvertise:
+        if not linkvertise.startswith('http'):
+            await interaction.response.send_message("❌ Linkvertise URL must start with http.", ephemeral=True)
+            return
+        updates['linkvertise_url'] = linkvertise
+        display = f"{linkvertise[:60]}..." if len(linkvertise) > 60 else linkvertise
+        set_links.append(f"🔗 Linkvertise: `{display}`")
+
+    updates['updated_at'] = time.time()
+    save_guild_config(interaction.guild.id, updates)
+
+    embed = discord.Embed(title="✅ Links Updated", color=discord.Color.green())
+    embed.description = "\n".join(set_links)
+    embed.set_footer(text="Users can now run /ks getkey")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@ks_group.command(name="config", description="[Admin] View current key system configuration.")
+@app_commands.checks.has_permissions(administrator=True)
+async def ks_config(interaction: discord.Interaction):
+    config = get_guild_config(interaction.guild.id)
+    if not config:
+        await interaction.response.send_message(
+            "❌ Key system not set up. Run `/ks setup` first.", ephemeral=True)
+        return
+
+    dest_url = get_destination_url(interaction.guild.id)
+
+    embed = discord.Embed(title="⚙️ Key System Config", color=discord.Color.blurple())
+    embed.add_field(name="Status", value="✅ Enabled" if config.get('enabled') else "❌ Disabled", inline=True)
+    embed.add_field(name="Key Duration", value=f"{config.get('key_duration_hours', 24)}h", inline=True)
+    embed.add_field(name="Min Time", value=f"{config.get('min_completion_seconds', 25)}s", inline=True)
+    embed.add_field(name="Membership Required", value="Yes" if config.get('require_membership', True) else "No", inline=True)
+
+    providers = []
+    if config.get('workink_url'):
+        providers.append("⚡ Work.ink ✅")
+    if config.get('lootlabs_url'):
+        providers.append("🎁 LootLabs ✅")
+    if config.get('linkvertise_url'):
+        providers.append("🔗 Linkvertise ✅")
+    if not providers:
+        providers.append("⚠️ None configured — run `/ks setlink`")
+
+    embed.add_field(name="Providers", value="\n".join(providers), inline=False)
+    embed.add_field(name="Destination URL", value=f"```{dest_url}```", inline=False)
+    embed.add_field(name="API Secret", value=f"||{config.get('api_secret', 'N/A')}||", inline=False)
+    embed.add_field(
+        name="Validation URL",
+        value=f"```{SERVER_BASE_URL}/api/validate-guild-key```",
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@ks_group.command(name="getkey", description="Get a script key by completing verification.")
+async def ks_getkey(interaction: discord.Interaction):
+    config = get_guild_config(interaction.guild.id)
+    if not config or not config.get('enabled'):
+        await interaction.response.send_message(
+            "❌ Key system is not set up for this server.", ephemeral=True)
+        return
+
+    has_providers = any([
+        config.get('workink_url'),
+        config.get('lootlabs_url'),
+        config.get('linkvertise_url')
+    ])
+    if not has_providers:
+        await interaction.response.send_message(
+            "❌ No verification providers configured. Ask an admin to run `/ks setlink`.",
+            ephemeral=True)
+        return
+
+    pending = get_pending_session(interaction.user.id, interaction.guild.id)
+    if pending:
+        gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{pending['token']}"
+        view = KeyClaimView(pending['token'], gateway_url, str(interaction.guild.id))
+
+        embed = discord.Embed(
+            title="🔑 Verification Already Complete!",
+            description="You already have a completed session. Click **Claim Key** below.",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        return
+
+    token = create_session(
+        interaction.guild.id,
+        interaction.user.id,
+        interaction.user.name
+    )
+
+    if not token:
+        await interaction.response.send_message(
+            "❌ Failed to create session. Try again later.", ephemeral=True)
+        return
+
+    gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{token}"
+    view = KeyClaimView(token, gateway_url, str(interaction.guild.id))
+
+    embed = discord.Embed(title="🔑 Key Verification", color=discord.Color.blurple())
+    embed.description = (
+        "**How to get your key:**\n\n"
+        "1️⃣ Click **Open Verification** below\n"
+        "2️⃣ Choose a provider and complete the task\n"
+        "3️⃣ Come back here and click **Claim Key**\n\n"
+        "⏱️ Session expires in **30 minutes**"
+    )
+    embed.set_footer(text="Do not share verification links.")
+
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+@ks_group.command(name="resetkey", description="Reset your key and HWID lock.")
+async def ks_resetkey(interaction: discord.Interaction):
+    config = get_guild_config(interaction.guild.id)
+    if not config:
+        await interaction.response.send_message(
+            "❌ Key system not set up for this server.", ephemeral=True)
+        return
+
+    count = delete_guild_keys_by_user(interaction.guild.id, interaction.user.id)
+    if count > 0:
+        await interaction.response.send_message(
+            "♻️ Key wiped. Run `/ks getkey` to get a new one.", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            "You don't have any active keys. Run `/ks getkey`.", ephemeral=True)
+
+
+@ks_group.command(name="revokekey", description="[Admin] Revoke a user's key.")
+@app_commands.describe(user="User whose key to revoke")
+@app_commands.checks.has_permissions(administrator=True)
+async def ks_revokekey(interaction: discord.Interaction, user: discord.Member):
+    config = get_guild_config(interaction.guild.id)
+    if not config:
+        await interaction.response.send_message("❌ Key system not set up.", ephemeral=True)
+        return
+
+    count = delete_guild_keys_by_user(interaction.guild.id, user.id)
+    if count > 0:
+        await interaction.response.send_message(
+            f"🗑️ Revoked {count} key(s) for {user.mention}.", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"{user.mention} has no active keys.", ephemeral=True)
+
+
+@ks_group.command(name="stats", description="[Admin] View key system statistics.")
+@app_commands.checks.has_permissions(administrator=True)
+async def ks_stats(interaction: discord.Interaction):
+    config = get_guild_config(interaction.guild.id)
+    if not config:
+        await interaction.response.send_message("❌ Key system not set up.", ephemeral=True)
+        return
+
+    stats = get_guild_key_stats(interaction.guild.id)
+
+    embed = discord.Embed(title="📊 Key System Stats", color=discord.Color.blurple())
+    embed.add_field(name="Total Keys", value=str(stats['total']), inline=True)
+    embed.add_field(name="Active", value=str(stats['active']), inline=True)
+    embed.add_field(name="Expired", value=str(stats['expired']), inline=True)
+    embed.add_field(name="HWID Locked", value=str(stats['hwid_locked']), inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@ks_group.command(name="disable", description="[Admin] Disable the key system.")
+@app_commands.checks.has_permissions(administrator=True)
+async def ks_disable(interaction: discord.Interaction):
+    config = get_guild_config(interaction.guild.id)
+    if not config:
+        await interaction.response.send_message("❌ Nothing to disable.", ephemeral=True)
+        return
+
+    save_guild_config(interaction.guild.id, {"enabled": False, "updated_at": time.time()})
+    await interaction.response.send_message(
+        "🔒 Key system disabled. Run `/ks setup` to re-enable.", ephemeral=True)
+
+
+@ks_group.command(name="toggle-membership", description="[Admin] Toggle server membership requirement for keys.")
+@app_commands.checks.has_permissions(administrator=True)
+async def ks_toggle_membership(interaction: discord.Interaction):
+    config = get_guild_config(interaction.guild.id)
+    if not config:
+        await interaction.response.send_message("❌ Key system not set up.", ephemeral=True)
+        return
+
+    current = config.get('require_membership', True)
+    save_guild_config(interaction.guild.id, {
+        "require_membership": not current,
+        "updated_at": time.time()
+    })
+
+    status = "disabled" if current else "enabled"
+    await interaction.response.send_message(
+        f"{'🔓' if current else '🔒'} Membership requirement **{status}**.", ephemeral=True)
+
+
+bot.tree.add_command(ks_group)
+
+
 @bot.event
 async def on_member_remove(member):
-    if member.guild.id != GUILD_ID:
-        return
-    count = delete_keys_by_discord_id(member.id)
-    if count > 0:
-        log_channel = bot.get_channel(LOG_CHANNEL_ID)
-        if log_channel:
-            embed = discord.Embed(title="\U0001f511 Key Auto-Revoked", color=discord.Color.red())
-            embed.add_field(name="User", value=f"{member.name} ({member.id})", inline=False)
-            embed.add_field(name="Reason", value="Left the server", inline=False)
-            embed.add_field(name="Keys Revoked", value=str(count), inline=False)
-            await log_channel.send(embed=embed)
+    if member.guild.id == GUILD_ID:
+        count = delete_keys_by_discord_id(member.id)
+        if count > 0:
+            log_channel = bot.get_channel(LOG_CHANNEL_ID)
+            if log_channel:
+                embed = discord.Embed(title="\U0001f511 Key Auto-Revoked", color=discord.Color.red())
+                embed.add_field(name="User", value=f"{member.name} ({member.id})", inline=False)
+                embed.add_field(name="Reason", value="Left the server", inline=False)
+                embed.add_field(name="Keys Revoked", value=str(count), inline=False)
+                await log_channel.send(embed=embed)
+
+    guild_config = get_guild_config(member.guild.id)
+    if guild_config and guild_config.get('require_membership'):
+        guild_count = delete_guild_keys_by_user(member.guild.id, member.id)
+        if guild_count > 0:
+            log_channel = bot.get_channel(LOG_CHANNEL_ID)
+            if log_channel:
+                embed = discord.Embed(title="🔑 Guild Key Auto-Revoked", color=discord.Color.orange())
+                embed.add_field(name="User", value=f"{member.name} ({member.id})", inline=False)
+                embed.add_field(name="Guild", value=f"{member.guild.name} ({member.guild.id})", inline=False)
+                embed.add_field(name="Keys Revoked", value=str(guild_count), inline=False)
+                await log_channel.send(embed=embed)
 
 
 @bot.event
@@ -284,14 +705,23 @@ async def on_ready():
 
     expired = cleanup_expired()
     if expired > 0:
-        print(f"Cleaned up {expired} expired keys from database")
+        print(f"Cleaned up {expired} expired premium keys")
+
+    guild_expired = cleanup_expired_guild_keys()
+    if guild_expired > 0:
+        print(f"Cleaned up {guild_expired} expired guild keys")
 
     try:
         await asyncio.sleep(5)
+
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
         synced = await bot.tree.sync(guild=guild)
         print(f"Synced {len(synced)} guild commands")
+
+        global_synced = await bot.tree.sync()
+        print(f"Synced {len(global_synced)} global commands")
+
     except discord.HTTPException as e:
         if e.status == 429:
             print("Rate limited - commands already synced, skipping")
