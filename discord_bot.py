@@ -17,10 +17,13 @@ from key_store import (
 from guild_key_system import (
     get_guild_config, init_guild_config, save_guild_config,
     delete_guild_config, create_session, get_session,
-    update_session, get_pending_session, get_active_session,
+    update_session, get_pending_session,
     create_guild_key, delete_guild_keys_by_user,
     get_guild_key_stats, cleanup_expired_guild_keys,
-    get_destination_url, SERVER_BASE_URL
+    get_destination_url, get_script_profile, get_script_profiles,
+    create_script_profile, update_script_profile, delete_script_profile,
+    get_profile_by_name,
+    SERVER_BASE_URL
 )
 
 TARGET_CHANNEL_ID = 1389210900489044048
@@ -204,11 +207,12 @@ BOOST_TYPES = {discord.MessageType.premium_guild_subscription}
 
 
 class KeyClaimView(discord.ui.View):
-    def __init__(self, session_token, gateway_url, guild_id):
+    def __init__(self, session_token, gateway_url, guild_id, profile_id):
         super().__init__(timeout=1800)
         self.session_token = session_token
         self.gateway_url = gateway_url
         self.guild_id = guild_id
+        self.profile_id = profile_id
 
         self.add_item(discord.ui.Button(
             label="🔗 Open Verification",
@@ -242,14 +246,15 @@ class KeyClaimView(discord.ui.View):
                 "⚠️ Key already claimed for this session.", ephemeral=True)
             return
 
-        config = get_guild_config(self.guild_id)
-        duration = config.get('key_duration_hours', 24) if config else 24
+        profile = get_script_profile(self.profile_id)
+        duration = profile.get('key_duration_hours', 24) if profile else 24
 
         key = create_guild_key(
             self.guild_id,
             interaction.user.id,
             interaction.user.name,
-            duration
+            duration,
+            self.profile_id
         )
 
         if not key:
@@ -264,6 +269,7 @@ class KeyClaimView(discord.ui.View):
 
         embed = discord.Embed(title="🔑 Your Key", color=discord.Color.green())
         embed.description = f"```{key}```"
+        embed.add_field(name="Script", value=profile.get('name', 'Unknown') if profile else 'Unknown', inline=True)
         embed.add_field(name="Expires", value=f"<t:{expires_ts}:R>", inline=True)
         embed.add_field(name="HWID Lock", value="Locks on first use", inline=True)
         embed.set_footer(text="Do not share your key. Leave the server = key revoked.")
@@ -303,26 +309,177 @@ class KeyClaimView(discord.ui.View):
         await interaction.response.send_message(status, ephemeral=True)
 
 
+class DiscordKeyClaimView(discord.ui.View):
+    def __init__(self, guild_id, profile_id):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.profile_id = profile_id
+
+    @discord.ui.button(label="🔑 Get Key", style=discord.ButtonStyle.success, custom_id="discord_claim_key")
+    async def get_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        profile = get_script_profile(self.profile_id)
+        if not profile or not profile.get('enabled'):
+            await interaction.response.send_message("❌ This script profile is disabled.", ephemeral=True)
+            return
+
+        if profile.get('required_role_id'):
+            role = interaction.guild.get_role(int(profile['required_role_id']))
+            if role and role not in interaction.user.roles:
+                await interaction.response.send_message(
+                    f"❌ You need the {role.mention} role to get a key for this script.", ephemeral=True)
+                return
+
+        duration = profile.get('key_duration_hours', 24)
+
+        key = create_guild_key(
+            self.guild_id,
+            interaction.user.id,
+            interaction.user.name,
+            duration,
+            self.profile_id
+        )
+
+        if not key:
+            await interaction.response.send_message(
+                "❌ Failed to generate key. Try again later.", ephemeral=True)
+            return
+
+        expires_ts = int(time.time() + (duration * 3600))
+
+        embed = discord.Embed(title="🔑 Your Key", color=discord.Color.green())
+        embed.description = f"```{key}```"
+        embed.add_field(name="Script", value=profile.get('name', 'Unknown'), inline=True)
+        embed.add_field(name="Expires", value=f"<t:{expires_ts}:R>", inline=True)
+        embed.add_field(name="HWID Lock", value="Locks on first use", inline=True)
+        embed.set_footer(text="Do not share your key. Leave the server = key revoked.")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class ProfileSelectForKey(discord.ui.Select):
+    def __init__(self, profiles, guild_id):
+        self.guild_id = guild_id
+        self.profiles_map = {}
+        options = []
+        for p in profiles:
+            pid = p['profile_id']
+            self.profiles_map[pid] = p
+            type_label = "🔗 Ad-Link" if p['key_type'] == 'adlink' else "💬 Discord"
+            options.append(discord.SelectOption(
+                label=p['name'],
+                value=pid,
+                description=f"{type_label} | {p.get('key_duration_hours', 24)}h keys"
+            ))
+        super().__init__(placeholder="Select a script...", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        profile_id = self.values[0]
+        profile = self.profiles_map.get(profile_id)
+
+        if not profile or not profile.get('enabled'):
+            await interaction.response.send_message("❌ This profile is disabled.", ephemeral=True)
+            return
+
+        if profile.get('required_role_id'):
+            role = interaction.guild.get_role(int(profile['required_role_id']))
+            if role and role not in interaction.user.roles:
+                await interaction.response.send_message(
+                    f"❌ You need the {role.mention} role to get a key for **{profile['name']}**.", ephemeral=True)
+                return
+
+        if profile['key_type'] == 'discord':
+            duration = profile.get('key_duration_hours', 24)
+
+            key = create_guild_key(
+                self.guild_id,
+                interaction.user.id,
+                interaction.user.name,
+                duration,
+                profile_id
+            )
+
+            if not key:
+                await interaction.response.send_message("❌ Failed to generate key.", ephemeral=True)
+                return
+
+            expires_ts = int(time.time() + (duration * 3600))
+
+            embed = discord.Embed(title="🔑 Your Key", color=discord.Color.green())
+            embed.description = f"```{key}```"
+            embed.add_field(name="Script", value=profile['name'], inline=True)
+            embed.add_field(name="Expires", value=f"<t:{expires_ts}:R>", inline=True)
+            embed.add_field(name="HWID Lock", value="Locks on first use", inline=True)
+            embed.set_footer(text="Do not share your key. Leave the server = key revoked.")
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        elif profile['key_type'] == 'adlink':
+            has_providers = any([
+                profile.get('workink_url'),
+                profile.get('lootlabs_url'),
+                profile.get('linkvertise_url')
+            ])
+            if not has_providers:
+                await interaction.response.send_message(
+                    "❌ No verification links configured for this script. Ask an admin.", ephemeral=True)
+                return
+
+            pending = get_pending_session(interaction.user.id, self.guild_id, profile_id)
+            if pending:
+                gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{pending['token']}"
+                view = KeyClaimView(pending['token'], gateway_url, str(self.guild_id), profile_id)
+
+                embed = discord.Embed(
+                    title="🔑 Verification Already Complete!",
+                    description=f"You already completed verification for **{profile['name']}**. Click **Claim Key** below.",
+                    color=discord.Color.green()
+                )
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+                return
+
+            token = create_session(
+                self.guild_id,
+                interaction.user.id,
+                interaction.user.name,
+                profile_id
+            )
+
+            if not token:
+                await interaction.response.send_message("❌ Failed to create session. Try again later.", ephemeral=True)
+                return
+
+            gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{token}"
+            view = KeyClaimView(token, gateway_url, str(self.guild_id), profile_id)
+
+            embed = discord.Embed(title="🔑 Key Verification", color=discord.Color.blurple())
+            embed.description = (
+                f"**Getting key for: {profile['name']}**\n\n"
+                "1️⃣ Click **Open Verification** below\n"
+                "2️⃣ Choose a provider and complete the task\n"
+                "3️⃣ Come back here and click **Claim Key**\n\n"
+                "⏱️ Session expires in **30 minutes**"
+            )
+            embed.set_footer(text="Do not share verification links.")
+
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class ProfileSelectView(discord.ui.View):
+    def __init__(self, profiles, guild_id):
+        super().__init__(timeout=120)
+        self.add_item(ProfileSelectForKey(profiles, guild_id))
+
+
 ks_group = app_commands.Group(name="ks", description="Key System commands")
 
 
 @ks_group.command(name="setup", description="[Admin] Initialize the key system for this server.")
-@app_commands.describe(
-    key_duration="How long keys last in hours (default: 24)",
-    min_time="Minimum seconds to complete verification (default: 25)"
-)
 @app_commands.checks.has_permissions(administrator=True)
-async def ks_setup(
-    interaction: discord.Interaction,
-    key_duration: int = 24,
-    min_time: int = 25
-):
+async def ks_setup(interaction: discord.Interaction):
     config = init_guild_config(
         interaction.guild.id,
         interaction.guild.name,
-        interaction.user.id,
-        key_duration,
-        min_time
+        interaction.user.id
     )
 
     if not config:
@@ -330,34 +487,102 @@ async def ks_setup(
             "❌ Failed to initialize. Database may be unavailable.", ephemeral=True)
         return
 
-    dest_url = get_destination_url(interaction.guild.id)
-
     embed = discord.Embed(title="⚙️ Key System Initialized", color=discord.Color.blurple())
     embed.description = (
-        "Your key system is ready! Follow these steps:\n\n"
-        "**Step 1:** Create a campaign on your monetization platform "
-        "(Work.ink, LootLabs, etc.) and set the **destination URL** to:\n"
-        f"```\n{dest_url}\n```\n"
-        "**Step 2:** Copy your campaign link and run:\n"
-        "```\n/ks setlink workink: <your-campaign-url>\n```\n"
-        "**Step 3:** Users can now run `/ks getkey` to get keys!\n\n"
-        "**For your Roblox script**, use this API secret:"
+        "Your server's key system is ready!\n\n"
+        "**Next steps:**\n"
+        "1️⃣ Create script profiles with `/ks addscript`\n"
+        "2️⃣ For ad-link profiles, set links with `/ks setlink`\n"
+        "3️⃣ Users get keys with `/ks getkey`\n\n"
+        "**Key types:**\n"
+        "• `discord` — Key given instantly, forces server membership\n"
+        "• `adlink` — Key given after completing a monetization link"
     )
-    embed.add_field(name="🔐 API Secret", value=f"||{config['api_secret']}||", inline=False)
-    embed.add_field(name="⏱️ Key Duration", value=f"{key_duration} hours", inline=True)
-    embed.add_field(name="⏳ Min Completion Time", value=f"{min_time} seconds", inline=True)
-    embed.add_field(
-        name="🔗 Validation URL",
-        value=f"```\n{SERVER_BASE_URL}/api/validate-guild-key\n```",
-        inline=False
-    )
-    embed.set_footer(text="Keep your API secret private! Use /ks config to view settings later.")
+    embed.set_footer(text="Use /ks config to view settings anytime.")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@ks_group.command(name="setlink", description="[Admin] Set monetization provider links.")
+@ks_group.command(name="addscript", description="[Admin] Add a script profile to your key system.")
 @app_commands.describe(
+    name="Name for this script (e.g. 'My ESP Script')",
+    key_type="Type of key system: 'discord' (instant) or 'adlink' (monetization)",
+    key_duration="How long keys last in hours (default: 24)",
+    required_role="Role required to get a key (optional)"
+)
+@app_commands.choices(key_type=[
+    app_commands.Choice(name="Discord (instant key, membership required)", value="discord"),
+    app_commands.Choice(name="Ad-Link (monetization link required)", value="adlink"),
+])
+@app_commands.checks.has_permissions(administrator=True)
+async def ks_addscript(
+    interaction: discord.Interaction,
+    name: str,
+    key_type: app_commands.Choice[str],
+    key_duration: int = 24,
+    required_role: discord.Role = None
+):
+    config = get_guild_config(interaction.guild.id)
+    if not config:
+        await interaction.response.send_message("❌ Run `/ks setup` first.", ephemeral=True)
+        return
+
+    existing = get_profile_by_name(interaction.guild.id, name)
+    if existing:
+        await interaction.response.send_message(
+            f"❌ A script profile named **{name}** already exists.", ephemeral=True)
+        return
+
+    profiles = get_script_profiles(interaction.guild.id)
+    if len(profiles) >= 10:
+        await interaction.response.send_message(
+            "❌ Maximum 10 script profiles per server.", ephemeral=True)
+        return
+
+    profile = create_script_profile(
+        interaction.guild.id,
+        name,
+        key_type.value,
+        key_duration,
+        required_role.id if required_role else None
+    )
+
+    if not profile:
+        await interaction.response.send_message("❌ Failed to create profile.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="✅ Script Profile Created", color=discord.Color.green())
+    embed.add_field(name="Name", value=name, inline=True)
+    embed.add_field(name="Type", value=key_type.name, inline=True)
+    embed.add_field(name="Key Duration", value=f"{key_duration}h", inline=True)
+
+    if required_role:
+        embed.add_field(name="Required Role", value=required_role.mention, inline=True)
+
+    embed.add_field(name="🔐 API Secret", value=f"||{profile['api_secret']}||", inline=False)
+    embed.add_field(
+        name="🔗 Validation URL",
+        value=f"```{SERVER_BASE_URL}/api/validate-guild-key```",
+        inline=False
+    )
+
+    if key_type.value == 'adlink':
+        dest_url = get_destination_url(interaction.guild.id, profile['profile_id'])
+        embed.add_field(
+            name="📎 Destination URL (for your campaign)",
+            value=f"```{dest_url}```",
+            inline=False
+        )
+        embed.set_footer(text="Set your campaign destination to the URL above, then use /ks setlink to register it.")
+    else:
+        embed.set_footer(text="Users can get keys immediately with /ks getkey. No links needed.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@ks_group.command(name="setlink", description="[Admin] Set monetization links for an ad-link script profile.")
+@app_commands.describe(
+    script_name="Name of the script profile",
     workink="Your Work.ink campaign URL",
     lootlabs="Your LootLabs campaign URL",
     linkvertise="Your Linkvertise campaign URL"
@@ -365,19 +590,29 @@ async def ks_setup(
 @app_commands.checks.has_permissions(administrator=True)
 async def ks_setlink(
     interaction: discord.Interaction,
+    script_name: str,
     workink: str = None,
     lootlabs: str = None,
     linkvertise: str = None
 ):
     config = get_guild_config(interaction.guild.id)
     if not config:
+        await interaction.response.send_message("❌ Run `/ks setup` first.", ephemeral=True)
+        return
+
+    profile = get_profile_by_name(interaction.guild.id, script_name)
+    if not profile:
         await interaction.response.send_message(
-            "❌ Run `/ks setup` first.", ephemeral=True)
+            f"❌ No script profile named **{script_name}** found. Use `/ks addscript` first.", ephemeral=True)
+        return
+
+    if profile['key_type'] != 'adlink':
+        await interaction.response.send_message(
+            f"❌ **{script_name}** is a Discord-type profile. Links are only for ad-link profiles.", ephemeral=True)
         return
 
     if not workink and not lootlabs and not linkvertise:
-        await interaction.response.send_message(
-            "❌ Provide at least one link.", ephemeral=True)
+        await interaction.response.send_message("❌ Provide at least one link.", ephemeral=True)
         return
 
     updates = {}
@@ -407,10 +642,9 @@ async def ks_setlink(
         display = f"{linkvertise[:60]}..." if len(linkvertise) > 60 else linkvertise
         set_links.append(f"🔗 Linkvertise: `{display}`")
 
-    updates['updated_at'] = time.time()
-    save_guild_config(interaction.guild.id, updates)
+    update_script_profile(profile['profile_id'], updates)
 
-    embed = discord.Embed(title="✅ Links Updated", color=discord.Color.green())
+    embed = discord.Embed(title=f"✅ Links Updated for {script_name}", color=discord.Color.green())
     embed.description = "\n".join(set_links)
     embed.set_footer(text="Users can now run /ks getkey")
 
@@ -426,37 +660,61 @@ async def ks_config(interaction: discord.Interaction):
             "❌ Key system not set up. Run `/ks setup` first.", ephemeral=True)
         return
 
-    dest_url = get_destination_url(interaction.guild.id)
+    profiles = get_script_profiles(interaction.guild.id)
 
     embed = discord.Embed(title="⚙️ Key System Config", color=discord.Color.blurple())
     embed.add_field(name="Status", value="✅ Enabled" if config.get('enabled') else "❌ Disabled", inline=True)
-    embed.add_field(name="Key Duration", value=f"{config.get('key_duration_hours', 24)}h", inline=True)
-    embed.add_field(name="Min Time", value=f"{config.get('min_completion_seconds', 25)}s", inline=True)
-    embed.add_field(name="Membership Required", value="Yes" if config.get('require_membership', True) else "No", inline=True)
+    embed.add_field(name="Script Profiles", value=str(len(profiles)), inline=True)
 
-    providers = []
-    if config.get('workink_url'):
-        providers.append("⚡ Work.ink ✅")
-    if config.get('lootlabs_url'):
-        providers.append("🎁 LootLabs ✅")
-    if config.get('linkvertise_url'):
-        providers.append("🔗 Linkvertise ✅")
-    if not providers:
-        providers.append("⚠️ None configured — run `/ks setlink`")
+    if not profiles:
+        embed.add_field(name="Scripts", value="None — use `/ks addscript` to create one", inline=False)
+    else:
+        for p in profiles:
+            type_emoji = "🔗" if p['key_type'] == 'adlink' else "💬"
+            status = "✅" if p.get('enabled') else "❌"
 
-    embed.add_field(name="Providers", value="\n".join(providers), inline=False)
-    embed.add_field(name="Destination URL", value=f"```{dest_url}```", inline=False)
-    embed.add_field(name="API Secret", value=f"||{config.get('api_secret', 'N/A')}||", inline=False)
-    embed.add_field(
-        name="Validation URL",
-        value=f"```{SERVER_BASE_URL}/api/validate-guild-key```",
-        inline=False
-    )
+            providers = []
+            if p['key_type'] == 'adlink':
+                if p.get('workink_url'):
+                    providers.append("⚡WI")
+                if p.get('lootlabs_url'):
+                    providers.append("🎁LL")
+                if p.get('linkvertise_url'):
+                    providers.append("🔗LV")
+
+            role_text = ""
+            if p.get('required_role_id'):
+                role_text = f" | Role: <@&{p['required_role_id']}>"
+
+            provider_text = f" | {' '.join(providers)}" if providers else ""
+            if p['key_type'] == 'adlink' and not providers:
+                provider_text = " | ⚠️ No links set"
+
+            embed.add_field(
+                name=f"{type_emoji} {p['name']} {status}",
+                value=f"Type: {p['key_type']} | Duration: {p.get('key_duration_hours', 24)}h{role_text}{provider_text}\nSecret: ||{p.get('api_secret', 'N/A')}||",
+                inline=False
+            )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@ks_group.command(name="getkey", description="Get a script key by completing verification.")
+@ks_group.command(name="removescript", description="[Admin] Remove a script profile.")
+@app_commands.describe(script_name="Name of the script profile to remove")
+@app_commands.checks.has_permissions(administrator=True)
+async def ks_removescript(interaction: discord.Interaction, script_name: str):
+    profile = get_profile_by_name(interaction.guild.id, script_name)
+    if not profile:
+        await interaction.response.send_message(
+            f"❌ No script profile named **{script_name}** found.", ephemeral=True)
+        return
+
+    delete_script_profile(profile['profile_id'])
+    await interaction.response.send_message(
+        f"🗑️ Script profile **{script_name}** and all its keys have been deleted.", ephemeral=True)
+
+
+@ks_group.command(name="getkey", description="Get a script key.")
 async def ks_getkey(interaction: discord.Interaction):
     config = get_guild_config(interaction.guild.id)
     if not config or not config.get('enabled'):
@@ -464,84 +722,151 @@ async def ks_getkey(interaction: discord.Interaction):
             "❌ Key system is not set up for this server.", ephemeral=True)
         return
 
-    has_providers = any([
-        config.get('workink_url'),
-        config.get('lootlabs_url'),
-        config.get('linkvertise_url')
-    ])
-    if not has_providers:
+    profiles = get_script_profiles(interaction.guild.id)
+    active_profiles = [p for p in profiles if p.get('enabled')]
+
+    if not active_profiles:
         await interaction.response.send_message(
-            "❌ No verification providers configured. Ask an admin to run `/ks setlink`.",
-            ephemeral=True)
+            "❌ No script profiles available.", ephemeral=True)
         return
 
-    pending = get_pending_session(interaction.user.id, interaction.guild.id)
-    if pending:
-        gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{pending['token']}"
-        view = KeyClaimView(pending['token'], gateway_url, str(interaction.guild.id))
+    if len(active_profiles) == 1:
+        profile = active_profiles[0]
 
-        embed = discord.Embed(
-            title="🔑 Verification Already Complete!",
-            description="You already have a completed session. Click **Claim Key** below.",
-            color=discord.Color.green()
-        )
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        return
+        if profile.get('required_role_id'):
+            role = interaction.guild.get_role(int(profile['required_role_id']))
+            if role and role not in interaction.user.roles:
+                await interaction.response.send_message(
+                    f"❌ You need the {role.mention} role to get a key for **{profile['name']}**.", ephemeral=True)
+                return
 
-    token = create_session(
-        interaction.guild.id,
-        interaction.user.id,
-        interaction.user.name
-    )
+        if profile['key_type'] == 'discord':
+            duration = profile.get('key_duration_hours', 24)
 
-    if not token:
-        await interaction.response.send_message(
-            "❌ Failed to create session. Try again later.", ephemeral=True)
-        return
+            key = create_guild_key(
+                interaction.guild.id,
+                interaction.user.id,
+                interaction.user.name,
+                duration,
+                profile['profile_id']
+            )
 
-    gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{token}"
-    view = KeyClaimView(token, gateway_url, str(interaction.guild.id))
+            if not key:
+                await interaction.response.send_message("❌ Failed to generate key.", ephemeral=True)
+                return
 
-    embed = discord.Embed(title="🔑 Key Verification", color=discord.Color.blurple())
-    embed.description = (
-        "**How to get your key:**\n\n"
-        "1️⃣ Click **Open Verification** below\n"
-        "2️⃣ Choose a provider and complete the task\n"
-        "3️⃣ Come back here and click **Claim Key**\n\n"
-        "⏱️ Session expires in **30 minutes**"
-    )
-    embed.set_footer(text="Do not share verification links.")
+            expires_ts = int(time.time() + (duration * 3600))
 
+            embed = discord.Embed(title="🔑 Your Key", color=discord.Color.green())
+            embed.description = f"```{key}```"
+            embed.add_field(name="Script", value=profile['name'], inline=True)
+            embed.add_field(name="Expires", value=f"<t:{expires_ts}:R>", inline=True)
+            embed.add_field(name="HWID Lock", value="Locks on first use", inline=True)
+            embed.set_footer(text="Do not share your key. Leave the server = key revoked.")
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        elif profile['key_type'] == 'adlink':
+            has_providers = any([
+                profile.get('workink_url'),
+                profile.get('lootlabs_url'),
+                profile.get('linkvertise_url')
+            ])
+            if not has_providers:
+                await interaction.response.send_message(
+                    "❌ No verification links configured. Ask an admin.", ephemeral=True)
+                return
+
+            pending = get_pending_session(interaction.user.id, interaction.guild.id, profile['profile_id'])
+            if pending:
+                gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{pending['token']}"
+                view = KeyClaimView(pending['token'], gateway_url, str(interaction.guild.id), profile['profile_id'])
+
+                embed = discord.Embed(
+                    title="🔑 Verification Already Complete!",
+                    description=f"Click **Claim Key** to get your key for **{profile['name']}**.",
+                    color=discord.Color.green()
+                )
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+                return
+
+            token = create_session(
+                interaction.guild.id,
+                interaction.user.id,
+                interaction.user.name,
+                profile['profile_id']
+            )
+
+            if not token:
+                await interaction.response.send_message("❌ Failed to create session.", ephemeral=True)
+                return
+
+            gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{token}"
+            view = KeyClaimView(token, gateway_url, str(interaction.guild.id), profile['profile_id'])
+
+            embed = discord.Embed(title="🔑 Key Verification", color=discord.Color.blurple())
+            embed.description = (
+                f"**Getting key for: {profile['name']}**\n\n"
+                "1️⃣ Click **Open Verification** below\n"
+                "2️⃣ Choose a provider and complete the task\n"
+                "3️⃣ Come back here and click **Claim Key**\n\n"
+                "⏱️ Session expires in **30 minutes**"
+            )
+            embed.set_footer(text="Do not share verification links.")
+
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            return
+
+    view = ProfileSelectView(active_profiles, str(interaction.guild.id))
+    embed = discord.Embed(title="🔑 Select a Script", color=discord.Color.blurple())
+    embed.description = "Choose which script you need a key for:"
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@ks_group.command(name="resetkey", description="Reset your key and HWID lock.")
-async def ks_resetkey(interaction: discord.Interaction):
+@ks_group.command(name="resetkey", description="Reset your key and HWID lock for a script.")
+@app_commands.describe(script_name="Name of the script (leave empty to reset all)")
+async def ks_resetkey(interaction: discord.Interaction, script_name: str = None):
     config = get_guild_config(interaction.guild.id)
     if not config:
-        await interaction.response.send_message(
-            "❌ Key system not set up for this server.", ephemeral=True)
+        await interaction.response.send_message("❌ Key system not set up.", ephemeral=True)
         return
 
-    count = delete_guild_keys_by_user(interaction.guild.id, interaction.user.id)
+    if script_name:
+        profile = get_profile_by_name(interaction.guild.id, script_name)
+        if not profile:
+            await interaction.response.send_message(f"❌ No script named **{script_name}** found.", ephemeral=True)
+            return
+        count = delete_guild_keys_by_user(interaction.guild.id, interaction.user.id, profile['profile_id'])
+    else:
+        count = delete_guild_keys_by_user(interaction.guild.id, interaction.user.id)
+
     if count > 0:
         await interaction.response.send_message(
-            "♻️ Key wiped. Run `/ks getkey` to get a new one.", ephemeral=True)
+            f"♻️ {count} key(s) wiped. Run `/ks getkey` to get new ones.", ephemeral=True)
     else:
         await interaction.response.send_message(
             "You don't have any active keys. Run `/ks getkey`.", ephemeral=True)
 
 
 @ks_group.command(name="revokekey", description="[Admin] Revoke a user's key.")
-@app_commands.describe(user="User whose key to revoke")
+@app_commands.describe(user="User whose key to revoke", script_name="Script name (optional)")
 @app_commands.checks.has_permissions(administrator=True)
-async def ks_revokekey(interaction: discord.Interaction, user: discord.Member):
+async def ks_revokekey(interaction: discord.Interaction, user: discord.Member, script_name: str = None):
     config = get_guild_config(interaction.guild.id)
     if not config:
         await interaction.response.send_message("❌ Key system not set up.", ephemeral=True)
         return
 
-    count = delete_guild_keys_by_user(interaction.guild.id, user.id)
+    profile_id = None
+    if script_name:
+        profile = get_profile_by_name(interaction.guild.id, script_name)
+        if not profile:
+            await interaction.response.send_message(f"❌ No script named **{script_name}** found.", ephemeral=True)
+            return
+        profile_id = profile['profile_id']
+
+    count = delete_guild_keys_by_user(interaction.guild.id, user.id, profile_id)
     if count > 0:
         await interaction.response.send_message(
             f"🗑️ Revoked {count} key(s) for {user.mention}.", ephemeral=True)
@@ -551,16 +876,27 @@ async def ks_revokekey(interaction: discord.Interaction, user: discord.Member):
 
 
 @ks_group.command(name="stats", description="[Admin] View key system statistics.")
+@app_commands.describe(script_name="Script name (optional, shows all if empty)")
 @app_commands.checks.has_permissions(administrator=True)
-async def ks_stats(interaction: discord.Interaction):
+async def ks_stats(interaction: discord.Interaction, script_name: str = None):
     config = get_guild_config(interaction.guild.id)
     if not config:
         await interaction.response.send_message("❌ Key system not set up.", ephemeral=True)
         return
 
-    stats = get_guild_key_stats(interaction.guild.id)
+    profile_id = None
+    title_suffix = ""
+    if script_name:
+        profile = get_profile_by_name(interaction.guild.id, script_name)
+        if not profile:
+            await interaction.response.send_message(f"❌ No script named **{script_name}** found.", ephemeral=True)
+            return
+        profile_id = profile['profile_id']
+        title_suffix = f" — {script_name}"
 
-    embed = discord.Embed(title="📊 Key System Stats", color=discord.Color.blurple())
+    stats = get_guild_key_stats(interaction.guild.id, profile_id)
+
+    embed = discord.Embed(title=f"📊 Key Stats{title_suffix}", color=discord.Color.blurple())
     embed.add_field(name="Total Keys", value=str(stats['total']), inline=True)
     embed.add_field(name="Active", value=str(stats['active']), inline=True)
     embed.add_field(name="Expired", value=str(stats['expired']), inline=True)
@@ -582,23 +918,21 @@ async def ks_disable(interaction: discord.Interaction):
         "🔒 Key system disabled. Run `/ks setup` to re-enable.", ephemeral=True)
 
 
-@ks_group.command(name="toggle-membership", description="[Admin] Toggle server membership requirement for keys.")
+@ks_group.command(name="toggle-membership", description="[Admin] Toggle membership requirement for a script.")
+@app_commands.describe(script_name="Name of the script profile")
 @app_commands.checks.has_permissions(administrator=True)
-async def ks_toggle_membership(interaction: discord.Interaction):
-    config = get_guild_config(interaction.guild.id)
-    if not config:
-        await interaction.response.send_message("❌ Key system not set up.", ephemeral=True)
+async def ks_toggle_membership(interaction: discord.Interaction, script_name: str):
+    profile = get_profile_by_name(interaction.guild.id, script_name)
+    if not profile:
+        await interaction.response.send_message(f"❌ No script named **{script_name}** found.", ephemeral=True)
         return
 
-    current = config.get('require_membership', True)
-    save_guild_config(interaction.guild.id, {
-        "require_membership": not current,
-        "updated_at": time.time()
-    })
+    current = profile.get('require_membership', True)
+    update_script_profile(profile['profile_id'], {"require_membership": not current})
 
     status = "disabled" if current else "enabled"
     await interaction.response.send_message(
-        f"{'🔓' if current else '🔒'} Membership requirement **{status}**.", ephemeral=True)
+        f"{'🔓' if current else '🔒'} Membership requirement **{status}** for **{script_name}**.", ephemeral=True)
 
 
 bot.tree.add_command(ks_group)
@@ -618,7 +952,7 @@ async def on_member_remove(member):
                 await log_channel.send(embed=embed)
 
     guild_config = get_guild_config(member.guild.id)
-    if guild_config and guild_config.get('require_membership'):
+    if guild_config:
         guild_count = delete_guild_keys_by_user(member.guild.id, member.id)
         if guild_count > 0:
             log_channel = bot.get_channel(LOG_CHANNEL_ID)
@@ -715,7 +1049,6 @@ async def on_ready():
         await asyncio.sleep(5)
 
         guild = discord.Object(id=GUILD_ID)
-        bot.tree.copy_global_to(guild=guild)
         synced = await bot.tree.sync(guild=guild)
         print(f"Synced {len(synced)} guild commands")
 
