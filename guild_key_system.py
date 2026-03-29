@@ -402,7 +402,7 @@ def validate_guild_key(key, hwid, api_secret):
     try:
         profile = get_profile_by_secret(api_secret)
         if not profile:
-            logger.warning(f"Guild key validation: no profile found for secret")
+            logger.warning(f"Guild key validation: no profile for secret")
             return False, "Invalid API secret"
 
         profile_id = profile["profile_id"]
@@ -410,7 +410,7 @@ def validate_guild_key(key, hwid, api_secret):
 
         key_doc = guild_keys_collection.find_one({"_id": key})
         if not key_doc:
-            logger.warning(f"Guild key validation: key not found '{key[:8]}...'")
+            logger.warning(f"Guild key validation: key not found")
             return False, "Invalid key"
 
         if key_doc.get("profile_id") != profile_id:
@@ -423,12 +423,10 @@ def validate_guild_key(key, hwid, api_secret):
 
         if time.time() > key_doc.get("expires_at", 0):
             guild_keys_collection.delete_one({"_id": key})
-            logger.warning(f"Guild key validation: key expired")
             return False, "Key expired. Get a new one from Discord."
 
         stored_hwid = key_doc.get("hwid")
         if stored_hwid and stored_hwid != hwid:
-            logger.warning(f"Guild key validation: HWID mismatch")
             return False, "Key locked to another device."
 
         if not stored_hwid:
@@ -436,7 +434,6 @@ def validate_guild_key(key, hwid, api_secret):
                 {"_id": key},
                 {"$set": {"hwid": hwid}}
             )
-            logger.info(f"Guild key validation: HWID locked")
 
         if profile.get("require_membership", True):
             discord_id = key_doc.get("discord_id")
@@ -444,14 +441,16 @@ def validate_guild_key(key, hwid, api_secret):
                 try:
                     import requests as req
                     headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
-                    url = f"https://discord.com/api/v10/guilds/{guild_id}/members/{discord_id}"
-                    resp = req.get(url, headers=headers, timeout=10)
-                    if resp.status_code != 200:
+                    check_url = f"https://discord.com/api/v10/guilds/{guild_id}/members/{discord_id}"
+                    resp = req.get(check_url, headers=headers, timeout=10)
+                    logger.info(f"Membership check: guild={guild_id} user={discord_id} status={resp.status_code}")
+                    if resp.status_code == 404:
                         guild_keys_collection.delete_one({"_id": key})
-                        logger.warning(f"Guild key validation: not in server")
                         return False, "You must be in the Discord server."
+                    elif resp.status_code != 200:
+                        logger.warning(f"Membership check returned {resp.status_code}, allowing through")
                 except Exception as ex:
-                    logger.error(f"Guild key validation: membership check failed: {ex}")
+                    logger.error(f"Membership check error: {ex}")
 
         logger.info(f"Guild key validation: SUCCESS for key '{key[:8]}...'")
         return True, "Authenticated"
