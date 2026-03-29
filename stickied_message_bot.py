@@ -35,7 +35,7 @@ bot = commands.Bot(command_prefix="?", intents=intents)
 stickied_messages = {}
 
 def save_data():
-    if not stickied_collection:
+    if stickied_collection is None:
         return
     try:
         for channel_key, data in stickied_messages.items():
@@ -48,7 +48,7 @@ def save_data():
         logger.error(f"MongoDB save failed: {e}")
 
 def delete_data(channel_key):
-    if not stickied_collection:
+    if stickied_collection is None:
         return
     try:
         stickied_collection.delete_one({"channel_key": channel_key})
@@ -57,7 +57,7 @@ def delete_data(channel_key):
 
 def load_data():
     global stickied_messages
-    if not stickied_collection:
+    if stickied_collection is None:
         stickied_messages = {}
         return
     try:
