@@ -38,8 +38,6 @@ else:
     logger.warning("MONGODB_URI not set for guild key system")
 
 
-# ─── Utility ───
-
 def _generate_api_secret():
     return secrets.token_urlsafe(32)
 
@@ -54,8 +52,6 @@ def _generate_key_string():
 def get_destination_url(guild_id):
     return f"{SERVER_BASE_URL}/ks/done/{guild_id}"
 
-
-# ─── Guild Config ───
 
 def get_guild_config(guild_id):
     if guild_configs_collection is None:
@@ -144,13 +140,10 @@ def get_guild_by_secret(api_secret):
         return None
 
 
-# ─── Sessions ───
-
 def create_session(guild_id, discord_id, discord_name):
     if guild_sessions_collection is None:
         return None
     try:
-        # Kill any existing active sessions for this user in this guild
         guild_sessions_collection.delete_many({
             "guild_id": str(guild_id),
             "discord_id": str(discord_id),
@@ -171,7 +164,7 @@ def create_session(guild_id, discord_id, discord_name):
             "completed_at": None,
             "key_claimed": False,
             "created_at": now,
-            "expires_at": now + 1800  # 30 min session
+            "expires_at": now + 1800
         }
         guild_sessions_collection.insert_one(session)
         return token
@@ -213,7 +206,6 @@ def update_session(token, updates):
 
 
 def find_session_by_ip_and_guild(ip, guild_id):
-    """Find the most recent uncompleted session for this IP + guild."""
     if guild_sessions_collection is None:
         return None
     try:
@@ -238,7 +230,6 @@ def find_session_by_ip_and_guild(ip, guild_id):
 
 
 def get_pending_session(discord_id, guild_id):
-    """Get unclaimed completed session for a user."""
     if guild_sessions_collection is None:
         return None
     try:
@@ -263,7 +254,6 @@ def get_pending_session(discord_id, guild_id):
 
 
 def get_active_session(discord_id, guild_id):
-    """Get any active (not expired) session for a user."""
     if guild_sessions_collection is None:
         return None
     try:
@@ -286,13 +276,10 @@ def get_active_session(discord_id, guild_id):
         return None
 
 
-# ─── Keys ───
-
 def create_guild_key(guild_id, discord_id, discord_name, duration_hours):
     if guild_keys_collection is None:
         return None
     try:
-        # Delete old keys for this user in this guild
         guild_keys_collection.delete_many({
             "guild_id": str(guild_id),
             "discord_id": str(discord_id)
@@ -317,7 +304,6 @@ def create_guild_key(guild_id, discord_id, discord_name, duration_hours):
 
 
 def validate_guild_key(key, hwid, api_secret):
-    """Validate a key. Returns (valid: bool, message: str)."""
     if guild_keys_collection is None:
         return False, "Key system unavailable"
 
@@ -339,7 +325,6 @@ def validate_guild_key(key, hwid, api_secret):
             guild_keys_collection.delete_one({"_id": key})
             return False, "Key expired. Get a new one from Discord."
 
-        # HWID lock
         stored_hwid = key_doc.get("hwid")
         if stored_hwid and stored_hwid != hwid:
             return False, "Key locked to another device."
@@ -350,7 +335,6 @@ def validate_guild_key(key, hwid, api_secret):
                 {"$set": {"hwid": hwid}}
             )
 
-        # Membership check
         if guild_config.get("require_membership", True):
             discord_id = key_doc.get("discord_id")
             if discord_id and DISCORD_TOKEN:
@@ -363,7 +347,7 @@ def validate_guild_key(key, hwid, api_secret):
                         guild_keys_collection.delete_one({"_id": key})
                         return False, "You must be in the Discord server."
                 except Exception:
-                    pass  # fail open on network errors
+                    pass
 
         return True, "Authenticated"
 
