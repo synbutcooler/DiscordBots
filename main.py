@@ -18,31 +18,29 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-def keep_alive_loop():
-    while True:
-        time.sleep(600)
-        if SELF_URL:
-            try:
-                resp = requests.get(f"https://vadriftzbots.onrender.com/health", timeout=15)
-                logger.info(f"Keep-alive ping: {resp.status_code}")
-            except Exception as e:
-                logger.warning(f"Keep-alive ping failed: {e}")
+SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://vadriftzbots.onrender.com")
 
+def keep_alive_loop():
+    time.sleep(30)
+    while True:
+        try:
+            resp = requests.get(f"{SELF_URL}/health", timeout=15)
+            logger.info(f"Keep-alive ping: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Keep-alive ping failed: {e}")
+        time.sleep(600)
 
 @app.route('/health')
 def health():
     return jsonify({"status": "healthy"}), 200
 
-
 @app.route('/')
 def index():
     return jsonify({"status": "Bot server running"}), 200
 
-
 @app.route('/api/validate-discord-key', methods=['POST'])
 def validate_discord_key():
     data = request.get_json()
-
     if not data:
         return jsonify({"valid": False, "message": "No data provided"})
 
@@ -57,7 +55,6 @@ def validate_discord_key():
         return jsonify({"valid": False, "message": "Missing key or HWID"})
 
     key_data = get_key(key_value)
-
     if not key_data:
         return jsonify({"valid": False, "message": "Invalid key"})
 
@@ -93,7 +90,6 @@ def validate_discord_key():
 
     return jsonify({"valid": True, "message": "Authenticated"})
 
-
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
 
@@ -102,9 +98,7 @@ if __name__ == '__main__':
         logger.info("Starting main bot...")
         bot_thread = threading.Thread(target=start_bot, daemon=True)
         bot_thread.start()
-
         time.sleep(10)
-
         logger.info("Starting stickied message bot...")
         stickied_bot_thread = threading.Thread(target=start_stickied_bot, daemon=True)
         stickied_bot_thread.start()
