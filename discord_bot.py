@@ -975,6 +975,50 @@ async def on_message(message):
         await bot.process_commands(message)
         return
 
+    MONITORED_CHANNELS = {
+    1454200774044291345,
+    1493410559331139697,
+    1493410056883011776,
+    1493409909235253380,
+}
+
+URL_PATTERN = re.compile(r'https?://\S+|www\.\S+')
+
+@bot.event
+async def on_message(message):
+    global last_meow_count
+
+    if message.author == bot.user:
+        return
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+
+    if message.channel.id in MONITORED_CHANNELS:
+        link_count = len(URL_PATTERN.findall(message.content or ""))
+        attachment_count = len(message.attachments)
+
+        if link_count >= 4 or attachment_count >= 4:
+            perms = message.channel.permissions_for(message.guild.me)
+            if not perms.manage_messages:
+                logger.warning(
+                    f"Missing Manage Messages permission in channel {message.channel.id}, "
+                    f"could not delete message {message.id} from {message.author} "
+                    f"(links={link_count}, attachments={attachment_count})"
+                )
+            else:
+                try:
+                    await message.delete()
+                    logger.info(
+                        f"Deleted message {message.id} from {message.author} in "
+                        f"channel {message.channel.id} (links={link_count}, attachments={attachment_count})"
+                    )
+                except discord.Forbidden:
+                    logger.warning(f"Forbidden: could not delete message {message.id}")
+                except discord.NotFound:
+                    pass
+            return
+            
     content = message.content or ""
     cleaned_content = re.sub(r'<@!?\d+>', '', content).strip()
     words = re.findall(r'\b\w+[!?.]*\b', cleaned_content)
