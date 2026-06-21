@@ -5,6 +5,7 @@ import asyncio
 import random
 import re
 import time
+import logging
 from datetime import datetime, timedelta
 from config import DISCORD_TOKEN
 from key_store import (
@@ -26,6 +27,8 @@ from guild_key_system import (
     SERVER_BASE_URL
 )
 
+logger = logging.getLogger(__name__)
+
 TARGET_CHANNEL_ID = 1389210900489044048
 AUTH_CHANNEL_ID = 1287714060716081183
 LOG_CHANNEL_ID = 1270314848764559494
@@ -34,6 +37,15 @@ DELAY_SECONDS = 1
 BOOST_TEST_CHANNEL_ID = 1270301984897110148
 
 DISCORD_KEY_EXPIRY_HOURS = 336
+
+MONITORED_CHANNELS = {
+    1454200774044291345,
+    1493410559331139697,
+    1493410056883011776,
+    1493409909235253380,
+}
+
+URL_PATTERN = re.compile(r'https?://\S+|www\.\S+')
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -975,25 +987,6 @@ async def on_message(message):
         await bot.process_commands(message)
         return
 
-    MONITORED_CHANNELS = {
-    1454200774044291345,
-    1493410559331139697,
-    1493410056883011776,
-    1493409909235253380,
-}
-
-URL_PATTERN = re.compile(r'https?://\S+|www\.\S+')
-
-@bot.event
-async def on_message(message):
-    global last_meow_count
-
-    if message.author == bot.user:
-        return
-    if message.author.bot:
-        await bot.process_commands(message)
-        return
-
     if message.channel.id in MONITORED_CHANNELS:
         link_count = len(URL_PATTERN.findall(message.content or ""))
         attachment_count = len(message.attachments)
@@ -1018,7 +1011,7 @@ async def on_message(message):
                 except discord.NotFound:
                     pass
             return
-            
+
     content = message.content or ""
     cleaned_content = re.sub(r'<@!?\d+>', '', content).strip()
     words = re.findall(r'\b\w+[!?.]*\b', cleaned_content)
