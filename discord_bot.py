@@ -38,6 +38,29 @@ BOOST_TEST_CHANNEL_ID = 1270301984897110148
 
 DISCORD_KEY_EXPIRY_HOURS = 336
 
+# --- Multi-tenant / public-bot settings -----------------------------------
+# This single bot runs BOTH the owner's personal server (legacy premium key
+# system + fun features) AND the public "/ks" Key-System-as-a-Service that any
+# server can use. Everything personal is gated behind OWNER_GUILD_ID so it can
+# never fire inside a customer's server.
+OWNER_GUILD_ID = 1241797935100989594
+
+# Per-guild toggles for the "fun" features (in-memory; set via /ks fun).
+# Structure: { guild_id: {"meow": bool, "good_boy": bool, "antispam": bool} }
+GUILD_FUN_SETTINGS = {}
+DEFAULT_FUN_SETTINGS = {"meow": True, "good_boy": True, "antispam": True}
+
+
+def is_owner_guild(guild_id) -> bool:
+    return guild_id is not None and guild_id == OWNER_GUILD_ID
+
+
+def get_fun_settings(guild_id) -> dict:
+    if guild_id not in GUILD_FUN_SETTINGS:
+        GUILD_FUN_SETTINGS[guild_id] = dict(DEFAULT_FUN_SETTINGS)
+    return GUILD_FUN_SETTINGS[guild_id]
+
+
 MONITORED_CHANNELS = {
     1454200774044291345,
     1493410559331139697,
@@ -73,6 +96,13 @@ class HWIDModal(discord.ui.Modal, title="Enter Your HWID"):
     hwid = discord.ui.TextInput(label="Paste your HWID here", style=discord.TextStyle.short, placeholder="Example: ABCDEFGH-1234-IJKL-5678-MNOPQRSTUVW", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # The manual HWID-authentication flow is an owner-server-only premium
+        # feature; it DMs the owner, so it must never run from another guild.
+        if not is_owner_guild(interaction.guild_id):
+            await interaction.response.send_message(
+                "This command isn't available in this server.", ephemeral=True)
+            return
+
         user = interaction.user
         hwid_value = self.hwid.value.strip()
         now = datetime.utcnow()
@@ -947,12 +977,28 @@ async def ks_toggle_membership(interaction: discord.Interaction, script_name: st
         f"{'🔓' if current else '🔒'} Membership requirement **{status}** for **{script_name}**.", ephemeral=True)
 
 
+@app_commands.choices(feature=[
+    app_commands.Choice(name="Meow easter egg", value="meow"),
+])
+@ks_group.command(name="fun", description="[Admin] Toggle the bot's fun little features in this server.")
+@app_commands.describe(feature="Which fun feature to toggle")
+@app_commands.checks.has_permissions(administrator=True)
+async def ks_fun(interaction: discord.Interaction, feature: app_commands.Choice[str]):
+    settings = get_fun_settings(interaction.guild.id)
+    key = feature.value
+    settings[key] = not settings.get(key, True)
+    state = "enabled" if settings[key] else "disabled"
+    await interaction.response.send_message(
+        f"✅ **{feature.name}** is now **{state}** in this server.", ephemeral=True)
+
+
 bot.tree.add_command(ks_group)
 
 
 @bot.event
 async def on_member_remove(member):
-    if member.guild.id == GUILD_ID:
+    # Owner-server premium keys (legacy key_store).
+    if is_owner_guild(member.guild.id):
         count = delete_keys_by_discord_id(member.id)
         if count > 0:
             log_channel = bot.get_channel(LOG_CHANNEL_ID)
@@ -963,17 +1009,24 @@ async def on_member_remove(member):
                 embed.add_field(name="Keys Revoked", value=str(count), inline=False)
                 await log_channel.send(embed=embed)
 
+    # Multi-tenant /ks keys for this (or any) guild.
     guild_config = get_guild_config(member.guild.id)
     if guild_config:
         guild_count = delete_guild_keys_by_user(member.guild.id, member.id)
         if guild_count > 0:
-            log_channel = bot.get_channel(LOG_CHANNEL_ID)
-            if log_channel:
-                embed = discord.Embed(title="🔑 Guild Key Auto-Revoked", color=discord.Color.orange())
-                embed.add_field(name="User", value=f"{member.name} ({member.id})", inline=False)
-                embed.add_field(name="Guild", value=f"{member.guild.name} ({member.guild.id})", inline=False)
-                embed.add_field(name="Keys Revoked", value=str(guild_count), inline=False)
-                await log_channel.send(embed=embed)
+            # Log to the guild owner's DMs by default (we have no guaranteed
+            # channel in a customer's server). Never leak this into the
+            # owner-server's personal log channel.
+            try:
+                guild_owner = member.guild.owner
+                if guild_owner:
+                    embed = discord.Embed(title="🔑 Guild Key Auto-Revoked", color=discord.Color.orange())
+                    embed.add_field(name="User", value=f"{member.name} ({member.id})", inline=False)
+                    embed.add_field(name="Guild", value=f"{member.guild.name} ({member.guild.id})", inline=False)
+                    embed.add_field(name="Keys Revoked", value=str(guild_count), inline=False)
+                    await guild_owner.send(embed=embed)
+            except Exception as e:
+                logger.warning(f"Could not DM guild owner about auto-revoke: {e}")
 
 
 @bot.event
@@ -983,11 +1036,21 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
+    # DMs / system messages: only process commands, ignore fun logic.
+    if message.guild is None:
+        await bot.process_commands(message)
+        return
+
     if message.author.bot:
         await bot.process_commands(message)
         return
 
-    if message.channel.id in MONITORED_CHANNELS:
+    fun = get_fun_settings(message.guild.id)
+
+    # Anti-spam (link/attachment flood) only for the owner server's monitored
+    # channels OR for servers that enable it (currently off by default for
+    # customers since MONITORED_CHANNELS are owner-specific).
+    if is_owner_guild(message.guild.id) and fun.get("antispam", True) and message.channel.id in MONITORED_CHANNELS:
         link_count = len(URL_PATTERN.findall(message.content or ""))
         attachment_count = len(message.attachments)
 
@@ -1013,59 +1076,64 @@ async def on_message(message):
             return
 
     content = message.content or ""
-    cleaned_content = re.sub(r'<@!?\d+>', '', content).strip()
-    words = re.findall(r'\b\w+[!?.]*\b', cleaned_content)
 
-    all_meows = all(re.match(r'meow[!?.]*$', word, re.IGNORECASE) for word in words) if words else False
+    # "meow" reply easter egg — owner server by default, toggleable per guild.
+    if fun.get("meow", True):
+        cleaned_content = re.sub(r'<@!?\d+>', '', content).strip()
+        words = re.findall(r'\b\w+[!?.]*\b', cleaned_content)
 
-    if all_meows and words:
-        meow_weights = [5, 4, 3, 2, 1, 1]
-        possible_counts = list(range(2, 8))
+        all_meows = all(re.match(r'meow[!?.]*$', word, re.IGNORECASE) for word in words) if words else False
 
-        if last_meow_count in possible_counts:
-            last_index = possible_counts.index(last_meow_count)
-            weights = meow_weights[:]
-            weights[last_index] = 0
-        else:
-            weights = meow_weights
+        if all_meows and words:
+            meow_weights = [5, 4, 3, 2, 1, 1]
+            possible_counts = list(range(2, 8))
 
-        meow_count = random.choices(possible_counts, weights=weights)[0]
-        last_meow_count = meow_count
-        punctuation = random.choice(["", "!", "!!", "."])
-        symbol_chance = random.randint(1, 3)
-        symbol = random.choice(cute_symbols) if symbol_chance == 1 else ""
+            if last_meow_count in possible_counts:
+                last_index = possible_counts.index(last_meow_count)
+                weights = meow_weights[:]
+                weights[last_index] = 0
+            else:
+                weights = meow_weights
 
-        await message.reply(("meow " * meow_count).strip() + punctuation + (" " + symbol if symbol else ""), mention_author=False)
+            meow_count = random.choices(possible_counts, weights=weights)[0]
+            last_meow_count = meow_count
+            punctuation = random.choice(["", "!", "!!", "."])
+            symbol_chance = random.randint(1, 3)
+            symbol = random.choice(cute_symbols) if symbol_chance == 1 else ""
 
-    boost_channels = {TARGET_CHANNEL_ID, BOOST_TEST_CHANNEL_ID}
+            await message.reply(("meow " * meow_count).strip() + punctuation + (" " + symbol if symbol else ""), mention_author=False)
 
-    if message.channel.id in boost_channels:
-        content_lower = content.lower()
-        is_system_boost = message.type in BOOST_TYPES
+    # "good boy" boost reactions — owner server only (channels are owner-specific).
+    if is_owner_guild(message.guild.id) and fun.get("good_boy", True):
+        boost_channels = {TARGET_CHANNEL_ID, BOOST_TEST_CHANNEL_ID}
 
-        is_text_boost = any(pattern in content_lower for pattern in [
-            "just boosted the server",
-            "boosted the server"
-        ])
+        if message.channel.id in boost_channels:
+            content_lower = content.lower()
+            is_system_boost = message.type in BOOST_TYPES
 
-        is_text_boost = is_text_boost and not is_system_boost
+            is_text_boost = any(pattern in content_lower for pattern in [
+                "just boosted the server",
+                "boosted the server"
+            ])
 
-        if is_text_boost or is_system_boost:
-            if not message.author:
-                return
+            is_text_boost = is_text_boost and not is_system_boost
 
-            user_id = message.author.id
+            if is_text_boost or is_system_boost:
+                if not message.author:
+                    return
 
-            if user_id not in recent_boosts:
-                recent_boosts[user_id] = True
+                user_id = message.author.id
 
-                if user_id in pending_tasks:
-                    try:
-                        pending_tasks[user_id].cancel()
-                    except:
-                        pass
+                if user_id not in recent_boosts:
+                    recent_boosts[user_id] = True
 
-                pending_tasks[user_id] = bot.loop.create_task(send_good_boy_after_delay(user_id, message.channel))
+                    if user_id in pending_tasks:
+                        try:
+                            pending_tasks[user_id].cancel()
+                        except:
+                            pass
+
+                    pending_tasks[user_id] = bot.loop.create_task(send_good_boy_after_delay(user_id, message.channel))
 
     await bot.process_commands(message)
 
@@ -1085,12 +1153,13 @@ async def on_ready():
     try:
         await asyncio.sleep(5)
 
-        guild = discord.Object(id=GUILD_ID)
-        synced = await bot.tree.sync(guild=guild)
-        print(f"Synced {len(synced)} guild commands")
-
         global_synced = await bot.tree.sync()
         print(f"Synced {len(global_synced)} global commands")
+
+        owner_guild = discord.Object(id=OWNER_GUILD_ID)
+        bot.tree.copy_global_to(guild=owner_guild)
+        synced = await bot.tree.sync(guild=owner_guild)
+        print(f"Synced {len(synced)} commands to owner guild")
 
     except discord.HTTPException as e:
         if e.status == 429:
