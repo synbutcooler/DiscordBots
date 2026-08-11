@@ -37,16 +37,8 @@ DELAY_SECONDS = 1
 BOOST_TEST_CHANNEL_ID = 1270301984897110148
 
 DISCORD_KEY_EXPIRY_HOURS = 336
-
-# --- Multi-tenant / public-bot settings -----------------------------------
-# This single bot runs BOTH the owner's personal server (legacy premium key
-# system + fun features) AND the public "/ks" Key-System-as-a-Service that any
-# server can use. Everything personal is gated behind OWNER_GUILD_ID so it can
-# never fire inside a customer's server.
 OWNER_GUILD_ID = 1241797935100989594
 
-# Per-guild toggles for the "fun" features (in-memory; set via /ks fun).
-# Structure: { guild_id: {"meow": bool, "good_boy": bool, "antispam": bool} }
 GUILD_FUN_SETTINGS = {}
 DEFAULT_FUN_SETTINGS = {"meow": True, "good_boy": True, "antispam": True}
 
@@ -465,6 +457,186 @@ class ProfileSelectView(discord.ui.View):
         self.add_item(ProfileSelectForKey(profiles, guild_id))
 
 
+class SetupWizardModal(discord.ui.Modal):
+    """One-shot configuration: collects the whole first script profile in one modal."""
+
+    def __init__(self):
+        super().__init__(title="Key System Setup", timeout=300)
+
+        self.script_name = discord.ui.TextInput(
+            label="Script Name",
+            style=discord.TextStyle.short,
+            placeholder="e.g. My ESP Script",
+            min_length=2,
+            max_length=50,
+            required=True,
+        )
+        self.key_type = discord.ui.TextInput(
+            label="Key Type (discord or adlink)",
+            style=discord.TextStyle.short,
+            placeholder="discord",
+            default="discord",
+            min_length=4,
+            max_length=7,
+            required=True,
+        )
+        self.duration = discord.ui.TextInput(
+            label="Key Duration (hours)",
+            style=discord.TextStyle.short,
+            placeholder="24",
+            default="24",
+            max_length=5,
+            required=True,
+        )
+        self.required_role = discord.ui.TextInput(
+            label="Required Role ID (optional)",
+            style=discord.TextStyle.short,
+            placeholder="Leave blank for none",
+            required=False,
+            max_length=30,
+        )
+
+        for item in (self.script_name, self.key_type, self.duration, self.required_role):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.script_name.value.strip()
+        key_type_raw = self.key_type.value.strip().lower()
+        if key_type_raw not in ("discord", "adlink"):
+            await interaction.response.send_message(
+                "❌ Key type must be `discord` or `adlink`. Run `/ks setup` again.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            duration = int(float(self.duration.value.strip()))
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Duration must be a number of hours.", ephemeral=True)
+            return
+        if duration < 1 or duration > 8760:
+            await interaction.response.send_message(
+                "❌ Duration must be between 1 and 8760 hours.", ephemeral=True)
+            return
+
+        role_id = None
+        role = None
+        role_raw = self.required_role.value.strip()
+        if role_raw:
+            digits = ''.join(ch for ch in role_raw if ch.isdigit())
+            if not digits:
+                await interaction.response.send_message(
+                    "❌ Required Role must be a role ID (right-click role → Copy ID).",
+                    ephemeral=True)
+                return
+            role = interaction.guild.get_role(int(digits))
+            if not role:
+                await interaction.response.send_message(
+                    "❌ I couldn't find that role in this server. Check the ID and that "
+                    "the bot has access to it.", ephemeral=True)
+                return
+            role_id = role.id
+
+        if get_profile_by_name(interaction.guild.id, name):
+            await interaction.response.send_message(
+                f"❌ A script named **{name}** already exists.", ephemeral=True)
+            return
+
+        config = init_guild_config(
+            interaction.guild.id, interaction.guild.name, interaction.user.id)
+        if not config:
+            await interaction.response.send_message(
+                "❌ Failed to initialize. Database may be unavailable.", ephemeral=True)
+            return
+
+        profiles = get_script_profiles(interaction.guild.id)
+        if len(profiles) >= 10:
+            await interaction.response.send_message(
+                "❌ Maximum 10 script profiles per server.", ephemeral=True)
+            return
+
+        profile = create_script_profile(
+            interaction.guild.id, name, key_type_raw, duration, role_id)
+        if not profile:
+            await interaction.response.send_message(
+                "❌ Failed to create profile.", ephemeral=True)
+            return
+
+        embed = _build_setup_embed(interaction.guild, profile, role)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def _build_setup_embed(guild, profile, role=None):
+    """Pretty post-setup summary with everything a script author needs."""
+    is_adlink = profile['key_type'] == 'adlink'
+    color = discord.Color.green() if not is_adlink else discord.Color.blurple()
+    type_label = "🔗 Ad-Link (monetization gate)" if is_adlink else "💬 Discord (instant key + membership)"
+
+    embed = discord.Embed(
+        title="✅ Key System Ready",
+        description=(
+            f"Your key system for **{guild.name}** is live. Below is everything "
+            "you need to wire it into your Roblox script."
+        ),
+        color=color,
+    )
+
+    embed.add_field(
+        name="📋 Script",
+        value=(
+            f"**Name:** {profile['name']}\n"
+            f"**Type:** {type_label}\n"
+            f"**Key Duration:** {profile.get('key_duration_hours', 24)}h\n"
+            f"**Required Role:** {role.mention if role else 'None'}"
+        ),
+        inline=False,
+    )
+
+    secret = profile['api_secret']
+    embed.add_field(
+        name="🔐 API Secret",
+        value=f"||{secret}||",
+        inline=True,
+    )
+    embed.add_field(
+        name="🔗 Validation URL",
+        value=f"`{SERVER_BASE_URL}/api/validate-guild-key`",
+        inline=False,
+    )
+
+    lua = (
+        "```lua\n"
+        "DiscordValidation = {\n"
+        "    Enabled = true,\n"
+        f"    ValidateURL = '{SERVER_BASE_URL}/api/validate-guild-key',\n"
+        f"    APISecret = '{secret}'\n"
+        "},\n"
+        "```"
+    )
+    embed.add_field(name="🤖 Roblox Script Config", value=lua, inline=False)
+
+    if is_adlink:
+        dest_url = get_destination_url(guild.id, profile['profile_id'])
+        embed.add_field(
+            name="📎 Ad-Link Destination URL",
+            value=(
+                f"Set this as your campaign's redirect/landing URL:\n```{dest_url}```\n"
+                "Then run `/ks setlink` to add your work.ink / LootLabs / Linkvertise URLs."
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="👥 How Users Get Keys",
+            value="Users run `/ks getkey` in this server to receive their key instantly.",
+            inline=False,
+        )
+
+    embed.set_footer(text="Keep the API secret private. Run /ks config anytime, /ks stats for stats.")
+    return embed
+
+
 class SetupLinksModal(discord.ui.Modal, title="Set Monetization Links"):
     def __init__(self, profile):
         super().__init__()
@@ -538,53 +710,41 @@ class SetupLinksModal(discord.ui.Modal, title="Set Monetization Links"):
 ks_group = app_commands.Group(name="ks", description="Key System commands")
 
 
-@ks_group.command(name="setup", description="[Admin] Initialize the key system for this server.")
+@ks_group.command(name="setup", description="[Admin] One-command setup for the key system.")
 @app_commands.checks.has_permissions(administrator=True)
 async def ks_setup(interaction: discord.Interaction):
-    config = init_guild_config(
-        interaction.guild.id,
-        interaction.guild.name,
-        interaction.user.id
-    )
+    config = get_guild_config(interaction.guild.id)
 
-    if not config:
-        await interaction.response.send_message(
-            "❌ Failed to initialize. Database may be unavailable.", ephemeral=True)
-        return
-
-    profiles = get_script_profiles(interaction.guild.id)
-
-    embed = discord.Embed(title="⚙️ Key System", color=discord.Color.blurple())
-
-    if profiles:
-        embed.description = (
-            f"Key system is **active** with **{len(profiles)}** script profile(s).\n\n"
-            "**Commands:**\n"
-            "`/ks addscript` — Add a new script profile\n"
-            "`/ks setlink` — Set monetization links for ad-link profiles\n"
-            "`/ks config` — View full configuration\n"
-            "`/ks removescript` — Remove a script profile\n\n"
-            "**Users run** `/ks getkey` **to get keys.**"
+    # Already set up: show a clean dashboard-style summary instead of the wizard.
+    if config and config.get('enabled'):
+        profiles = get_script_profiles(interaction.guild.id)
+        embed = discord.Embed(
+            title="⚙️ Key System",
+            description=(
+                f"Key system is **active** in **{interaction.guild.name}** "
+                f"with **{len(profiles)}** script profile(s)."
+            ),
+            color=discord.Color.blurple(),
         )
         for p in profiles:
             type_emoji = "🔗" if p['key_type'] == 'adlink' else "💬"
             status = "✅" if p.get('enabled') else "❌"
+            req_role = f"<@&{p['required_role_id']}>" if p.get('required_role_id') else "None"
             embed.add_field(
                 name=f"{type_emoji} {p['name']} {status}",
-                value=f"Duration: {p.get('key_duration_hours', 24)}h | Secret: ||{p.get('api_secret', 'N/A')[:16]}...||",
-                inline=False
+                value=(
+                    f"Duration: `{p.get('key_duration_hours', 24)}h` · "
+                    f"Role: {req_role}\n"
+                    f"Secret: ||{p.get('api_secret', 'N/A')[:18]}...||"
+                ),
+                inline=False,
             )
-    else:
-        embed.description = (
-            "Key system initialized! Now create your first script profile.\n\n"
-            "**Key types:**\n"
-            "💬 `discord` — Key given instantly, forces server membership\n"
-            "🔗 `adlink` — Key given after completing a monetization link\n\n"
-            "**Run:** `/ks addscript name: MyScript key_type: discord`"
-        )
+        embed.set_footer(text="Use /ks addscript to add another script, /ks stats for stats.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
 
-    embed.set_footer(text="Use /ks config to view full settings anytime.")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    # First-time setup: launch the one-shot wizard modal.
+    await interaction.response.send_modal(SetupWizardModal())
 
 
 @ks_group.command(name="addscript", description="[Admin] Add a script profile to your key system.")
@@ -939,11 +1099,16 @@ async def ks_stats(interaction: discord.Interaction, script_name: str = None):
 
     stats = get_guild_key_stats(interaction.guild.id, profile_id)
 
-    embed = discord.Embed(title=f"📊 Key Stats{title_suffix}", color=discord.Color.blurple())
-    embed.add_field(name="Total Keys", value=str(stats['total']), inline=True)
-    embed.add_field(name="Active", value=str(stats['active']), inline=True)
-    embed.add_field(name="Expired", value=str(stats['expired']), inline=True)
-    embed.add_field(name="HWID Locked", value=str(stats['hwid_locked']), inline=True)
+    embed = discord.Embed(
+        title=f"📊 Key Stats{title_suffix}",
+        description=f"Statistics for **{interaction.guild.name}**",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="🔑 Total Keys", value=str(stats['total']), inline=True)
+    embed.add_field(name="✅ Active", value=str(stats['active']), inline=True)
+    embed.add_field(name="⌛ Expired", value=str(stats['expired']), inline=True)
+    embed.add_field(name="🔒 HWID Locked", value=str(stats['hwid_locked']), inline=True)
+    embed.set_footer(text="Run /ks setup to view your configuration.")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -997,7 +1162,6 @@ bot.tree.add_command(ks_group)
 
 @bot.event
 async def on_member_remove(member):
-    # Owner-server premium keys (legacy key_store).
     if is_owner_guild(member.guild.id):
         count = delete_keys_by_discord_id(member.id)
         if count > 0:
@@ -1009,14 +1173,11 @@ async def on_member_remove(member):
                 embed.add_field(name="Keys Revoked", value=str(count), inline=False)
                 await log_channel.send(embed=embed)
 
-    # Multi-tenant /ks keys for this (or any) guild.
     guild_config = get_guild_config(member.guild.id)
     if guild_config:
         guild_count = delete_guild_keys_by_user(member.guild.id, member.id)
         if guild_count > 0:
-            # Log to the guild owner's DMs by default (we have no guaranteed
-            # channel in a customer's server). Never leak this into the
-            # owner-server's personal log channel.
+
             try:
                 guild_owner = member.guild.owner
                 if guild_owner:
@@ -1036,7 +1197,6 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # DMs / system messages: only process commands, ignore fun logic.
     if message.guild is None:
         await bot.process_commands(message)
         return
@@ -1047,9 +1207,6 @@ async def on_message(message):
 
     fun = get_fun_settings(message.guild.id)
 
-    # Anti-spam (link/attachment flood) only for the owner server's monitored
-    # channels OR for servers that enable it (currently off by default for
-    # customers since MONITORED_CHANNELS are owner-specific).
     if is_owner_guild(message.guild.id) and fun.get("antispam", True) and message.channel.id in MONITORED_CHANNELS:
         link_count = len(URL_PATTERN.findall(message.content or ""))
         attachment_count = len(message.attachments)
@@ -1077,7 +1234,6 @@ async def on_message(message):
 
     content = message.content or ""
 
-    # "meow" reply easter egg — owner server by default, toggleable per guild.
     if fun.get("meow", True):
         cleaned_content = re.sub(r'<@!?\d+>', '', content).strip()
         words = re.findall(r'\b\w+[!?.]*\b', cleaned_content)
@@ -1103,7 +1259,6 @@ async def on_message(message):
 
             await message.reply(("meow " * meow_count).strip() + punctuation + (" " + symbol if symbol else ""), mention_author=False)
 
-    # "good boy" boost reactions — owner server only (channels are owner-specific).
     if is_owner_guild(message.guild.id) and fun.get("good_boy", True):
         boost_channels = {TARGET_CHANNEL_ID, BOOST_TEST_CHANNEL_ID}
 
@@ -1152,7 +1307,6 @@ async def on_ready():
 
     try:
         await asyncio.sleep(5)
-
         global_synced = await bot.tree.sync()
         print(f"Synced {len(global_synced)} global commands")
 
