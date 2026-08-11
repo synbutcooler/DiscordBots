@@ -395,6 +395,43 @@ def create_guild_key(guild_id, discord_id, discord_name, duration_hours, profile
         return None
 
 
+def list_recent_keys(guild_id, profile_id=None, limit=15):
+    """Return the most recently created (possibly active) keys for a guild.
+
+    Each entry includes the masked key, owner, script profile, expiry, and
+    whether it's currently active/HWID-locked. Used by /ks stats.
+    """
+    if guild_keys_collection is None:
+        return []
+    try:
+        query = {"guild_id": str(guild_id)}
+        if profile_id:
+            query["profile_id"] = profile_id
+        cursor = guild_keys_collection.find(query).sort("created_at", -1).limit(limit)
+        now = time.time()
+        out = []
+        profiles_cache = {}
+        for doc in cursor:
+            pid = doc.get("profile_id")
+            if pid not in profiles_cache:
+                p = get_script_profile(pid)
+                profiles_cache[pid] = p.get("name", "Unknown") if p else "Unknown"
+            key = doc.get("_id", "")
+            out.append({
+                "key_masked": (key[:6] + "…" + key[-4:]) if len(key) > 12 else "••••",
+                "owner": doc.get("discord_name", "unknown"),
+                "owner_id": doc.get("discord_id", ""),
+                "script": profiles_cache.get(pid, "Unknown"),
+                "active": now < doc.get("expires_at", 0),
+                "hwid_locked": bool(doc.get("hwid")),
+                "expires_at": doc.get("expires_at", 0),
+            })
+        return out
+    except Exception as e:
+        logger.error(f"Failed to list keys: {e}")
+        return []
+
+
 def validate_guild_key(key, hwid, api_secret):
     if guild_keys_collection is None:
         return False, "Key system unavailable"
