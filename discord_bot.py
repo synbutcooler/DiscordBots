@@ -473,16 +473,16 @@ class SetupWizardModal(discord.ui.Modal):
             required=True,
         )
         self.key_type = discord.ui.TextInput(
-            label="Key Type (discord or adlink)",
+            label="Key Type",
             style=discord.TextStyle.short,
-            placeholder="discord",
+            placeholder="discord = instant key  |  adlink = link gate (work.ink etc.)",
             default="discord",
             min_length=4,
             max_length=7,
             required=True,
         )
         self.duration = discord.ui.TextInput(
-            label="Key Duration (hours)",
+            label="Key Duration (hours, 0 = never)",
             style=discord.TextStyle.short,
             placeholder="24",
             default="24",
@@ -492,7 +492,7 @@ class SetupWizardModal(discord.ui.Modal):
         self.required_role = discord.ui.TextInput(
             label="Required Role ID (optional)",
             style=discord.TextStyle.short,
-            placeholder="Leave blank for none",
+            placeholder="Users need this role to /ks getkey. Blank = anyone.",
             required=False,
             max_length=30,
         )
@@ -516,7 +516,7 @@ class SetupWizardModal(discord.ui.Modal):
             await interaction.response.send_message(
                 "❌ Duration must be a number of hours.", ephemeral=True)
             return
-        if duration < 1 or duration > 8760:
+        if duration < 0 or duration > 8760:
             await interaction.response.send_message(
                 "❌ Duration must be between 1 and 8760 hours.", ephemeral=True)
             return
@@ -539,33 +539,36 @@ class SetupWizardModal(discord.ui.Modal):
                 return
             role_id = role.id
 
+        # Acknowledge before DB writes to stay within Discord's 3s window.
+        await interaction.response.defer(ephemeral=True)
+
         if get_profile_by_name(interaction.guild.id, name):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ A script named **{name}** already exists.", ephemeral=True)
             return
 
         config = init_guild_config(
             interaction.guild.id, interaction.guild.name, interaction.user.id)
         if not config:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Failed to initialize. Database may be unavailable.", ephemeral=True)
             return
 
         profiles = get_script_profiles(interaction.guild.id)
         if len(profiles) >= 10:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Maximum 10 script profiles per server.", ephemeral=True)
             return
 
         profile = create_script_profile(
             interaction.guild.id, name, key_type_raw, duration, role_id)
         if not profile:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Failed to create profile.", ephemeral=True)
             return
 
         embed = _build_setup_embed(interaction.guild, profile, role)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 def _build_setup_embed(guild, profile, role=None):
@@ -651,14 +654,15 @@ class AddScriptModal(discord.ui.Modal):
             label="Script Name", style=discord.TextStyle.short,
             placeholder="e.g. My ESP Script", min_length=2, max_length=50, required=True)
         self.key_type = discord.ui.TextInput(
-            label="Key Type (discord or adlink)", style=discord.TextStyle.short,
+            label="Key Type", style=discord.TextStyle.short,
+            placeholder="discord = instant  |  adlink = link gate",
             default="discord", min_length=4, max_length=7, required=True)
         self.duration = discord.ui.TextInput(
-            label="Key Duration (hours)", style=discord.TextStyle.short,
+            label="Key Duration (hours, 0 = never)", style=discord.TextStyle.short,
             default="24", max_length=5, required=True)
         self.required_role = discord.ui.TextInput(
             label="Required Role ID (optional)", style=discord.TextStyle.short,
-            placeholder="Leave blank for none", required=False, max_length=30)
+            placeholder="Blank = anyone can get a key", required=False, max_length=30)
         for item in (self.script_name, self.key_type, self.duration, self.required_role):
             self.add_item(item)
 
@@ -673,7 +677,7 @@ class AddScriptModal(discord.ui.Modal):
         except ValueError:
             await interaction.response.send_message("❌ Duration must be a number of hours.", ephemeral=True)
             return
-        if duration < 1 or duration > 8760:
+        if duration < 0 or duration > 8760:
             await interaction.response.send_message("❌ Duration must be between 1 and 8760 hours.", ephemeral=True)
             return
 
@@ -691,22 +695,24 @@ class AddScriptModal(discord.ui.Modal):
                 return
             role_id = role.id
 
+        # Acknowledge immediately so DB work can't trip the 3s timeout.
+        await interaction.response.defer(ephemeral=True)
+
         if get_profile_by_name(interaction.guild.id, name):
-            await interaction.response.send_message(f"❌ A script named **{name}** already exists.", ephemeral=True)
+            await interaction.followup.send(f"❌ A script named **{name}** already exists.", ephemeral=True)
             return
         profiles = get_script_profiles(interaction.guild.id)
         if len(profiles) >= 10:
-            await interaction.response.send_message("❌ Maximum 10 script profiles per server.", ephemeral=True)
+            await interaction.followup.send("❌ Maximum 10 script profiles per server.", ephemeral=True)
             return
 
         profile = create_script_profile(interaction.guild.id, name, key_type_raw, duration, role_id)
         if not profile:
-            await interaction.response.send_message("❌ Failed to create profile.", ephemeral=True)
+            await interaction.followup.send("❌ Failed to create profile.", ephemeral=True)
             return
 
-        # Show the rich integration embed for the new script.
         embed = _build_setup_embed(interaction.guild, profile, role)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class RemoveScriptSelect(discord.ui.Select):
@@ -822,27 +828,31 @@ class ManagementView(discord.ui.View):
 
     class MembershipButton(discord.ui.Button):
         def __init__(self):
-            super().__init__(label="Membership", style=discord.ButtonStyle.secondary, emoji="🔒", row=1)
+            super().__init__(label="Server Lock", style=discord.ButtonStyle.secondary, emoji="🔒", row=1)
 
         async def callback(self, interaction: discord.Interaction):
             if not interaction.user.guild_permissions.administrator:
                 await interaction.response.send_message("❌ Admins only.", ephemeral=True)
                 return
             profiles = get_script_profiles(interaction.guild.id)
-            discord_profiles = [p for p in profiles]
-            if not discord_profiles:
+            if not profiles:
                 await interaction.response.send_message("❌ Add a script first.", ephemeral=True)
                 return
             self.view.clear_items()
-            self.view.add_item(MembershipSelect(self.view, discord_profiles))
+            self.view.add_item(MembershipSelect(self.view, profiles))
             self.view.add_item(BackButton())
             await interaction.response.edit_message(
-                content="Toggle whether users must stay in this server for keys to work:",
+                content=(
+                    "__**Server Lock**__\n"
+                    "**ON (default):** a key stops working the moment the user leaves this Discord server. "
+                    "Use this when keys are a perk of being in your server.\n"
+                    "**OFF:** keys keep working even after someone leaves."
+                ),
                 embed=None, view=self.view)
 
     class ToggleSystemButton(discord.ui.Button):
         def __init__(self):
-            super().__init__(label="Enable/Disable", style=discord.ButtonStyle.secondary, emoji="⚙️", row=1)
+            super().__init__(label="Enable/Disable", style=discord.ButtonStyle.secondary, emoji="⏯️", row=1)
 
         async def callback(self, interaction: discord.Interaction):
             if not interaction.user.guild_permissions.administrator:
@@ -852,9 +862,12 @@ class ManagementView(discord.ui.View):
             current = bool(config and config.get('enabled'))
             save_guild_config(interaction.guild.id, {"enabled": not current, "updated_at": time.time()})
             embed = build_dashboard_embed(interaction.guild)
-            await interaction.response.edit_message(
-                content=f"✅ Key system **{'disabled' if current else 'enabled'}**.",
-                embed=embed, view=self.view)
+            if current:
+                msg = ("⏸️ Key system **disabled**. The script will reject every key "
+                       "(users see 'key system disabled') until you enable it again.")
+            else:
+                msg = "▶️ Key system **enabled** — keys work normally."
+            await interaction.response.edit_message(content=msg, embed=embed, view=self.view)
 
     class ViewConfigButton(discord.ui.Button):
         def __init__(self):
@@ -951,12 +964,18 @@ def build_dashboard_embed(guild):
     if profiles:
         lines = []
         for p in profiles:
+            # 🔗 = Ad-Link (user completes a work.ink/LootLabs link for a key)
+            # 💬 = Discord (key issued instantly in the server)
             type_emoji = "🔗" if p['key_type'] == 'adlink' else "💬"
+            type_word = "link-gate" if p['key_type'] == 'adlink' else "instant"
             status_emoji = "✅" if p.get('enabled') else "❌"
-            req_role = f"<@&{p['required_role_id']}>" if p.get('required_role_id') else "No role"
+            dur = p.get('key_duration_hours', 24)
+            dur_word = "never expires" if dur == 0 else f"{dur}h"
+            req_role = f"<@&{p['required_role_id']}>" if p.get('required_role_id') else "anyone"
+            lock = "server-locked" if p.get('require_membership', True) else "no lock"
             lines.append(
                 f"{type_emoji} **{p['name']}** {status_emoji}\n"
-                f"     ⏳ `{p.get('key_duration_hours', 24)}h` · 🔒 {req_role}"
+                f"     `{type_word}` · ⏳ {dur_word} · 🔒 {lock} · role: {req_role}"
             )
         embed.add_field(name="Script Profiles", value="\n".join(lines), inline=False)
     else:
@@ -1279,96 +1298,96 @@ bot.tree.add_command(ks_group)
 
 
 # ---------------------------------------------------------------------------
-# /antispam — global anti-scam protection (4+ links/attachments)
+# /antispam setup — global anti-scam protection via an interactive panel
+# (deletes messages with 4+ links/attachments unless they have real text)
 # ---------------------------------------------------------------------------
 
-antispam_group = app_commands.Group(
-    name="antispam",
-    description="Protect the server from link/attachment scam posts.",
-)
+class AntiSpamChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="Pick channels to protect (leave empty = all channels)",
+            min_values=0,
+            max_values=25,
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+        )
 
-
-@antispam_group.command(name="enable", description="Turn anti-scam deletion on.")
-@app_commands.describe(channel="Only protect this channel (leave blank = all channels)")
-@app_commands.checks.has_permissions(administrator=True)
-async def antispam_enable(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    if channel:
-        s = get_settings(interaction.guild.id)
-        channels = [str(c) for c in (s.get("antispam_channels") or [])]
-        if str(channel.id) not in channels:
-            channels.append(str(channel.id))
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            return
+        channels = [str(c.id) for c in self.values]
         update_settings(interaction.guild.id, {
             "antispam_enabled": True,
             "antispam_channels": channels,
         })
-        await interaction.response.send_message(
-            f"🛡️ Anti-scam protection **enabled** for {channel.mention}. "
-            "Messages with 4+ links or attachments will be deleted.",
-            ephemeral=True)
-    else:
+        view = AntiSpamView()
+        await interaction.response.edit_message(
+            content=("🛡️ Anti-scam **enabled**. "
+                     + ("Now protecting specific channels." if channels
+                        else "Now protecting **every channel**.")),
+            embed=build_antispam_embed(interaction.guild),
+            view=view,
+        )
+
+
+class AntiSpamView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(AntiSpamChannelSelect())
+
+    @discord.ui.button(label="Enable (all channels)", style=discord.ButtonStyle.success, emoji="🛡️", row=1)
+    async def enable_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            return
         update_settings(interaction.guild.id, {
-            "antispam_enabled": True,
-            "antispam_channels": [],
-        })
-        await interaction.response.send_message(
-            "🛡️ Anti-scam protection **enabled server-wide**. "
-            "Messages with 4+ links or attachments will be deleted in every channel.",
-            ephemeral=True)
+            "antispam_enabled": True, "antispam_channels": []})
+        await interaction.response.edit_message(
+            content="🛡️ Anti-scam **enabled server-wide**.",
+            embed=build_antispam_embed(interaction.guild), view=self)
+
+    @discord.ui.button(label="Disable", style=discord.ButtonStyle.danger, emoji="🛑", row=1)
+    async def disable(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            return
+        update_settings(interaction.guild.id, {"antispam_enabled": False})
+        await interaction.response.edit_message(
+            content="🛑 Anti-scam **disabled**.",
+            embed=build_antispam_embed(interaction.guild), view=self)
 
 
-@antispam_group.command(name="disable", description="Turn anti-scam deletion off.")
-@app_commands.checks.has_permissions(administrator=True)
-async def antispam_disable(interaction: discord.Interaction):
-    update_settings(interaction.guild.id, {"antispam_enabled": False})
-    await interaction.response.send_message(
-        "🛑 Anti-scam protection **disabled**.", ephemeral=True)
-
-
-@antispam_group.command(name="status", description="Show the current anti-scam configuration.")
-@app_commands.checks.has_permissions(administrator=True)
-async def antispam_status(interaction: discord.Interaction):
-    s = get_settings(interaction.guild.id)
+def build_antispam_embed(guild):
+    s = get_settings(guild.id)
     enabled = s.get("antispam_enabled", False)
     channels = s.get("antispam_channels") or []
     if not enabled:
-        await interaction.response.send_message("Anti-scam is currently **disabled**.", ephemeral=True)
-        return
-    if not channels:
-        scope = "**every channel**"
+        status = "🛑 **Disabled**"
+        scope = "—"
+    elif not channels:
+        status = "🛡️ **Enabled**"
+        scope = "Every channel"
     else:
-        scope = "only: " + " ".join(f"<#{c}>" for c in channels)
+        status = "🛡️ **Enabled**"
+        scope = "\n".join(f"• <#{c}>" for c in channels)
+    embed = discord.Embed(title="Anti-Scam Protection", color=discord.Color.blurple())
+    embed.add_field(name="Status", value=status, inline=True)
+    embed.add_field(name="Protected channels", value=scope, inline=True)
+    embed.add_field(
+        name="What it does",
+        value=("Deletes messages with **4+ links or 4+ attachments** "
+               "(fake MrBeast/Elon crypto scams). Messages with real text are kept."),
+        inline=False,
+    )
+    return embed
+
+
+@bot.tree.command(name="antispam", description="Configure anti-scam link/attachment protection.")
+@app_commands.checks.has_permissions(administrator=True)
+async def antispam_setup(interaction: discord.Interaction):
+    view = AntiSpamView()
     await interaction.response.send_message(
-        f"🛡️ Anti-scam is **enabled** — protecting {scope}.", ephemeral=True)
-
-
-@antispam_group.command(name="addchannel", description="Protect an additional channel.")
-@app_commands.describe(channel="The channel to protect")
-@app_commands.checks.has_permissions(administrator=True)
-async def antispam_addchannel(interaction: discord.Interaction, channel: discord.TextChannel):
-    s = get_settings(interaction.guild.id)
-    channels = [str(c) for c in (s.get("antispam_channels") or [])]
-    if str(channel.id) in channels:
-        await interaction.response.send_message(f"{channel.mention} is already protected.", ephemeral=True)
-        return
-    channels.append(str(channel.id))
-    update_settings(interaction.guild.id, {
-        "antispam_enabled": True,
-        "antispam_channels": channels,
-    })
-    await interaction.response.send_message(f"✅ Now protecting {channel.mention}.", ephemeral=True)
-
-
-@antispam_group.command(name="removechannel", description="Stop protecting a channel.")
-@app_commands.describe(channel="The channel to remove")
-@app_commands.checks.has_permissions(administrator=True)
-async def antispam_removechannel(interaction: discord.Interaction, channel: discord.TextChannel):
-    s = get_settings(interaction.guild.id)
-    channels = [str(c) for c in (s.get("antispam_channels") or []) if str(c) != str(channel.id)]
-    update_settings(interaction.guild.id, {"antispam_channels": channels})
-    await interaction.response.send_message(f"✅ Removed protection from {channel.mention}.", ephemeral=True)
-
-
-bot.tree.add_command(antispam_group)
+        embed=build_antispam_embed(interaction.guild), view=view, ephemeral=True)
 
 
 @bot.event
