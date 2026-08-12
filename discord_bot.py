@@ -1050,10 +1050,12 @@ ks_group = app_commands.Group(name="ks", description="Key System commands")
 async def ks_setup(interaction: discord.Interaction):
     config = get_guild_config(interaction.guild.id)
 
+    # First-time setup: launch the one-shot wizard modal.
     if not (config and config.get('enabled')):
         await interaction.response.send_modal(SetupWizardModal())
         return
 
+    # Already set up: show the interactive management panel.
     embed = build_dashboard_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, view=ManagementView(), ephemeral=True)
 
@@ -1245,6 +1247,7 @@ async def ks_stats(interaction: discord.Interaction, script_name: str = None):
     embed.add_field(name="⌛ Expired", value=str(stats['expired']), inline=True)
     embed.add_field(name="🔒 HWID Locked", value=str(stats['hwid_locked']), inline=True)
 
+    # Per-script breakdown when viewing all scripts.
     if not script_name:
         profiles = get_script_profiles(interaction.guild.id)
         if profiles:
@@ -1370,6 +1373,7 @@ bot.tree.add_command(antispam_group)
 
 @bot.event
 async def on_member_remove(member):
+    # Owner-server premium keys (legacy key_store).
     if is_owner_guild(member.guild.id):
         count = delete_keys_by_discord_id(member.id)
         if count > 0:
@@ -1381,10 +1385,14 @@ async def on_member_remove(member):
                 embed.add_field(name="Keys Revoked", value=str(count), inline=False)
                 await log_channel.send(embed=embed)
 
+    # Multi-tenant /ks keys for this (or any) guild.
     guild_config = get_guild_config(member.guild.id)
     if guild_config:
         guild_count = delete_guild_keys_by_user(member.guild.id, member.id)
         if guild_count > 0:
+            # Log to the guild owner's DMs by default (we have no guaranteed
+            # channel in a customer's server). Never leak this into the
+            # owner-server's personal log channel.
             try:
                 guild_owner = member.guild.owner
                 if guild_owner:
@@ -1404,6 +1412,7 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
+    # DMs / system messages: only process commands, ignore fun logic.
     if message.guild is None:
         await bot.process_commands(message)
         return
@@ -1412,6 +1421,10 @@ async def on_message(message):
         await bot.process_commands(message)
         return
 
+    # Anti-scam: delete messages flooded with links/attachments (the fake
+    # MrBeast/Elon crypto scams). Runs in:
+    #   - the owner's always-on MONITORED_CHANNELS, and
+    #   - any channel where an admin enabled protection via /antispam.
     owner_protected = is_owner_guild(message.guild.id) and message.channel.id in MONITORED_CHANNELS
     if owner_protected or antispam_active(message.guild.id, message.channel.id):
         link_count = len(URL_PATTERN.findall(message.content or ""))
@@ -1440,6 +1453,7 @@ async def on_message(message):
 
     content = message.content or ""
 
+    # "meow" easter egg — global, no command, works in any server.
     cleaned_content = re.sub(r'<@!?\d+>', '', content).strip()
     words = re.findall(r'\b\w+[!?.]*\b', cleaned_content)
 
@@ -1464,6 +1478,9 @@ async def on_message(message):
 
         await message.reply(("meow " * meow_count).strip() + punctuation + (" " + symbol if symbol else ""), mention_author=False)
 
+    # "good boy" — global. Triggers on real Discord boost messages in ANY
+    # server (no hardcoded channel needed), and as a little joke when someone
+    # begs the bot for a "good boy".
     is_system_boost = message.type in BOOST_TYPES
     content_lower = content.lower()
     is_beg = ("good boy" in content_lower or "goodboy" in content_lower) and bot.user in message.mentions
@@ -1504,9 +1521,18 @@ async def on_ready():
     try:
         await asyncio.sleep(5)
 
+        # --- Instant command cleanup -------------------------------------
+        # tree.sync() only upserts; it never removes commands that were
+        # deleted or renamed in code, so stale/old commands linger for up to
+        # an hour. We diff what's currently registered against what the bot
+        # actually defines and delete the extras immediately.
+        #
+        # A command is "global" when it has no guild_ids binding. The /ks
+        # group is global; the legacy premium commands are bound to the owner
+        # guild and must NOT be counted as global.
         def _is_global(cmd):
             gids = getattr(cmd, "guild_ids", None)
-            return not gids
+            return not gids  # empty/None -> global
 
         desired_global = {c.name for c in bot.tree.get_commands(guild=None) if _is_global(c)}
         current_global = await bot.http.get_global_commands(bot.user.id)
@@ -1514,20 +1540,31 @@ async def on_ready():
         for cmd_id in stale_global:
             await bot.http.delete_global_command(bot.user.id, cmd_id)
             print(f"Deleted stale global command {cmd_id}")
+
+        # Owner guild: ONLY the legacy premium commands are bound here
+        # (authenticate/getkey/resetkey/revokekey/keystats). The /ks group is
+        # GLOBAL and must NOT be copied to this guild — doing so made every /ks
+        # subcommand show up twice (once global, once guild). Remove any guild
+        # command whose name isn't one of the legacy commands.
         owner_guild = discord.Object(id=OWNER_GUILD_ID)
         legacy_names = {
             c.name for c in bot.tree.get_commands(guild=owner_guild)
             if getattr(c, "guild_ids", None) and OWNER_GUILD_ID in c.guild_ids
         }
         current_owner = await bot.http.get_guild_commands(bot.user.id, OWNER_GUILD_ID)
+        # Delete everything that isn't a legacy command (this wipes the old
+        # duplicate /ks guild copies instantly).
         stale_owner = [c["id"] for c in current_owner if c["name"] not in legacy_names]
         for cmd_id in stale_owner:
             await bot.http.delete_guild_command(bot.user.id, OWNER_GUILD_ID, cmd_id)
             print(f"Deleted stale/duplicate owner-guild command {cmd_id}")
 
+        # Sync GLOBAL commands (/ks). They appear in every server — including
+        # the owner's — as a single copy.
         global_synced = await bot.tree.sync()
         print(f"Synced {len(global_synced)} global commands (removed {len(stale_global)} stale)")
 
+        # Sync the owner-guild legacy commands (no global copy mixed in).
         synced = await bot.tree.sync(guild=owner_guild)
         print(f"Synced {len(synced)} legacy commands to owner guild (removed {len(stale_owner)} stale/duplicate)")
 
