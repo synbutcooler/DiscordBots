@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import secrets
 import string
@@ -17,6 +18,9 @@ guild_configs_collection = None
 guild_sessions_collection = None
 guild_keys_collection = None
 script_profiles_collection = None
+guild_trials_collection = None
+
+MAX_TRIAL_SECONDS = 30 * 24 * 3600  # 30 days — hard cap so "999d" can't disable keys forever
 
 if MONGODB_URI:
     try:
@@ -26,6 +30,7 @@ if MONGODB_URI:
         guild_sessions_collection = _db["guild_key_sessions"]
         guild_keys_collection = _db["guild_keys"]
         script_profiles_collection = _db["script_profiles"]
+        guild_trials_collection = _db["guild_key_trials"]
 
         guild_sessions_collection.create_index("expires_at", expireAfterSeconds=0)
         guild_sessions_collection.create_index([("guild_id", ASCENDING), ("discord_id", ASCENDING)])
@@ -145,6 +150,7 @@ def create_script_profile(guild_id, name, key_type, key_duration_hours=24, requi
             "lootlabs_url": "",
             "linkvertise_url": "",
             "require_membership": True,
+            "trial_seconds": 0,
             "enabled": True,
             "created_at": time.time(),
             "updated_at": time.time()
@@ -210,6 +216,8 @@ def delete_script_profile(profile_id):
         script_profiles_collection.delete_one({"_id": profile_id})
         if guild_keys_collection is not None:
             guild_keys_collection.delete_many({"profile_id": profile_id})
+        if guild_trials_collection is not None:
+            guild_trials_collection.delete_many({"profile_id": profile_id})
         return True
     except Exception as e:
         logger.error(f"Failed to delete script profile: {e}")
