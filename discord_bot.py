@@ -25,7 +25,6 @@ from guild_key_system import (
     get_destination_url, get_script_profile, get_script_profiles,
     create_script_profile, update_script_profile, delete_script_profile,
     get_profile_by_name,
-    parse_flexible_duration, format_flexible_duration,
     SERVER_BASE_URL
 )
 from server_settings import (
@@ -881,7 +880,6 @@ class ManagementView(KsPanelView):
                     f"Required role: {req_role}\n"
                     f"Server lock: {membership}\n"
                     f"Ad links: {links_str}\n"
-                    f"Free trial: {format_flexible_duration(p.get('trial_seconds', 0))}\n"
                     f"Tutorial: {tut_line}\n"
                     f"API secret: ||{secret}...||"
                 ),
@@ -906,27 +904,6 @@ class ManagementView(KsPanelView):
             ),
             embed=None,
             view=TutorialTargetView(profiles, config),
-        )
-        self.stop()
-
-    @discord.ui.button(label="Free Trial", style=discord.ButtonStyle.secondary, emoji="🎁", row=2)
-    async def set_trial(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await _deny_if_not_admin(interaction):
-            return
-        profiles = await asyncio.to_thread(get_script_profiles, interaction.guild.id)
-        if not profiles:
-            await interaction.response.send_message("❌ Add a script first.", ephemeral=True)
-            return
-        await interaction.response.edit_message(
-            content=(
-                "__**Free Trial**__\n"
-                "First time a device runs the script, they skip the key UI for that long. "
-                "Locked to **HWID** — one trial per device per script, ever. "
-                "Deleting the script file / changing IP does nothing.\n"
-                "Examples: `15m`  `12h`  `4d`  `35h`  `1d12h`  `0` = off. Cap is 30 days."
-            ),
-            embed=None,
-            view=TrialTargetView(profiles),
         )
         self.stop()
 
@@ -1063,81 +1040,6 @@ class TutorialUrlModal(discord.ui.Modal):
                     f"▶️ Tutorial **cleared** for **{self.label}** "
                     "(falls back to the all-scripts default)."
                 )
-        embed = await asyncio.to_thread(build_dashboard_embed, interaction.guild)
-        await interaction.edit_original_response(
-            content=msg, embed=embed, view=ManagementView()
-        )
-
-
-class TrialTargetView(KsPanelView):
-    def __init__(self, profiles):
-        super().__init__()
-        self.add_item(TrialTargetSelect(profiles))
-        self.add_item(BackToDashboardButton())
-
-
-class TrialTargetSelect(discord.ui.Select):
-    def __init__(self, profiles):
-        options = [
-            discord.SelectOption(
-                label=str(p.get("name", "unnamed"))[:100],
-                value=str(p["profile_id"]),
-                description=f"Trial: {format_flexible_duration(p.get('trial_seconds', 0))}",
-            )
-            for p in (profiles or [])[:25]
-        ]
-        super().__init__(
-            placeholder="Choose a script…",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-        self.profiles = {p["profile_id"]: p for p in (profiles or [])}
-
-    async def callback(self, interaction: discord.Interaction):
-        profile = self.profiles.get(self.values[0]) or {}
-        current = format_flexible_duration(profile.get("trial_seconds", 0))
-        if current == "off":
-            current = ""
-        await interaction.response.send_modal(
-            TrialDurationModal(profile.get("profile_id"), profile.get("name", "script"), current)
-        )
-
-
-class TrialDurationModal(discord.ui.Modal):
-    def __init__(self, profile_id, name, current=""):
-        super().__init__(title="Free Trial Length", timeout=300)
-        self.profile_id = profile_id
-        self.name = name
-        self.dur_input = discord.ui.TextInput(
-            label="Duration (15m, 12h, 4d, 35h…)",
-            style=discord.TextStyle.short,
-            placeholder="0 = off   ·   max 30d",
-            required=False,
-            max_length=20,
-            default=current[:20],
-        )
-        self.add_item(self.dur_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        seconds = parse_flexible_duration(self.dur_input.value)
-        if seconds is None:
-            await interaction.response.send_message(
-                "❌ Couldn't read that. Try `15m`, `12h`, `4d`, `35h`, or `0` to turn it off.",
-                ephemeral=True,
-            )
-            return
-        await interaction.response.defer()
-        await asyncio.to_thread(
-            update_script_profile, self.profile_id, {"trial_seconds": int(seconds)}
-        )
-        if seconds:
-            msg = (
-                f"🎁 Free trial for **{self.name}** is **{format_flexible_duration(seconds)}**. "
-                "Each device gets it once."
-            )
-        else:
-            msg = f"🎁 Free trial **disabled** for **{self.name}**."
         embed = await asyncio.to_thread(build_dashboard_embed, interaction.guild)
         await interaction.edit_original_response(
             content=msg, embed=embed, view=ManagementView()
@@ -1592,7 +1494,6 @@ async def ks_stats(interaction: discord.Interaction, script_name: str = None):
                 )
             embed.add_field(name="Per Script", value="\n".join(lines), inline=False)
 
-    # Recent keys list.
     recent = list_recent_keys(interaction.guild.id, profile_id, limit=10)
     if recent:
         rows = []
