@@ -375,6 +375,9 @@ class ProfileSelectForKey(discord.ui.Select):
                     f"❌ You need the {role.mention} role to get a key for **{profile['name']}**.", ephemeral=True)
                 return
 
+        # Acknowledge immediately; key generation does a DB write.
+        await interaction.response.defer(ephemeral=True)
+
         if profile['key_type'] == 'discord':
             duration = profile.get('key_duration_hours', 24)
 
@@ -387,7 +390,7 @@ class ProfileSelectForKey(discord.ui.Select):
             )
 
             if not key:
-                await interaction.response.send_message("❌ Failed to generate key.", ephemeral=True)
+                await interaction.followup.send("❌ Failed to generate key.", ephemeral=True)
                 return
 
             expires_ts = int(time.time() + (duration * 3600))
@@ -399,7 +402,7 @@ class ProfileSelectForKey(discord.ui.Select):
             embed.add_field(name="HWID Lock", value="Locks on first use", inline=True)
             embed.set_footer(text="Do not share your key. Leave the server = key revoked.")
 
-            await interaction.response.edit_message(embed=embed, view=None)
+            await interaction.followup.edit_message(interaction.message.id, embed=embed, view=None)
 
         elif profile['key_type'] == 'adlink':
             has_providers = any([
@@ -422,7 +425,7 @@ class ProfileSelectForKey(discord.ui.Select):
                     description=f"You already completed verification for **{profile['name']}**. Click **Claim Key** below.",
                     color=discord.Color.green()
                 )
-                await interaction.response.edit_message(embed=embed, view=view)
+                await interaction.followup.edit_message(interaction.message.id, embed=embed, view=view)
                 return
 
             token = create_session(
@@ -433,7 +436,7 @@ class ProfileSelectForKey(discord.ui.Select):
             )
 
             if not token:
-                await interaction.response.send_message("❌ Failed to create session. Try again later.", ephemeral=True)
+                await interaction.followup.send("❌ Failed to create session. Try again later.", ephemeral=True)
                 return
 
             gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{token}"
@@ -449,7 +452,7 @@ class ProfileSelectForKey(discord.ui.Select):
             )
             embed.set_footer(text="Do not share verification links.")
 
-            await interaction.response.edit_message(embed=embed, view=view)
+            await interaction.followup.edit_message(interaction.message.id, embed=embed, view=view)
 
 
 class ProfileSelectView(discord.ui.View):
@@ -726,14 +729,17 @@ class RemoveScriptSelect(discord.ui.Select):
         super().__init__(placeholder="Choose a script to remove…", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         profile_id = self.values[0]
         profile = get_script_profile(profile_id)
         name = profile['name'] if profile else profile_id
         delete_script_profile(profile_id)
         self.parent_view.reset_main()
         embed = build_dashboard_embed(interaction.guild)
-        await interaction.response.edit_message(
-            content=f"🗑️ **{name}** and all its keys have been deleted.", embed=embed, view=self.parent_view)
+        await interaction.followup.edit_message(
+            interaction.message.id,
+            content=f"🗑️ **{name}** and all its keys have been deleted.",
+            embed=embed, view=self.parent_view)
 
 
 class SetLinkScriptSelect(discord.ui.Select):
@@ -858,6 +864,7 @@ class ManagementView(discord.ui.View):
             if not interaction.user.guild_permissions.administrator:
                 await interaction.response.send_message("❌ Admins only.", ephemeral=True)
                 return
+            await interaction.response.defer(ephemeral=True)
             config = get_guild_config(interaction.guild.id)
             current = bool(config and config.get('enabled'))
             save_guild_config(interaction.guild.id, {"enabled": not current, "updated_at": time.time()})
@@ -867,7 +874,8 @@ class ManagementView(discord.ui.View):
                        "(users see 'key system disabled') until you enable it again.")
             else:
                 msg = "▶️ Key system **enabled** — keys work normally."
-            await interaction.response.edit_message(content=msg, embed=embed, view=self.view)
+            await interaction.followup.edit_message(
+                interaction.message.id, content=msg, embed=embed, view=self.view)
 
     class ViewConfigButton(discord.ui.Button):
         def __init__(self):
@@ -877,7 +885,7 @@ class ManagementView(discord.ui.View):
             if not interaction.user.guild_permissions.administrator:
                 await interaction.response.send_message("❌ Admins only.", ephemeral=True)
                 return
-            config = get_guild_config(interaction.guild.id)
+            await interaction.response.defer(ephemeral=True)
             profiles = get_script_profiles(interaction.guild.id)
             embed = discord.Embed(
                 title="📋 Full Configuration",
@@ -899,7 +907,7 @@ class ManagementView(discord.ui.View):
                     value=(
                         f"Duration: `{p.get('key_duration_hours', 24)}h`\n"
                         f"Required role: {req_role}\n"
-                        f"Membership: {membership}\n"
+                        f"Server lock: {membership}\n"
                         f"Ad links: {links_str}\n"
                         f"API secret: ||{p['api_secret'][:18]}...||"
                     ),
@@ -907,7 +915,8 @@ class ManagementView(discord.ui.View):
                 )
             self.view.clear_items()
             self.view.add_item(BackButton())
-            await interaction.response.edit_message(content=None, embed=embed, view=self.view)
+            await interaction.followup.edit_message(
+                interaction.message.id, content=None, embed=embed, view=self.view)
 
 
 class BackButton(discord.ui.Button):
@@ -932,16 +941,18 @@ class MembershipSelect(discord.ui.Select):
         super().__init__(placeholder="Choose a script to toggle membership…", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         profile = get_script_profile(self.values[0])
         if not profile:
-            await interaction.response.send_message("❌ Profile not found.", ephemeral=True)
+            await interaction.followup.send("❌ Profile not found.", ephemeral=True)
             return
         current = profile.get('require_membership', True)
         update_script_profile(profile['profile_id'], {"require_membership": not current})
         self.parent_view.reset_main()
         embed = build_dashboard_embed(interaction.guild)
-        await interaction.response.edit_message(
-            content=f"{'🔒' if not current else '🔓'} Membership requirement **{'enabled' if not current else 'disabled'}** for **{profile['name']}**.",
+        await interaction.followup.edit_message(
+            interaction.message.id,
+            content=f"{'🔒' if not current else '🔓'} Server lock **{'enabled' if not current else 'disabled'}** for **{profile['name']}**.",
             embed=embed, view=self.parent_view)
 
 
@@ -1083,14 +1094,14 @@ async def ks_setup(interaction: discord.Interaction):
 async def ks_getkey(interaction: discord.Interaction):
     config = get_guild_config(interaction.guild.id)
     if not config or not config.get('enabled'):
-        await interaction.response.send_message("❌ Key system is not set up for this server.", ephemeral=True)
+        await interaction.followup.send("❌ Key system is not set up for this server.", ephemeral=True)
         return
 
     profiles = get_script_profiles(interaction.guild.id)
     active_profiles = [p for p in profiles if p.get('enabled')]
 
     if not active_profiles:
-        await interaction.response.send_message("❌ No script profiles available.", ephemeral=True)
+        await interaction.followup.send("❌ No script profiles available.", ephemeral=True)
         return
 
     if len(active_profiles) == 1:
@@ -1099,9 +1110,12 @@ async def ks_getkey(interaction: discord.Interaction):
         if profile.get('required_role_id'):
             role = interaction.guild.get_role(int(profile['required_role_id']))
             if role and role not in interaction.user.roles:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"❌ You need the {role.mention} role to get a key for **{profile['name']}**.", ephemeral=True)
                 return
+
+        # Acknowledge before DB writes so /ks getkey never trips the 3s timeout.
+        await interaction.response.defer(ephemeral=True)
 
         if profile['key_type'] == 'discord':
             duration = profile.get('key_duration_hours', 24)
@@ -1115,7 +1129,7 @@ async def ks_getkey(interaction: discord.Interaction):
             )
 
             if not key:
-                await interaction.response.send_message("❌ Failed to generate key.", ephemeral=True)
+                await interaction.followup.send("❌ Failed to generate key.", ephemeral=True)
                 return
 
             expires_ts = int(time.time() + (duration * 3600))
@@ -1127,7 +1141,7 @@ async def ks_getkey(interaction: discord.Interaction):
             embed.add_field(name="HWID Lock", value="Locks on first use", inline=True)
             embed.set_footer(text="Do not share your key. Leave the server = key revoked.")
 
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         elif profile['key_type'] == 'adlink':
@@ -1137,7 +1151,7 @@ async def ks_getkey(interaction: discord.Interaction):
                 profile.get('linkvertise_url')
             ])
             if not has_providers:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "❌ No verification links configured. Ask an admin.", ephemeral=True)
                 return
 
@@ -1151,7 +1165,7 @@ async def ks_getkey(interaction: discord.Interaction):
                     description=f"Click **Claim Key** to get your key for **{profile['name']}**.",
                     color=discord.Color.green()
                 )
-                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
                 return
 
             token = create_session(
@@ -1162,7 +1176,7 @@ async def ks_getkey(interaction: discord.Interaction):
             )
 
             if not token:
-                await interaction.response.send_message("❌ Failed to create session.", ephemeral=True)
+                await interaction.followup.send("❌ Failed to create session.", ephemeral=True)
                 return
 
             gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{token}"
@@ -1178,13 +1192,13 @@ async def ks_getkey(interaction: discord.Interaction):
             )
             embed.set_footer(text="Do not share verification links.")
 
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
             return
 
     view = ProfileSelectView(active_profiles, str(interaction.guild.id))
     embed = discord.Embed(title="🔑 Select a Script", color=discord.Color.blurple())
     embed.description = "Choose which script you need a key for:"
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 @ks_group.command(name="resetkey", description="Reset your key and HWID lock for a script.")
@@ -1305,7 +1319,7 @@ bot.tree.add_command(ks_group)
 class AntiSpamChannelSelect(discord.ui.ChannelSelect):
     def __init__(self):
         super().__init__(
-            placeholder="Pick channels to protect (leave empty = all channels)",
+            placeholder="Pick channels — applies INSTANTLY (empty = all channels)",
             min_values=0,
             max_values=25,
             channel_types=[discord.ChannelType.text, discord.ChannelType.news],
@@ -1315,19 +1329,21 @@ class AntiSpamChannelSelect(discord.ui.ChannelSelect):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         channels = [str(c.id) for c in self.values]
         update_settings(interaction.guild.id, {
             "antispam_enabled": True,
             "antispam_channels": channels,
         })
         view = AntiSpamView()
-        await interaction.response.edit_message(
-            content=("🛡️ Anti-scam **enabled**. "
-                     + ("Now protecting specific channels." if channels
-                        else "Now protecting **every channel**.")),
-            embed=build_antispam_embed(interaction.guild),
-            view=view,
-        )
+        if channels:
+            msg = ("🛡️ **Applied instantly.** Protection is now ON for the "
+                   f"{len(channels)} selected channel(s). Pick again to change.")
+        else:
+            msg = "🛡️ **Applied instantly.** Protection is now ON for **every channel**."
+        await interaction.followup.edit_message(
+            interaction.message.id,
+            content=msg, embed=build_antispam_embed(interaction.guild), view=view)
 
 
 class AntiSpamView(discord.ui.View):
@@ -1340,21 +1356,27 @@ class AntiSpamView(discord.ui.View):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         update_settings(interaction.guild.id, {
             "antispam_enabled": True, "antispam_channels": []})
-        await interaction.response.edit_message(
+        view = AntiSpamView()
+        await interaction.followup.edit_message(
+            interaction.message.id,
             content="🛡️ Anti-scam **enabled server-wide**.",
-            embed=build_antispam_embed(interaction.guild), view=self)
+            embed=build_antispam_embed(interaction.guild), view=view)
 
     @discord.ui.button(label="Disable", style=discord.ButtonStyle.danger, emoji="🛑", row=1)
     async def disable(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         update_settings(interaction.guild.id, {"antispam_enabled": False})
-        await interaction.response.edit_message(
+        view = AntiSpamView()
+        await interaction.followup.edit_message(
+            interaction.message.id,
             content="🛑 Anti-scam **disabled**.",
-            embed=build_antispam_embed(interaction.guild), view=self)
+            embed=build_antispam_embed(interaction.guild), view=view)
 
 
 def build_antispam_embed(guild):
@@ -1374,12 +1396,97 @@ def build_antispam_embed(guild):
     embed.add_field(name="Status", value=status, inline=True)
     embed.add_field(name="Protected channels", value=scope, inline=True)
     embed.add_field(
-        name="What it does",
-        value=("Deletes messages with **4+ links or 4+ attachments** "
-               "(fake MrBeast/Elon crypto scams). Messages with real text are kept."),
+        name="How to use",
+        value=("📌 **Pick channels in the dropdown below — it applies instantly, no "
+               "apply button.** Leave it empty to protect every channel. Use the "
+               "buttons to enable-all or disable."),
+        inline=False,
+    )
+    embed.add_field(
+        name="What it deletes",
+        value=("Messages with **4+ links or 4+ attachments** that have no real text "
+               "(the fake MrBeast/Elon crypto scam posts). Captions with actual words are kept."),
         inline=False,
     )
     return embed
+
+
+# ---------------------------------------------------------------------------
+# /fun — toggle the bot's little fun features (meow, good boy)
+# ---------------------------------------------------------------------------
+
+class FunView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Meow: ON", style=discord.ButtonStyle.success, emoji="🐱", custom_id="fun_meow")
+    async def toggle_meow(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        s = get_settings(interaction.guild.id)
+        new_val = not s.get("fun_meow", True)
+        update_settings(interaction.guild.id, {"fun_meow": new_val})
+        button.label = f"Meow: {'ON' if new_val else 'OFF'}"
+        button.style = discord.ButtonStyle.success if new_val else discord.ButtonStyle.secondary
+        await interaction.followup.edit_message(
+            interaction.message.id,
+            content=f"🐱 Meow replies {'enabled' if new_val else 'disabled'}.",
+            embed=build_fun_embed(interaction.guild), view=self)
+
+    @discord.ui.button(label="Good boy: OFF", style=discord.ButtonStyle.secondary, emoji="🐶", custom_id="fun_goodboy")
+    async def toggle_goodboy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        s = get_settings(interaction.guild.id)
+        new_val = not s.get("fun_goodboy", False)
+        update_settings(interaction.guild.id, {"fun_goodboy": new_val})
+        button.label = f"Good boy: {'ON' if new_val else 'OFF'}"
+        button.style = discord.ButtonStyle.success if new_val else discord.ButtonStyle.secondary
+        await interaction.followup.edit_message(
+            interaction.message.id,
+            content=f"🐶 Good-boy boosts {'enabled' if new_val else 'disabled'}.",
+            embed=build_fun_embed(interaction.guild), view=self)
+
+
+def build_fun_embed(guild):
+    s = get_settings(guild.id)
+    meow = s.get("fun_meow", True)
+    goodboy = s.get("fun_goodboy", False)
+    embed = discord.Embed(title="🎉 Fun Features", color=discord.Color.blurple())
+    embed.add_field(
+        name=f"🐱 Meow replies — {'ON' if meow else 'OFF'}",
+        value=("When someone sends a message that's just \"meow\", the bot replies with a "
+               "random number of meows and a cute face. A silly easter egg. (On by default.)"),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"🐶 Good boy — {'ON' if goodboy else 'OFF'}",
+        value=("After someone boosts the server (or @mentions the bot asking for a good "
+               "boy), it waits a moment then says \"good boy\". Off by default — can get "
+               "spammy with frequent boosts."),
+        inline=False,
+    )
+    embed.set_footer(text="Use the buttons below to toggle. Settings save instantly.")
+    return embed
+
+
+@bot.tree.command(name="fun", description="Toggle the bot's fun little features.")
+@app_commands.checks.has_permissions(administrator=True)
+async def fun_setup(interaction: discord.Interaction):
+    # Set button labels/styles to match current saved state.
+    view = FunView()
+    s = get_settings(interaction.guild.id)
+    meow = s.get("fun_meow", True)
+    goodboy = s.get("fun_goodboy", False)
+    view.toggle_meow.label = f"Meow: {'ON' if meow else 'OFF'}"
+    view.toggle_meow.style = discord.ButtonStyle.success if meow else discord.ButtonStyle.secondary
+    view.toggle_goodboy.label = f"Good boy: {'ON' if goodboy else 'OFF'}"
+    view.toggle_goodboy.style = discord.ButtonStyle.success if goodboy else discord.ButtonStyle.secondary
+    await interaction.response.send_message(embed=build_fun_embed(interaction.guild), view=view, ephemeral=True)
 
 
 @bot.tree.command(name="antispam", description="Configure anti-scam link/attachment protection.")
@@ -1504,56 +1611,57 @@ async def on_message(message):
                 return
 
     content = message.content or ""
+    fun = get_settings(message.guild.id)
 
-    # "meow" easter egg — global, no command, works in any server.
-    cleaned_content = re.sub(r'<@!?\d+>', '', content).strip()
-    words = re.findall(r'\b\w+[!?.]*\b', cleaned_content)
+    # "meow" easter egg — on by default, toggle with /fun.
+    if fun.get("fun_meow", True):
+        cleaned_content = re.sub(r'<@!?\d+>', '', content).strip()
+        words = re.findall(r'\b\w+[!?.]*\b', cleaned_content)
 
-    all_meows = all(re.match(r'meow[!?.]*$', word, re.IGNORECASE) for word in words) if words else False
+        all_meows = all(re.match(r'meow[!?.]*$', word, re.IGNORECASE) for word in words) if words else False
 
-    if all_meows and words:
-        meow_weights = [5, 4, 3, 2, 1, 1]
-        possible_counts = list(range(2, 8))
+        if all_meows and words:
+            meow_weights = [5, 4, 3, 2, 1, 1]
+            possible_counts = list(range(2, 8))
 
-        if last_meow_count in possible_counts:
-            last_index = possible_counts.index(last_meow_count)
-            weights = meow_weights[:]
-            weights[last_index] = 0
-        else:
-            weights = meow_weights
+            if last_meow_count in possible_counts:
+                last_index = possible_counts.index(last_meow_count)
+                weights = meow_weights[:]
+                weights[last_index] = 0
+            else:
+                weights = meow_weights
 
-        meow_count = random.choices(possible_counts, weights=weights)[0]
-        last_meow_count = meow_count
-        punctuation = random.choice(["", "!", "!!", "."])
-        symbol_chance = random.randint(1, 3)
-        symbol = random.choice(cute_symbols) if symbol_chance == 1 else ""
+            meow_count = random.choices(possible_counts, weights=weights)[0]
+            last_meow_count = meow_count
+            punctuation = random.choice(["", "!", "!!", "."])
+            symbol_chance = random.randint(1, 3)
+            symbol = random.choice(cute_symbols) if symbol_chance == 1 else ""
 
-        await message.reply(("meow " * meow_count).strip() + punctuation + (" " + symbol if symbol else ""), mention_author=False)
+            await message.reply(("meow " * meow_count).strip() + punctuation + (" " + symbol if symbol else ""), mention_author=False)
 
-    # "good boy" — global. Triggers on real Discord boost messages in ANY
-    # server (no hardcoded channel needed), and as a little joke when someone
-    # begs the bot for a "good boy".
-    is_system_boost = message.type in BOOST_TYPES
-    content_lower = content.lower()
-    is_beg = ("good boy" in content_lower or "goodboy" in content_lower) and bot.user in message.mentions
+    # "good boy" — OFF by default, toggle with /fun. Fires on real Discord
+    # boost messages, and as a little joke when someone @mentions the bot and
+    # asks for a good boy.
+    if fun.get("fun_goodboy", False):
+        is_system_boost = message.type in BOOST_TYPES
+        content_lower = content.lower()
+        is_beg = ("good boy" in content_lower or "goodboy" in content_lower) and bot.user in message.mentions
 
-    if is_system_boost or is_beg:
-        if not message.author:
-            pass
-        else:
-            user_id = message.author.id
+        if is_system_boost or is_beg:
+            if message.author:
+                user_id = message.author.id
 
-            if user_id not in recent_boosts:
-                recent_boosts[user_id] = True
+                if user_id not in recent_boosts:
+                    recent_boosts[user_id] = True
 
-                if user_id in pending_tasks:
-                    try:
-                        pending_tasks[user_id].cancel()
-                    except Exception:
-                        pass
+                    if user_id in pending_tasks:
+                        try:
+                            pending_tasks[user_id].cancel()
+                        except Exception:
+                            pass
 
-                pending_tasks[user_id] = bot.loop.create_task(
-                    send_good_boy_after_delay(user_id, message.channel))
+                    pending_tasks[user_id] = bot.loop.create_task(
+                        send_good_boy_after_delay(user_id, message.channel))
 
     await bot.process_commands(message)
 
