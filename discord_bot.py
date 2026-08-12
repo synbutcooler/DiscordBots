@@ -718,61 +718,26 @@ class AddScriptModal(discord.ui.Modal):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-class RemoveScriptSelect(discord.ui.Select):
-    def __init__(self, parent_view, profiles):
-        self.parent_view = parent_view
-        options = [
-            discord.SelectOption(label=p['name'][:100], value=p['profile_id'],
-                                 description=f"{p['key_type']} · {p.get('key_duration_hours', 24)}h")
-            for p in profiles
-        ]
-        super().__init__(placeholder="Choose a script to remove…", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        profile_id = self.values[0]
-        profile = get_script_profile(profile_id)
-        name = profile['name'] if profile else profile_id
-        delete_script_profile(profile_id)
-        self.parent_view.reset_main()
-        embed = build_dashboard_embed(interaction.guild)
-        await interaction.followup.edit_message(
-            interaction.message.id,
-            content=f"🗑️ **{name}** and all its keys have been deleted.",
-            embed=embed, view=self.parent_view)
-
-
-class SetLinkScriptSelect(discord.ui.Select):
-    def __init__(self, parent_view, profiles):
-        self.parent_view = parent_view
-        adlink = [p for p in profiles if p['key_type'] == 'adlink']
-        options = [
-            discord.SelectOption(label=p['name'][:100], value=p['profile_id'],
-                                 description="Set work.ink / LootLabs / Linkvertise URLs")
-            for p in adlink
-        ]
-        super().__init__(placeholder="Choose an ad-link script…", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        profile = get_script_profile(self.values[0])
-        if not profile:
-            await interaction.response.send_message("❌ Profile not found.", ephemeral=True)
-            return
-        await interaction.response.send_modal(SetupLinksModal(profile))
-
-
 class ManagementView(discord.ui.View):
-    """Interactive admin panel driven by /ks setup."""
+    """Interactive admin panel driven by /ks setup.
+
+    Buttons are defined as decorated methods directly on the view (the
+    supported discord.py pattern). Sub-screens (remove/set-link/server-lock)
+    swap the view's children; the Back button rebuilds the main screen.
+    """
 
     def __init__(self):
         super().__init__(timeout=300)
-        self._build_main()
+        # Start on the main dashboard.
+        self.show_main()
 
-    def reset_main(self):
+    # -- screen helpers ----------------------------------------------------
+    def clear_dynamic(self):
+        """Remove everything except the persistent main buttons (if present)."""
         self.clear_items()
-        self._build_main()
 
-    def _build_main(self):
+    def show_main(self):
+        self.clear_dynamic()
         self.add_item(self.AddScriptButton())
         self.add_item(self.RemoveScriptButton())
         self.add_item(self.SetLinksButton())
@@ -780,9 +745,11 @@ class ManagementView(discord.ui.View):
         self.add_item(self.ToggleSystemButton())
         self.add_item(self.ViewConfigButton())
 
+    # Nested button classes are fine for one-shot buttons; their callbacks use
+    # self.view to manipulate the enclosing view.
     class AddScriptButton(discord.ui.Button):
         def __init__(self):
-            super().__init__(label="Add Script", style=discord.ButtonStyle.success, emoji="➕", row=0)
+            super().__init__(label="Add Script", style=discord.ButtonStyle.success, emoji="➕", row=0, custom_id="ks_add_script")
 
         async def callback(self, interaction: discord.Interaction):
             if not interaction.user.guild_permissions.administrator:
@@ -796,7 +763,7 @@ class ManagementView(discord.ui.View):
 
     class RemoveScriptButton(discord.ui.Button):
         def __init__(self):
-            super().__init__(label="Remove Script", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
+            super().__init__(label="Remove Script", style=discord.ButtonStyle.danger, emoji="🗑️", row=0, custom_id="ks_remove_script")
 
         async def callback(self, interaction: discord.Interaction):
             if not interaction.user.guild_permissions.administrator:
@@ -806,7 +773,7 @@ class ManagementView(discord.ui.View):
             if not profiles:
                 await interaction.response.send_message("❌ No scripts to remove. Add one first.", ephemeral=True)
                 return
-            self.view.clear_items()
+            self.view.clear_dynamic()
             self.view.add_item(RemoveScriptSelect(self.view, profiles))
             self.view.add_item(BackButton())
             await interaction.response.edit_message(
@@ -814,7 +781,7 @@ class ManagementView(discord.ui.View):
 
     class SetLinksButton(discord.ui.Button):
         def __init__(self):
-            super().__init__(label="Set Links", style=discord.ButtonStyle.primary, emoji="🔗", row=0)
+            super().__init__(label="Set Links", style=discord.ButtonStyle.primary, emoji="🔗", row=0, custom_id="ks_set_links")
 
         async def callback(self, interaction: discord.Interaction):
             if not interaction.user.guild_permissions.administrator:
@@ -826,7 +793,7 @@ class ManagementView(discord.ui.View):
                 await interaction.response.send_message(
                     "❌ No ad-link scripts. Add one with type `adlink` to set monetization URLs.", ephemeral=True)
                 return
-            self.view.clear_items()
+            self.view.clear_dynamic()
             self.view.add_item(SetLinkScriptSelect(self.view, adlink))
             self.view.add_item(BackButton())
             await interaction.response.edit_message(
@@ -834,7 +801,7 @@ class ManagementView(discord.ui.View):
 
     class MembershipButton(discord.ui.Button):
         def __init__(self):
-            super().__init__(label="Server Lock", style=discord.ButtonStyle.secondary, emoji="🔒", row=1)
+            super().__init__(label="Server Lock", style=discord.ButtonStyle.secondary, emoji="🔒", row=1, custom_id="ks_membership")
 
         async def callback(self, interaction: discord.Interaction):
             if not interaction.user.guild_permissions.administrator:
@@ -844,7 +811,7 @@ class ManagementView(discord.ui.View):
             if not profiles:
                 await interaction.response.send_message("❌ Add a script first.", ephemeral=True)
                 return
-            self.view.clear_items()
+            self.view.clear_dynamic()
             self.view.add_item(MembershipSelect(self.view, profiles))
             self.view.add_item(BackButton())
             await interaction.response.edit_message(
@@ -858,7 +825,7 @@ class ManagementView(discord.ui.View):
 
     class ToggleSystemButton(discord.ui.Button):
         def __init__(self):
-            super().__init__(label="Enable/Disable", style=discord.ButtonStyle.secondary, emoji="⏯️", row=1)
+            super().__init__(label="Enable/Disable", style=discord.ButtonStyle.secondary, emoji="⏯️", row=1, custom_id="ks_toggle_system")
 
         async def callback(self, interaction: discord.Interaction):
             if not interaction.user.guild_permissions.administrator:
@@ -874,12 +841,13 @@ class ManagementView(discord.ui.View):
                        "(users see 'key system disabled') until you enable it again.")
             else:
                 msg = "▶️ Key system **enabled** — keys work normally."
+            self.view.show_main()
             await interaction.followup.edit_message(
                 interaction.message.id, content=msg, embed=embed, view=self.view)
 
     class ViewConfigButton(discord.ui.Button):
         def __init__(self):
-            super().__init__(label="View Config", style=discord.ButtonStyle.secondary, emoji="📋", row=1)
+            super().__init__(label="View Config", style=discord.ButtonStyle.secondary, emoji="📋", row=1, custom_id="ks_view_config")
 
         async def callback(self, interaction: discord.Interaction):
             if not interaction.user.guild_permissions.administrator:
@@ -887,10 +855,7 @@ class ManagementView(discord.ui.View):
                 return
             await interaction.response.defer(ephemeral=True)
             profiles = get_script_profiles(interaction.guild.id)
-            embed = discord.Embed(
-                title="📋 Full Configuration",
-                color=discord.Color.blurple(),
-            )
+            embed = discord.Embed(title="📋 Full Configuration", color=discord.Color.blurple())
             if not profiles:
                 embed.description = "No scripts yet."
             for p in profiles:
@@ -913,7 +878,7 @@ class ManagementView(discord.ui.View):
                     ),
                     inline=False,
                 )
-            self.view.clear_items()
+            self.view.clear_dynamic()
             self.view.add_item(BackButton())
             await interaction.followup.edit_message(
                 interaction.message.id, content=None, embed=embed, view=self.view)
@@ -921,12 +886,57 @@ class ManagementView(discord.ui.View):
 
 class BackButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
+        super().__init__(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2, custom_id="ks_back")
 
     async def callback(self, interaction: discord.Interaction):
-        self.view.reset_main()
+        self.view.show_main()
         embed = build_dashboard_embed(interaction.guild)
         await interaction.response.edit_message(content=None, embed=embed, view=self.view)
+
+
+class RemoveScriptSelect(discord.ui.Select):
+    def __init__(self, parent_view, profiles):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=p['name'][:100], value=p['profile_id'],
+                description=f"{p['key_type']} · {p.get('key_duration_hours', 24)}h")
+            for p in profiles
+        ]
+        super().__init__(placeholder="Choose a script to remove…", min_values=1, max_values=1, options=options, custom_id="ks_remove_select")
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        profile_id = self.values[0]
+        profile = get_script_profile(profile_id)
+        name = profile['name'] if profile else profile_id
+        delete_script_profile(profile_id)
+        self.parent_view.show_main()
+        embed = build_dashboard_embed(interaction.guild)
+        await interaction.followup.edit_message(
+            interaction.message.id,
+            content=f"🗑️ **{name}** and all its keys have been deleted.",
+            embed=embed, view=self.parent_view)
+
+
+class SetLinkScriptSelect(discord.ui.Select):
+    def __init__(self, parent_view, profiles):
+        self.parent_view = parent_view
+        adlink = [p for p in profiles if p['key_type'] == 'adlink']
+        options = [
+            discord.SelectOption(
+                label=p['name'][:100], value=p['profile_id'],
+                description="Set work.ink / LootLabs / Linkvertise URLs")
+            for p in adlink
+        ]
+        super().__init__(placeholder="Choose an ad-link script…", min_values=1, max_values=1, options=options, custom_id="ks_link_select")
+
+    async def callback(self, interaction: discord.Interaction):
+        profile = get_script_profile(self.values[0])
+        if not profile:
+            await interaction.response.send_message("❌ Profile not found.", ephemeral=True)
+            return
+        await interaction.response.send_modal(SetupLinksModal(profile))
 
 
 class MembershipSelect(discord.ui.Select):
@@ -935,10 +945,10 @@ class MembershipSelect(discord.ui.Select):
         options = [
             discord.SelectOption(
                 label=p['name'][:100], value=p['profile_id'],
-                description=f"Membership: {'ON' if p.get('require_membership', True) else 'OFF'}")
+                description=f"Server lock: {'ON' if p.get('require_membership', True) else 'OFF'}")
             for p in profiles
         ]
-        super().__init__(placeholder="Choose a script to toggle membership…", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder="Choose a script to toggle server lock…", min_values=1, max_values=1, options=options, custom_id="ks_membership_select")
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -948,13 +958,12 @@ class MembershipSelect(discord.ui.Select):
             return
         current = profile.get('require_membership', True)
         update_script_profile(profile['profile_id'], {"require_membership": not current})
-        self.parent_view.reset_main()
+        self.parent_view.show_main()
         embed = build_dashboard_embed(interaction.guild)
         await interaction.followup.edit_message(
             interaction.message.id,
             content=f"{'🔒' if not current else '🔓'} Server lock **{'enabled' if not current else 'disabled'}** for **{profile['name']}**.",
             embed=embed, view=self.parent_view)
-
 
 
 def build_dashboard_embed(guild):
