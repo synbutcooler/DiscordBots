@@ -458,7 +458,17 @@ def validate_guild_key(key, hwid, api_secret):
             logger.warning(f"Guild key validation: guild mismatch")
             return False, "Invalid key"
 
-        if time.time() > key_doc.get("expires_at", 0):
+        # If the whole key system or this specific script is disabled, reject
+        # all keys (existing scripts stop working until re-enabled).
+        if not profile.get("enabled", True):
+            return False, "This script's key system is currently disabled."
+        config = get_guild_config(guild_id)
+        if not config or not config.get("enabled", True):
+            return False, "The key system is currently disabled for this server."
+
+        expires_at = key_doc.get("expires_at", 0)
+        # duration 0 / far-future = non-expiring key.
+        if expires_at and expires_at < time.time() + (365 * 24 * 3600) and time.time() > expires_at:
             guild_keys_collection.delete_one({"_id": key})
             return False, "Key expired. Get a new one from Discord."
 
