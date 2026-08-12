@@ -41,18 +41,11 @@ DELAY_SECONDS = 1
 BOOST_TEST_CHANNEL_ID = 1270301984897110148
 
 DISCORD_KEY_EXPIRY_HOURS = 336
-
-# --- Multi-tenant / public-bot settings -----------------------------------
-# This single bot runs BOTH the owner's personal server (legacy premium key
-# system + fun features) AND the public "/ks" Key-System-as-a-Service that any
-# server can use. Everything personal is gated behind OWNER_GUILD_ID so it can
-# never fire inside a customer's server.
 OWNER_GUILD_ID = 1241797935100989594
 
 
 def is_owner_guild(guild_id) -> bool:
     return guild_id is not None and guild_id == OWNER_GUILD_ID
-
 
 MONITORED_CHANNELS = {
     1454200774044291345,
@@ -89,8 +82,6 @@ class HWIDModal(discord.ui.Modal, title="Enter Your HWID"):
     hwid = discord.ui.TextInput(label="Paste your HWID here", style=discord.TextStyle.short, placeholder="Example: ABCDEFGH-1234-IJKL-5678-MNOPQRSTUVW", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # The manual HWID-authentication flow is an owner-server-only premium
-        # feature; it DMs the owner, so it must never run from another guild.
         if not is_owner_guild(interaction.guild_id):
             await interaction.response.send_message(
                 "This command isn't available in this server.", ephemeral=True)
@@ -138,7 +129,6 @@ class HWIDModal(discord.ui.Modal, title="Enter Your HWID"):
                 await owner.send(embed=msg_embed)
             except:
                 pass
-
 
 class AuthButtonView(discord.ui.View):
     def __init__(self):
@@ -385,7 +375,6 @@ class ProfileSelectForKey(discord.ui.Select):
                     f"❌ You need the {role.mention} role to get a key for **{profile['name']}**.", ephemeral=True)
                 return
 
-        # Acknowledge immediately; key generation does a DB write.
         await interaction.response.defer(ephemeral=True)
 
         if profile['key_type'] == 'discord':
@@ -890,7 +879,7 @@ class ManagementView(KsPanelView):
         )
         self.stop()
 
-    @discord.ui.button(label="Tutorial", style=discord.ButtonStyle.secondary, emoji="▶️", row=2)
+    @discord.ui.button(label="Add Tutorial", style=discord.ButtonStyle.secondary, emoji="▶️", row=2)
     async def set_tutorial(self, interaction: discord.Interaction, button: discord.ui.Button):
         if await _deny_if_not_admin(interaction):
             return
