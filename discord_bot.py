@@ -241,8 +241,35 @@ async def keystats(interaction: discord.Interaction):
 BOOST_TYPES = {discord.MessageType.premium_guild_subscription}
 
 
+def resolve_tutorial(profile, config=None):
+    """YouTube URL: per-script wins, otherwise the guild-wide default."""
+    text = ((profile or {}).get("tutorial") or "").strip()
+    if text:
+        return text
+    if config is None and profile and profile.get("guild_id"):
+        config = get_guild_config(profile["guild_id"])
+    return ((config or {}).get("default_tutorial") or "").strip()
+
+
+def normalize_tutorial_url(raw: str):
+    """Return a Discord-safe YouTube URL, '' to clear, or None if invalid."""
+    url = (raw or "").strip()
+    if not url:
+        return ""
+    if url.startswith("www."):
+        url = "https://" + url
+    if not url.startswith(("http://", "https://")):
+        return None
+    if len(url) > 512:
+        return None
+    host = url.lower()
+    if not any(h in host for h in ("youtube.com", "youtu.be")):
+        return None
+    return url
+
+
 class KeyClaimView(discord.ui.View):
-    def __init__(self, session_token, gateway_url, guild_id, profile_id):
+    def __init__(self, session_token, gateway_url, guild_id, profile_id, tutorial=None):
         super().__init__(timeout=1800)
         self.session_token = session_token
         self.gateway_url = gateway_url
@@ -254,6 +281,13 @@ class KeyClaimView(discord.ui.View):
             style=discord.ButtonStyle.link,
             url=gateway_url
         ))
+        if tutorial:
+            self.add_item(discord.ui.Button(
+                label="Watch Tutorial",
+                style=discord.ButtonStyle.link,
+                emoji="▶️",
+                url=tutorial,
+            ))
 
     @discord.ui.button(label="✅ Claim Key", style=discord.ButtonStyle.success)
     async def claim_key(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -318,29 +352,6 @@ class KeyClaimView(discord.ui.View):
         button.label = "✅ Key Claimed"
 
         await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="📊 Check Status", style=discord.ButtonStyle.secondary)
-    async def check_status(self, interaction: discord.Interaction, button: discord.ui.Button):
-        session = get_session(self.session_token)
-
-        if not session:
-            await interaction.response.send_message("❌ Session expired. Run `/ks getkey` again.", ephemeral=True)
-            return
-
-        if str(interaction.user.id) != session.get('discord_id'):
-            await interaction.response.send_message("❌ This isn't your session.", ephemeral=True)
-            return
-
-        if session.get('key_claimed'):
-            status = "✅ Key already claimed"
-        elif session.get('completed'):
-            status = "✅ Verification complete — click **Claim Key**!"
-        elif session.get('timer_started'):
-            status = "⏳ Timer started — complete the verification task"
-        else:
-            status = "🔗 Click **Open Verification** to start"
-
-        await interaction.response.send_message(status, ephemeral=True)
 
 
 class ProfileSelectForKey(discord.ui.Select):
@@ -417,7 +428,10 @@ class ProfileSelectForKey(discord.ui.Select):
             pending = get_pending_session(interaction.user.id, self.guild_id, profile_id)
             if pending:
                 gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{pending['token']}"
-                view = KeyClaimView(pending['token'], gateway_url, str(self.guild_id), profile_id)
+                view = KeyClaimView(
+                    pending['token'], gateway_url, str(self.guild_id), profile_id,
+                    tutorial=resolve_tutorial(profile),
+                )
 
                 embed = discord.Embed(
                     title="🔑 Verification Already Complete!",
@@ -439,7 +453,10 @@ class ProfileSelectForKey(discord.ui.Select):
                 return
 
             gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{token}"
-            view = KeyClaimView(token, gateway_url, str(self.guild_id), profile_id)
+            view = KeyClaimView(
+                token, gateway_url, str(self.guild_id), profile_id,
+                tutorial=resolve_tutorial(profile),
+            )
 
             embed = discord.Embed(title="🔑 Key Verification", color=discord.Color.blurple())
             embed.description = (
@@ -460,117 +477,103 @@ class ProfileSelectView(discord.ui.View):
         self.add_item(ProfileSelectForKey(profiles, guild_id))
 
 
-class SetupWizardModal(discord.ui.Modal):
-    """One-shot configuration: collects the whole first script profile in one modal."""
+def _add_script_builder_embed(first_time=False):
+    title = "➕ First Script" if first_time else "➕ Add Script"
+    embed = discord.Embed(
+        title=title,
+        description=(
+            "Pick a **key type** and optionally a **required role**, then hit **Continue**.\n"
+            "Name and duration are asked on the next step."
+        ),
+        color=discord.Color.green(),
+    )
+    embed.add_field(
+        name="💬 Discord",
+        value="Instant key in this server. No ads.",
+        inline=True,
+    )
+    embed.add_field(
+        name="🔗 Ad-Link",
+        value="User completes work.ink / LootLabs / Linkvertise first.",
+        inline=True,
+    )
+    embed.set_footer(text="Leave the role empty if anyone should be able to /ks getkey.")
+    return embed
 
+
+class AddScriptKeyTypeSelect(discord.ui.Select):
+    def __init__(self, current=None):
+        options = [
+            discord.SelectOption(
+                label="Discord — instant key",
+                value="discord",
+                emoji="💬",
+                description="Users get a key immediately in this server",
+                default=current == "discord",
+            ),
+            discord.SelectOption(
+                label="Ad-Link — link gate",
+                value="adlink",
+                emoji="🔗",
+                description="Users complete work.ink / LootLabs / Linkvertise",
+                default=current == "adlink",
+            ),
+        ]
+        super().__init__(placeholder="Key type…", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.key_type = self.values[0]
+        await interaction.response.defer()
+
+
+class AddScriptRoleSelect(discord.ui.RoleSelect):
     def __init__(self):
-        super().__init__(title="Key System Setup", timeout=300)
-
-        self.script_name = discord.ui.TextInput(
-            label="Script Name",
-            style=discord.TextStyle.short,
-            placeholder="e.g. My ESP Script",
-            min_length=2,
-            max_length=50,
-            required=True,
-        )
-        self.key_type = discord.ui.TextInput(
-            label="Key Type",
-            style=discord.TextStyle.short,
-            placeholder="discord = instant key  |  adlink = link gate (work.ink etc.)",
-            default="discord",
-            min_length=4,
-            max_length=7,
-            required=True,
-        )
-        self.duration = discord.ui.TextInput(
-            label="Key Duration (hours, 0 = never)",
-            style=discord.TextStyle.short,
-            placeholder="24",
-            default="24",
-            max_length=5,
-            required=True,
-        )
-        self.required_role = discord.ui.TextInput(
-            label="Required Role ID (optional)",
-            style=discord.TextStyle.short,
-            placeholder="Users need this role to /ks getkey. Blank = anyone.",
-            required=False,
-            max_length=30,
+        super().__init__(
+            placeholder="Required role (optional — leave empty for anyone)",
+            min_values=0,
+            max_values=1,
         )
 
-        for item in (self.script_name, self.key_type, self.duration, self.required_role):
-            self.add_item(item)
+    async def callback(self, interaction: discord.Interaction):
+        if self.values:
+            self.view.role = self.values[0]
+        else:
+            self.view.role = None
+        await interaction.response.defer()
 
-    async def on_submit(self, interaction: discord.Interaction):
-        name = self.script_name.value.strip()
-        key_type_raw = self.key_type.value.strip().lower()
-        if key_type_raw not in ("discord", "adlink"):
+
+class AddScriptContinueButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Continue", style=discord.ButtonStyle.success, emoji="➡️", row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not self.view.key_type:
             await interaction.response.send_message(
-                "❌ Key type must be `discord` or `adlink`. Run `/ks setup` again.",
-                ephemeral=True,
+                "Pick a key type in the dropdown first.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            AddScriptModal(
+                key_type=self.view.key_type,
+                role=self.view.role,
+                first_time=self.view.first_time,
             )
-            return
+        )
 
-        try:
-            duration = int(float(self.duration.value.strip()))
-        except ValueError:
-            await interaction.response.send_message(
-                "❌ Duration must be a number of hours.", ephemeral=True)
-            return
-        if duration < 0 or duration > 8760:
-            await interaction.response.send_message(
-                "❌ Duration must be between 1 and 8760 hours.", ephemeral=True)
-            return
 
-        role_id = None
-        role = None
-        role_raw = self.required_role.value.strip()
-        if role_raw:
-            digits = ''.join(ch for ch in role_raw if ch.isdigit())
-            if not digits:
-                await interaction.response.send_message(
-                    "❌ Required Role must be a role ID (right-click role → Copy ID).",
-                    ephemeral=True)
-                return
-            role = interaction.guild.get_role(int(digits))
-            if not role:
-                await interaction.response.send_message(
-                    "❌ I couldn't find that role in this server. Check the ID and that "
-                    "the bot has access to it.", ephemeral=True)
-                return
-            role_id = role.id
+class AddScriptBuilderView(discord.ui.View):
+    def __init__(self, first_time=False, key_type=None, role=None):
+        super().__init__(timeout=300)
+        self.first_time = first_time
+        self.key_type = key_type
+        self.role = role
+        self.add_item(AddScriptKeyTypeSelect(key_type))
+        self.add_item(AddScriptRoleSelect())
+        self.add_item(AddScriptContinueButton())
+        if not first_time:
+            self.add_item(BackToDashboardButton())
 
-        # Acknowledge before DB writes to stay within Discord's 3s window.
-        await interaction.response.defer(ephemeral=True)
-
-        if get_profile_by_name(interaction.guild.id, name):
-            await interaction.followup.send(
-                f"❌ A script named **{name}** already exists.", ephemeral=True)
-            return
-
-        config = init_guild_config(
-            interaction.guild.id, interaction.guild.name, interaction.user.id)
-        if not config:
-            await interaction.followup.send(
-                "❌ Failed to initialize. Database may be unavailable.", ephemeral=True)
-            return
-
-        profiles = get_script_profiles(interaction.guild.id)
-        if len(profiles) >= 10:
-            await interaction.followup.send(
-                "❌ Maximum 10 script profiles per server.", ephemeral=True)
-            return
-
-        profile = create_script_profile(
-            interaction.guild.id, name, key_type_raw, duration, role_id)
-        if not profile:
-            await interaction.followup.send(
-                "❌ Failed to create profile.", ephemeral=True)
-            return
-
-        embed = _build_setup_embed(interaction.guild, profile, role)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await _panel_on_error(interaction, error, item)
 
 
 def _build_setup_embed(guild, profile, role=None):
@@ -648,56 +651,36 @@ def _build_setup_embed(guild, profile, role=None):
 # ---------------------------------------------------------------------------
 
 class AddScriptModal(discord.ui.Modal):
-    """Modal for adding an additional script profile from the panel."""
+    """Name + duration only — type and role come from the dropdown screen."""
 
-    def __init__(self):
+    def __init__(self, key_type, role=None, first_time=False):
         super().__init__(title="Add Script", timeout=300)
+        self.key_type = key_type
+        self.role = role
+        self.first_time = first_time
         self.script_name = discord.ui.TextInput(
             label="Script Name", style=discord.TextStyle.short,
             placeholder="e.g. My ESP Script", min_length=2, max_length=50, required=True)
-        self.key_type = discord.ui.TextInput(
-            label="Key Type", style=discord.TextStyle.short,
-            placeholder="discord = instant  |  adlink = link gate",
-            default="discord", min_length=4, max_length=7, required=True)
         self.duration = discord.ui.TextInput(
             label="Key Duration (hours, 0 = never)", style=discord.TextStyle.short,
             default="24", max_length=5, required=True)
-        self.required_role = discord.ui.TextInput(
-            label="Required Role ID (optional)", style=discord.TextStyle.short,
-            placeholder="Blank = anyone can get a key", required=False, max_length=30)
-        for item in (self.script_name, self.key_type, self.duration, self.required_role):
-            self.add_item(item)
+        self.add_item(self.script_name)
+        self.add_item(self.duration)
 
     async def on_submit(self, interaction: discord.Interaction):
         name = self.script_name.value.strip()
-        key_type_raw = self.key_type.value.strip().lower()
-        if key_type_raw not in ("discord", "adlink"):
-            await interaction.response.send_message("❌ Key type must be `discord` or `adlink`.", ephemeral=True)
-            return
         try:
             duration = int(float(self.duration.value.strip()))
         except ValueError:
             await interaction.response.send_message("❌ Duration must be a number of hours.", ephemeral=True)
             return
         if duration < 0 or duration > 8760:
-            await interaction.response.send_message("❌ Duration must be between 1 and 8760 hours.", ephemeral=True)
+            await interaction.response.send_message("❌ Duration must be between 0 and 8760 hours.", ephemeral=True)
             return
 
-        role_id = None
-        role = None
-        role_raw = self.required_role.value.strip()
-        if role_raw:
-            digits = ''.join(ch for ch in role_raw if ch.isdigit())
-            if not digits:
-                await interaction.response.send_message("❌ Required Role must be a role ID.", ephemeral=True)
-                return
-            role = interaction.guild.get_role(int(digits))
-            if not role:
-                await interaction.response.send_message("❌ I couldn't find that role in this server.", ephemeral=True)
-                return
-            role_id = role.id
+        role = self.role
+        role_id = role.id if role else None
 
-        # Acknowledge immediately so DB work can't trip the 3s timeout.
         await interaction.response.defer(ephemeral=True)
 
         if get_profile_by_name(interaction.guild.id, name):
@@ -708,13 +691,24 @@ class AddScriptModal(discord.ui.Modal):
             await interaction.followup.send("❌ Maximum 10 script profiles per server.", ephemeral=True)
             return
 
-        profile = create_script_profile(interaction.guild.id, name, key_type_raw, duration, role_id)
+        if self.first_time or not get_guild_config(interaction.guild.id):
+            config = init_guild_config(
+                interaction.guild.id, interaction.guild.name, interaction.user.id)
+            if not config:
+                await interaction.followup.send(
+                    "❌ Failed to initialize. Database may be unavailable.", ephemeral=True)
+                return
+
+        profile = create_script_profile(
+            interaction.guild.id, name, self.key_type, duration, role_id)
         if not profile:
             await interaction.followup.send("❌ Failed to create profile.", ephemeral=True)
             return
 
-        embed = _build_setup_embed(interaction.guild, profile, role)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        ready = _build_setup_embed(interaction.guild, profile, role)
+        dash = build_dashboard_embed(interaction.guild)
+        await interaction.edit_original_response(content=None, embed=dash, view=ManagementView())
+        await interaction.followup.send(embed=ready, ephemeral=True)
 
 
 def _is_ks_admin(interaction: discord.Interaction) -> bool:
@@ -769,7 +763,12 @@ class ManagementView(KsPanelView):
         if len(profiles) >= 10:
             await interaction.response.send_message("❌ Maximum 10 script profiles per server.", ephemeral=True)
             return
-        await interaction.response.send_modal(AddScriptModal())
+        await interaction.response.edit_message(
+            content=None,
+            embed=_add_script_builder_embed(),
+            view=AddScriptBuilderView(),
+        )
+        self.stop()
 
     @discord.ui.button(label="Remove Script", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
     async def remove_script(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -872,6 +871,8 @@ class ManagementView(KsPanelView):
                 links.append("Linkvertise")
             links_str = ", ".join(links) if links else "None"
             secret = (p.get("api_secret") or "")[:18]
+            tut = resolve_tutorial(p)
+            tut_line = tut if tut else "None"
             embed.add_field(
                 name=f"{type_label} — {p.get('name', 'unnamed')}",
                 value=(
@@ -879,12 +880,30 @@ class ManagementView(KsPanelView):
                     f"Required role: {req_role}\n"
                     f"Server lock: {membership}\n"
                     f"Ad links: {links_str}\n"
+                    f"Tutorial: {tut_line}\n"
                     f"API secret: ||{secret}...||"
                 ),
                 inline=False,
             )
         await interaction.edit_original_response(
             content=None, embed=embed, view=BackOnlyView()
+        )
+        self.stop()
+
+    @discord.ui.button(label="Tutorial", style=discord.ButtonStyle.secondary, emoji="▶️", row=2)
+    async def set_tutorial(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await _deny_if_not_admin(interaction):
+            return
+        profiles = await asyncio.to_thread(get_script_profiles, interaction.guild.id)
+        config = await asyncio.to_thread(get_guild_config, interaction.guild.id)
+        await interaction.response.edit_message(
+            content=(
+                "__**YouTube Tutorial**__\n"
+                "Users see a **Watch Tutorial** button on `/ks getkey` (ad-link flow).\n"
+                "Pick **All scripts** for a default, or one script to override it."
+            ),
+            embed=None,
+            view=TutorialTargetView(profiles, config),
         )
         self.stop()
 
@@ -927,6 +946,104 @@ class MembershipView(KsPanelView):
         super().__init__()
         self.add_item(MembershipSelect(profiles))
         self.add_item(BackToDashboardButton())
+
+
+class TutorialTargetView(KsPanelView):
+    def __init__(self, profiles, config=None):
+        super().__init__()
+        self.add_item(TutorialTargetSelect(profiles, config))
+        self.add_item(BackToDashboardButton())
+
+
+class TutorialTargetSelect(discord.ui.Select):
+    def __init__(self, profiles, config=None):
+        default_url = ((config or {}).get("default_tutorial") or "").strip()
+        options = [
+            discord.SelectOption(
+                label="All scripts (default)",
+                value="all",
+                description=("Set" if default_url else "No default tutorial yet")[:100],
+                emoji="🌐",
+            )
+        ]
+        for p in (profiles or [])[:24]:
+            has = bool((p.get("tutorial") or "").strip())
+            options.append(discord.SelectOption(
+                label=str(p.get("name", "unnamed"))[:100],
+                value=str(p["profile_id"]),
+                description=("Custom YouTube link" if has else "Uses the all-scripts default")[:100],
+            ))
+        super().__init__(
+            placeholder="Apply tutorial to…",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.profiles = {p["profile_id"]: p for p in (profiles or [])}
+        self.config = config or {}
+
+    async def callback(self, interaction: discord.Interaction):
+        target = self.values[0]
+        if target == "all":
+            current = (self.config.get("default_tutorial") or "").strip()
+            label = "all scripts"
+        else:
+            profile = self.profiles.get(target) or {}
+            current = (profile.get("tutorial") or "").strip()
+            label = profile.get("name", "this script")
+        await interaction.response.send_modal(TutorialUrlModal(target, label, current))
+
+
+class TutorialUrlModal(discord.ui.Modal):
+    def __init__(self, target, label, current=""):
+        super().__init__(title="YouTube Tutorial", timeout=300)
+        self.target = target
+        self.label = label
+        self.url_input = discord.ui.TextInput(
+            label="YouTube link",
+            style=discord.TextStyle.short,
+            placeholder="https://youtu.be/...  (blank = remove)",
+            required=False,
+            max_length=512,
+            default=current[:512],
+        )
+        self.add_item(self.url_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.url_input.value.strip()
+        url = normalize_tutorial_url(raw)
+        if url is None:
+            await interaction.response.send_message(
+                "❌ That doesn't look like a YouTube link. Use youtube.com or youtu.be.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        if self.target == "all":
+            await asyncio.to_thread(
+                save_guild_config,
+                interaction.guild.id,
+                {"default_tutorial": url, "updated_at": time.time()},
+            )
+            if url:
+                msg = f"▶️ Default tutorial set for **all scripts**.\n{url}"
+            else:
+                msg = "▶️ Default tutorial **cleared**."
+        else:
+            await asyncio.to_thread(
+                update_script_profile, self.target, {"tutorial": url}
+            )
+            if url:
+                msg = f"▶️ Tutorial set for **{self.label}**.\n{url}"
+            else:
+                msg = (
+                    f"▶️ Tutorial **cleared** for **{self.label}** "
+                    "(falls back to the all-scripts default)."
+                )
+        embed = await asyncio.to_thread(build_dashboard_embed, interaction.guild)
+        await interaction.edit_original_response(
+            content=msg, embed=embed, view=ManagementView()
+        )
 
 
 class RemoveScriptSelect(discord.ui.Select):
@@ -1156,7 +1273,11 @@ async def ks_setup(interaction: discord.Interaction):
     # A disabled-but-existing config must still open the dashboard — otherwise
     # Enable/Disable would trap admins in the wizard on the next /ks setup.
     if not config:
-        await interaction.response.send_modal(SetupWizardModal())
+        await interaction.response.send_message(
+            embed=_add_script_builder_embed(first_time=True),
+            view=AddScriptBuilderView(first_time=True),
+            ephemeral=True,
+        )
         return
 
     embed = await asyncio.to_thread(build_dashboard_embed, interaction.guild)
@@ -1232,7 +1353,10 @@ async def ks_getkey(interaction: discord.Interaction):
             pending = get_pending_session(interaction.user.id, interaction.guild.id, profile['profile_id'])
             if pending:
                 gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{pending['token']}"
-                view = KeyClaimView(pending['token'], gateway_url, str(interaction.guild.id), profile['profile_id'])
+                view = KeyClaimView(
+                    pending['token'], gateway_url, str(interaction.guild.id), profile['profile_id'],
+                    tutorial=resolve_tutorial(profile, config),
+                )
 
                 embed = discord.Embed(
                     title="🔑 Verification Already Complete!",
@@ -1254,7 +1378,10 @@ async def ks_getkey(interaction: discord.Interaction):
                 return
 
             gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{token}"
-            view = KeyClaimView(token, gateway_url, str(interaction.guild.id), profile['profile_id'])
+            view = KeyClaimView(
+                token, gateway_url, str(interaction.guild.id), profile['profile_id'],
+                tutorial=resolve_tutorial(profile, config),
+            )
 
             embed = discord.Embed(title="🔑 Key Verification", color=discord.Color.blurple())
             embed.description = (
