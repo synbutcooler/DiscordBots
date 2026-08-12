@@ -41,12 +41,6 @@ DELAY_SECONDS = 1
 BOOST_TEST_CHANNEL_ID = 1270301984897110148
 
 DISCORD_KEY_EXPIRY_HOURS = 336
-
-# --- Multi-tenant / public-bot settings -----------------------------------
-# This single bot runs BOTH the owner's personal server (legacy premium key
-# system + fun features) AND the public "/ks" Key-System-as-a-Service that any
-# server can use. Everything personal is gated behind OWNER_GUILD_ID so it can
-# never fire inside a customer's server.
 OWNER_GUILD_ID = 1241797935100989594
 
 
@@ -89,8 +83,6 @@ class HWIDModal(discord.ui.Modal, title="Enter Your HWID"):
     hwid = discord.ui.TextInput(label="Paste your HWID here", style=discord.TextStyle.short, placeholder="Example: ABCDEFGH-1234-IJKL-5678-MNOPQRSTUVW", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # The manual HWID-authentication flow is an owner-server-only premium
-        # feature; it DMs the owner, so it must never run from another guild.
         if not is_owner_guild(interaction.guild_id):
             await interaction.response.send_message(
                 "This command isn't available in this server.", ephemeral=True)
@@ -384,8 +376,6 @@ class ProfileSelectForKey(discord.ui.Select):
                 await interaction.response.send_message(
                     f"❌ You need the {role.mention} role to get a key for **{profile['name']}**.", ephemeral=True)
                 return
-
-        # Acknowledge immediately; key generation does a DB write.
         await interaction.response.defer(ephemeral=True)
 
         if profile['key_type'] == 'discord':
@@ -758,7 +748,6 @@ class ManagementView(KsPanelView):
     async def add_script(self, interaction: discord.Interaction, button: discord.ui.Button):
         if await _deny_if_not_admin(interaction):
             return
-        # Modal must be the first (and only) response — don't touch the view.
         profiles = await asyncio.to_thread(get_script_profiles, interaction.guild.id)
         if len(profiles) >= 10:
             await interaction.response.send_message("❌ Maximum 10 script profiles per server.", ephemeral=True)
@@ -1164,8 +1153,6 @@ def build_dashboard_embed(guild):
     if profiles:
         lines = []
         for p in profiles:
-            # 🔗 = Ad-Link (user completes a work.ink/LootLabs link for a key)
-            # 💬 = Discord (key issued instantly in the server)
             type_emoji = "🔗" if p['key_type'] == 'adlink' else "💬"
             type_word = "link-gate" if p['key_type'] == 'adlink' else "instant"
             status_emoji = "✅" if p.get('enabled') else "❌"
@@ -1268,10 +1255,6 @@ ks_group = app_commands.Group(name="ks", description="Key System commands")
 @app_commands.checks.has_permissions(administrator=True)
 async def ks_setup(interaction: discord.Interaction):
     config = await asyncio.to_thread(get_guild_config, interaction.guild.id)
-
-    # First-time setup only when this guild has never been configured.
-    # A disabled-but-existing config must still open the dashboard — otherwise
-    # Enable/Disable would trap admins in the wizard on the next /ks setup.
     if not config:
         await interaction.response.send_message(
             embed=_add_script_builder_embed(first_time=True),
@@ -1286,8 +1269,6 @@ async def ks_setup(interaction: discord.Interaction):
 
 @ks_group.command(name="getkey", description="Get a script key.")
 async def ks_getkey(interaction: discord.Interaction):
-    # Ack immediately. Several branches used followup without a response,
-    # which Discord reports as "did not respond".
     await interaction.response.defer(ephemeral=True)
 
     config = await asyncio.to_thread(get_guild_config, interaction.guild.id)
@@ -1480,8 +1461,6 @@ async def ks_stats(interaction: discord.Interaction, script_name: str = None):
     embed.add_field(name="✅ Active", value=str(stats['active']), inline=True)
     embed.add_field(name="⌛ Expired", value=str(stats['expired']), inline=True)
     embed.add_field(name="🔒 HWID Locked", value=str(stats['hwid_locked']), inline=True)
-
-    # Per-script breakdown when viewing all scripts.
     if not script_name:
         profiles = get_script_profiles(interaction.guild.id)
         if profiles:
@@ -1677,7 +1656,6 @@ def build_fun_embed(guild):
 @bot.tree.command(name="fun", description="Toggle the bot's fun little features.")
 @app_commands.checks.has_permissions(administrator=True)
 async def fun_setup(interaction: discord.Interaction):
-    # Set button labels/styles to match current saved state.
     view = FunView()
     s = get_settings(interaction.guild.id)
     meow = s.get("fun_meow", True)
@@ -1699,7 +1677,6 @@ async def antispam_setup(interaction: discord.Interaction):
 
 @bot.event
 async def on_member_remove(member):
-    # Owner-server premium keys (legacy key_store).
     if is_owner_guild(member.guild.id):
         count = delete_keys_by_discord_id(member.id)
         if count > 0:
@@ -1711,14 +1688,10 @@ async def on_member_remove(member):
                 embed.add_field(name="Keys Revoked", value=str(count), inline=False)
                 await log_channel.send(embed=embed)
 
-    # Multi-tenant /ks keys for this (or any) guild.
     guild_config = get_guild_config(member.guild.id)
     if guild_config:
         guild_count = delete_guild_keys_by_user(member.guild.id, member.id)
         if guild_count > 0:
-            # Log to the guild owner's DMs by default (we have no guaranteed
-            # channel in a customer's server). Never leak this into the
-            # owner-server's personal log channel.
             try:
                 guild_owner = member.guild.owner
                 if guild_owner:
@@ -1738,7 +1711,6 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # DMs / system messages: only process commands, ignore fun logic.
     if message.guild is None:
         await bot.process_commands(message)
         return
@@ -1880,19 +1852,9 @@ async def on_ready():
 
     try:
         await asyncio.sleep(5)
-
-        # --- Instant command cleanup -------------------------------------
-        # tree.sync() only upserts; it never removes commands that were
-        # deleted or renamed in code, so stale/old commands linger for up to
-        # an hour. We diff what's currently registered against what the bot
-        # actually defines and delete the extras immediately.
-        #
-        # A command is "global" when it has no guild_ids binding. The /ks
-        # group is global; the legacy premium commands are bound to the owner
-        # guild and must NOT be counted as global.
         def _is_global(cmd):
             gids = getattr(cmd, "guild_ids", None)
-            return not gids  # empty/None -> global
+            return not gids
 
         desired_global = {c.name for c in bot.tree.get_commands(guild=None) if _is_global(c)}
         current_global = await bot.http.get_global_commands(bot.user.id)
@@ -1900,31 +1862,20 @@ async def on_ready():
         for cmd_id in stale_global:
             await bot.http.delete_global_command(bot.user.id, cmd_id)
             print(f"Deleted stale global command {cmd_id}")
-
-        # Owner guild: ONLY the legacy premium commands are bound here
-        # (authenticate/getkey/resetkey/revokekey/keystats). The /ks group is
-        # GLOBAL and must NOT be copied to this guild — doing so made every /ks
-        # subcommand show up twice (once global, once guild). Remove any guild
-        # command whose name isn't one of the legacy commands.
         owner_guild = discord.Object(id=OWNER_GUILD_ID)
         legacy_names = {
             c.name for c in bot.tree.get_commands(guild=owner_guild)
             if getattr(c, "guild_ids", None) and OWNER_GUILD_ID in c.guild_ids
         }
         current_owner = await bot.http.get_guild_commands(bot.user.id, OWNER_GUILD_ID)
-        # Delete everything that isn't a legacy command (this wipes the old
-        # duplicate /ks guild copies instantly).
         stale_owner = [c["id"] for c in current_owner if c["name"] not in legacy_names]
         for cmd_id in stale_owner:
             await bot.http.delete_guild_command(bot.user.id, OWNER_GUILD_ID, cmd_id)
             print(f"Deleted stale/duplicate owner-guild command {cmd_id}")
 
-        # Sync GLOBAL commands (/ks). They appear in every server — including
-        # the owner's — as a single copy.
         global_synced = await bot.tree.sync()
         print(f"Synced {len(global_synced)} global commands (removed {len(stale_global)} stale)")
 
-        # Sync the owner-guild legacy commands (no global copy mixed in).
         synced = await bot.tree.sync(guild=owner_guild)
         print(f"Synced {len(synced)} legacy commands to owner guild (removed {len(stale_owner)} stale/duplicate)")
 
