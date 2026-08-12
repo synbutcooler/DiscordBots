@@ -17,7 +17,7 @@ from key_store import (
 )
 from guild_key_system import (
     get_guild_config, init_guild_config, save_guild_config,
-    delete_guild_config, create_session, get_session,
+    create_session, get_session,
     update_session, get_pending_session,
     create_guild_key, delete_guild_keys_by_user,
     get_guild_key_stats, cleanup_expired_guild_keys,
@@ -26,6 +26,9 @@ from guild_key_system import (
     create_script_profile, update_script_profile, delete_script_profile,
     get_profile_by_name,
     SERVER_BASE_URL
+)
+from server_settings import (
+    get_settings, update_settings, antispam_active,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,20 +49,9 @@ DISCORD_KEY_EXPIRY_HOURS = 336
 # never fire inside a customer's server.
 OWNER_GUILD_ID = 1241797935100989594
 
-# Per-guild toggles for the "fun" features (in-memory; set via /ks fun).
-# Structure: { guild_id: {"meow": bool, "good_boy": bool, "antispam": bool} }
-GUILD_FUN_SETTINGS = {}
-DEFAULT_FUN_SETTINGS = {"meow": True, "good_boy": True, "antispam": True}
-
 
 def is_owner_guild(guild_id) -> bool:
     return guild_id is not None and guild_id == OWNER_GUILD_ID
-
-
-def get_fun_settings(guild_id) -> dict:
-    if guild_id not in GUILD_FUN_SETTINGS:
-        GUILD_FUN_SETTINGS[guild_id] = dict(DEFAULT_FUN_SETTINGS)
-    return GUILD_FUN_SETTINGS[guild_id]
 
 
 MONITORED_CHANNELS = {
@@ -718,7 +710,8 @@ class AddScriptModal(discord.ui.Modal):
 
 
 class RemoveScriptSelect(discord.ui.Select):
-    def __init__(self, profiles):
+    def __init__(self, parent_view, profiles):
+        self.parent_view = parent_view
         options = [
             discord.SelectOption(label=p['name'][:100], value=p['profile_id'],
                                  description=f"{p['key_type']} · {p.get('key_duration_hours', 24)}h")
@@ -731,11 +724,15 @@ class RemoveScriptSelect(discord.ui.Select):
         profile = get_script_profile(profile_id)
         name = profile['name'] if profile else profile_id
         delete_script_profile(profile_id)
-        await interaction.response.send_message(f"🗑️ **{name}** and all its keys have been deleted.", ephemeral=True)
+        self.parent_view.reset_main()
+        embed = build_dashboard_embed(interaction.guild)
+        await interaction.response.edit_message(
+            content=f"🗑️ **{name}** and all its keys have been deleted.", embed=embed, view=self.parent_view)
 
 
 class SetLinkScriptSelect(discord.ui.Select):
-    def __init__(self, profiles):
+    def __init__(self, parent_view, profiles):
+        self.parent_view = parent_view
         adlink = [p for p in profiles if p['key_type'] == 'adlink']
         options = [
             discord.SelectOption(label=p['name'][:100], value=p['profile_id'],
@@ -753,50 +750,187 @@ class SetLinkScriptSelect(discord.ui.Select):
 
 
 class ManagementView(discord.ui.View):
-    """Persistent-feeling panel with the management buttons."""
+    """Interactive admin panel driven by /ks setup."""
 
     def __init__(self):
         super().__init__(timeout=300)
+        self._build_main()
 
-    @discord.ui.button(label="Add Script", style=discord.ButtonStyle.success, emoji="➕")
-    async def add_script(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-            return
-        profiles = get_script_profiles(interaction.guild.id)
-        if len(profiles) >= 10:
-            await interaction.response.send_message("❌ Maximum 10 script profiles per server.", ephemeral=True)
-            return
-        await interaction.response.send_modal(AddScriptModal())
-
-    @discord.ui.button(label="Remove Script", style=discord.ButtonStyle.danger, emoji="🗑️")
-    async def remove_script(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-            return
-        profiles = get_script_profiles(interaction.guild.id)
-        if not profiles:
-            await interaction.response.send_message("❌ No scripts to remove. Add one first.", ephemeral=True)
-            return
-        # Clear previous selects to avoid duplicate-component errors.
+    def reset_main(self):
         self.clear_items()
-        self.add_item(RemoveScriptSelect(profiles))
-        await interaction.response.edit_message(view=self)
+        self._build_main()
 
-    @discord.ui.button(label="Set Links", style=discord.ButtonStyle.primary, emoji="🔗")
-    async def set_links(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    def _build_main(self):
+        self.add_item(self.AddScriptButton())
+        self.add_item(self.RemoveScriptButton())
+        self.add_item(self.SetLinksButton())
+        self.add_item(self.MembershipButton())
+        self.add_item(self.ToggleSystemButton())
+        self.add_item(self.ViewConfigButton())
+
+    class AddScriptButton(discord.ui.Button):
+        def __init__(self):
+            super().__init__(label="Add Script", style=discord.ButtonStyle.success, emoji="➕", row=0)
+
+        async def callback(self, interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+                return
+            profiles = get_script_profiles(interaction.guild.id)
+            if len(profiles) >= 10:
+                await interaction.response.send_message("❌ Maximum 10 script profiles per server.", ephemeral=True)
+                return
+            await interaction.response.send_modal(AddScriptModal())
+
+    class RemoveScriptButton(discord.ui.Button):
+        def __init__(self):
+            super().__init__(label="Remove Script", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
+
+        async def callback(self, interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+                return
+            profiles = get_script_profiles(interaction.guild.id)
+            if not profiles:
+                await interaction.response.send_message("❌ No scripts to remove. Add one first.", ephemeral=True)
+                return
+            self.view.clear_items()
+            self.view.add_item(RemoveScriptSelect(self.view, profiles))
+            self.view.add_item(BackButton())
+            await interaction.response.edit_message(
+                content="Pick a script to delete:", embed=None, view=self.view)
+
+    class SetLinksButton(discord.ui.Button):
+        def __init__(self):
+            super().__init__(label="Set Links", style=discord.ButtonStyle.primary, emoji="🔗", row=0)
+
+        async def callback(self, interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+                return
+            profiles = get_script_profiles(interaction.guild.id)
+            adlink = [p for p in profiles if p['key_type'] == 'adlink']
+            if not adlink:
+                await interaction.response.send_message(
+                    "❌ No ad-link scripts. Add one with type `adlink` to set monetization URLs.", ephemeral=True)
+                return
+            self.view.clear_items()
+            self.view.add_item(SetLinkScriptSelect(self.view, adlink))
+            self.view.add_item(BackButton())
+            await interaction.response.edit_message(
+                content="Pick an ad-link script:", embed=None, view=self.view)
+
+    class MembershipButton(discord.ui.Button):
+        def __init__(self):
+            super().__init__(label="Membership", style=discord.ButtonStyle.secondary, emoji="🔒", row=1)
+
+        async def callback(self, interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+                return
+            profiles = get_script_profiles(interaction.guild.id)
+            discord_profiles = [p for p in profiles]
+            if not discord_profiles:
+                await interaction.response.send_message("❌ Add a script first.", ephemeral=True)
+                return
+            self.view.clear_items()
+            self.view.add_item(MembershipSelect(self.view, discord_profiles))
+            self.view.add_item(BackButton())
+            await interaction.response.edit_message(
+                content="Toggle whether users must stay in this server for keys to work:",
+                embed=None, view=self.view)
+
+    class ToggleSystemButton(discord.ui.Button):
+        def __init__(self):
+            super().__init__(label="Enable/Disable", style=discord.ButtonStyle.secondary, emoji="⚙️", row=1)
+
+        async def callback(self, interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+                return
+            config = get_guild_config(interaction.guild.id)
+            current = bool(config and config.get('enabled'))
+            save_guild_config(interaction.guild.id, {"enabled": not current, "updated_at": time.time()})
+            embed = build_dashboard_embed(interaction.guild)
+            await interaction.response.edit_message(
+                content=f"✅ Key system **{'disabled' if current else 'enabled'}**.",
+                embed=embed, view=self.view)
+
+    class ViewConfigButton(discord.ui.Button):
+        def __init__(self):
+            super().__init__(label="View Config", style=discord.ButtonStyle.secondary, emoji="📋", row=1)
+
+        async def callback(self, interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+                return
+            config = get_guild_config(interaction.guild.id)
+            profiles = get_script_profiles(interaction.guild.id)
+            embed = discord.Embed(
+                title="📋 Full Configuration",
+                color=discord.Color.blurple(),
+            )
+            if not profiles:
+                embed.description = "No scripts yet."
+            for p in profiles:
+                type_label = "🔗 Ad-Link" if p['key_type'] == 'adlink' else "💬 Discord"
+                req_role = f"<@&{p['required_role_id']}>" if p.get('required_role_id') else "None"
+                membership = "Required" if p.get('require_membership', True) else "Not required"
+                links = []
+                if p.get('workink_url'): links.append("Work.ink")
+                if p.get('lootlabs_url'): links.append("LootLabs")
+                if p.get('linkvertise_url'): links.append("Linkvertise")
+                links_str = ", ".join(links) if links else "None"
+                embed.add_field(
+                    name=f"{type_label} — {p['name']}",
+                    value=(
+                        f"Duration: `{p.get('key_duration_hours', 24)}h`\n"
+                        f"Required role: {req_role}\n"
+                        f"Membership: {membership}\n"
+                        f"Ad links: {links_str}\n"
+                        f"API secret: ||{p['api_secret'][:18]}...||"
+                    ),
+                    inline=False,
+                )
+            self.view.clear_items()
+            self.view.add_item(BackButton())
+            await interaction.response.edit_message(content=None, embed=embed, view=self.view)
+
+
+class BackButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.reset_main()
+        embed = build_dashboard_embed(interaction.guild)
+        await interaction.response.edit_message(content=None, embed=embed, view=self.view)
+
+
+class MembershipSelect(discord.ui.Select):
+    def __init__(self, parent_view, profiles):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=p['name'][:100], value=p['profile_id'],
+                description=f"Membership: {'ON' if p.get('require_membership', True) else 'OFF'}")
+            for p in profiles
+        ]
+        super().__init__(placeholder="Choose a script to toggle membership…", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        profile = get_script_profile(self.values[0])
+        if not profile:
+            await interaction.response.send_message("❌ Profile not found.", ephemeral=True)
             return
-        profiles = get_script_profiles(interaction.guild.id)
-        adlink = [p for p in profiles if p['key_type'] == 'adlink']
-        if not adlink:
-            await interaction.response.send_message(
-                "❌ No ad-link scripts. Add one with type `adlink` to set monetization URLs.", ephemeral=True)
-            return
-        self.clear_items()
-        self.add_item(SetLinkScriptSelect(adlink))
-        await interaction.response.edit_message(view=self)
+        current = profile.get('require_membership', True)
+        update_script_profile(profile['profile_id'], {"require_membership": not current})
+        self.parent_view.reset_main()
+        embed = build_dashboard_embed(interaction.guild)
+        await interaction.response.edit_message(
+            content=f"{'🔒' if not current else '🔓'} Membership requirement **{'enabled' if not current else 'disabled'}** for **{profile['name']}**.",
+            embed=embed, view=self.parent_view)
+
 
 
 def build_dashboard_embed(guild):
@@ -832,7 +966,9 @@ def build_dashboard_embed(guild):
             inline=False,
         )
 
-    embed.set_footer(text="Users get keys with /ks getkey · /ks stats for stats")
+    embed.set_footer(
+        text="Users get keys with /ks getkey · /ks stats for stats · /antispam for scam protection"
+    )
     return embed
 
 
@@ -914,189 +1050,12 @@ ks_group = app_commands.Group(name="ks", description="Key System commands")
 async def ks_setup(interaction: discord.Interaction):
     config = get_guild_config(interaction.guild.id)
 
-    # First-time setup: launch the one-shot wizard modal.
     if not (config and config.get('enabled')):
         await interaction.response.send_modal(SetupWizardModal())
         return
 
-    # Already set up: show the interactive management panel.
     embed = build_dashboard_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, view=ManagementView(), ephemeral=True)
-
-
-@ks_group.command(name="addscript", description="[Admin] Add a script profile to your key system.")
-@app_commands.describe(
-    name="Name for this script (e.g. 'My ESP Script')",
-    key_type="Type of key system",
-    key_duration="How long keys last in hours (default: 24)",
-    required_role="Role required to get a key (optional)"
-)
-@app_commands.choices(key_type=[
-    app_commands.Choice(name="Discord (instant key, membership required)", value="discord"),
-    app_commands.Choice(name="Ad-Link (monetization link required)", value="adlink"),
-])
-@app_commands.checks.has_permissions(administrator=True)
-async def ks_addscript(
-    interaction: discord.Interaction,
-    name: str,
-    key_type: app_commands.Choice[str],
-    key_duration: int = 24,
-    required_role: discord.Role = None
-):
-    config = get_guild_config(interaction.guild.id)
-    if not config:
-        await interaction.response.send_message("❌ Run `/ks setup` first.", ephemeral=True)
-        return
-
-    existing = get_profile_by_name(interaction.guild.id, name)
-    if existing:
-        await interaction.response.send_message(f"❌ A profile named **{name}** already exists.", ephemeral=True)
-        return
-
-    profiles = get_script_profiles(interaction.guild.id)
-    if len(profiles) >= 10:
-        await interaction.response.send_message("❌ Maximum 10 script profiles per server.", ephemeral=True)
-        return
-
-    profile = create_script_profile(
-        interaction.guild.id,
-        name,
-        key_type.value,
-        key_duration,
-        required_role.id if required_role else None
-    )
-
-    if not profile:
-        await interaction.response.send_message("❌ Failed to create profile.", ephemeral=True)
-        return
-
-    embed = discord.Embed(title="✅ Script Profile Created", color=discord.Color.green())
-
-    info_lines = [
-        f"**Name:** {name}",
-        f"**Type:** {key_type.name}",
-        f"**Key Duration:** {key_duration}h",
-    ]
-
-    if required_role:
-        info_lines.append(f"**Required Role:** {required_role.mention}")
-
-    info_lines.append(f"\n**🔐 API Secret:**\n||{profile['api_secret']}||")
-    info_lines.append(f"\n**🔗 Validation URL:**\n```{SERVER_BASE_URL}/api/validate-guild-key```")
-
-    if key_type.value == 'adlink':
-        dest_url = get_destination_url(interaction.guild.id, profile['profile_id'])
-        info_lines.append(f"\n**📎 Destination URL** (set this in your campaign):\n```{dest_url}```")
-        info_lines.append("\nNext: Run `/ks setlink` to register your campaign URL.")
-    else:
-        info_lines.append("\nUsers can get keys immediately with `/ks getkey`.")
-
-    embed.description = "\n".join(info_lines)
-
-    lua_config = (
-        "```lua\nDiscordValidation = {\n"
-        "    Enabled = true,\n"
-        f"    ValidateURL = '{SERVER_BASE_URL}/api/validate-guild-key',\n"
-        f"    APISecret = '{profile['api_secret']}'\n"
-        "},\n```"
-    )
-    embed.add_field(name="Roblox Script Config", value=lua_config, inline=False)
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@ks_group.command(name="setlink", description="[Admin] Set monetization links for an ad-link script.")
-@app_commands.describe(script_name="Name of the script profile")
-@app_commands.checks.has_permissions(administrator=True)
-async def ks_setlink(interaction: discord.Interaction, script_name: str):
-    config = get_guild_config(interaction.guild.id)
-    if not config:
-        await interaction.response.send_message("❌ Run `/ks setup` first.", ephemeral=True)
-        return
-
-    profile = get_profile_by_name(interaction.guild.id, script_name)
-    if not profile:
-        await interaction.response.send_message(
-            f"❌ No script profile named **{script_name}** found.", ephemeral=True)
-        return
-
-    if profile['key_type'] != 'adlink':
-        await interaction.response.send_message(
-            f"❌ **{script_name}** is a Discord-type profile. Links are only for ad-link profiles.", ephemeral=True)
-        return
-
-    await interaction.response.send_modal(SetupLinksModal(profile))
-
-
-@ks_group.command(name="config", description="[Admin] View current key system configuration.")
-@app_commands.checks.has_permissions(administrator=True)
-async def ks_config(interaction: discord.Interaction):
-    config = get_guild_config(interaction.guild.id)
-    if not config:
-        await interaction.response.send_message("❌ Key system not set up. Run `/ks setup` first.", ephemeral=True)
-        return
-
-    profiles = get_script_profiles(interaction.guild.id)
-
-    embed = discord.Embed(title="⚙️ Key System Config", color=discord.Color.blurple())
-
-    status_line = "✅ Enabled" if config.get('enabled') else "❌ Disabled"
-    embed.description = f"**Status:** {status_line}\n**Script Profiles:** {len(profiles)}"
-
-    if not profiles:
-        embed.add_field(name="Scripts", value="None — use `/ks addscript`", inline=False)
-    else:
-        for p in profiles:
-            type_emoji = "🔗" if p['key_type'] == 'adlink' else "💬"
-            status = "✅" if p.get('enabled') else "❌"
-
-            lines = [f"Type: {p['key_type']} | Duration: {p.get('key_duration_hours', 24)}h"]
-
-            if p.get('required_role_id'):
-                lines.append(f"Role: <@&{p['required_role_id']}>")
-
-            if p['key_type'] == 'adlink':
-                providers = []
-                if p.get('workink_url'):
-                    providers.append("⚡WI")
-                if p.get('lootlabs_url'):
-                    providers.append("🎁LL")
-                if p.get('linkvertise_url'):
-                    providers.append("🔗LV")
-                if providers:
-                    lines.append(f"Providers: {' '.join(providers)}")
-                else:
-                    lines.append("⚠️ No links set — use `/ks setlink`")
-
-            lines.append(f"Secret: ||{p.get('api_secret', 'N/A')}||")
-
-            embed.add_field(
-                name=f"{type_emoji} {p['name']} {status}",
-                value="\n".join(lines),
-                inline=False
-            )
-
-    embed.add_field(
-        name="Validation URL",
-        value=f"```{SERVER_BASE_URL}/api/validate-guild-key```",
-        inline=False
-    )
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@ks_group.command(name="removescript", description="[Admin] Remove a script profile.")
-@app_commands.describe(script_name="Name of the script profile to remove")
-@app_commands.checks.has_permissions(administrator=True)
-async def ks_removescript(interaction: discord.Interaction, script_name: str):
-    profile = get_profile_by_name(interaction.guild.id, script_name)
-    if not profile:
-        await interaction.response.send_message(f"❌ No profile named **{script_name}** found.", ephemeral=True)
-        return
-
-    delete_script_profile(profile['profile_id'])
-    await interaction.response.send_message(
-        f"🗑️ **{script_name}** and all its keys have been deleted.", ephemeral=True)
 
 
 @ks_group.command(name="getkey", description="Get a script key.")
@@ -1286,7 +1245,6 @@ async def ks_stats(interaction: discord.Interaction, script_name: str = None):
     embed.add_field(name="⌛ Expired", value=str(stats['expired']), inline=True)
     embed.add_field(name="🔒 HWID Locked", value=str(stats['hwid_locked']), inline=True)
 
-    # Per-script breakdown when viewing all scripts.
     if not script_name:
         profiles = get_script_profiles(interaction.guild.id)
         if profiles:
@@ -1313,56 +1271,105 @@ async def ks_stats(interaction: discord.Interaction, script_name: str = None):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@ks_group.command(name="disable", description="[Admin] Disable the key system.")
-@app_commands.checks.has_permissions(administrator=True)
-async def ks_disable(interaction: discord.Interaction):
-    config = get_guild_config(interaction.guild.id)
-    if not config:
-        await interaction.response.send_message("❌ Nothing to disable.", ephemeral=True)
-        return
-
-    save_guild_config(interaction.guild.id, {"enabled": False, "updated_at": time.time()})
-    await interaction.response.send_message("🔒 Key system disabled. Run `/ks setup` to re-enable.", ephemeral=True)
-
-
-@ks_group.command(name="toggle-membership", description="[Admin] Toggle membership requirement for a script.")
-@app_commands.describe(script_name="Name of the script profile")
-@app_commands.checks.has_permissions(administrator=True)
-async def ks_toggle_membership(interaction: discord.Interaction, script_name: str):
-    profile = get_profile_by_name(interaction.guild.id, script_name)
-    if not profile:
-        await interaction.response.send_message(f"❌ No script named **{script_name}** found.", ephemeral=True)
-        return
-
-    current = profile.get('require_membership', True)
-    update_script_profile(profile['profile_id'], {"require_membership": not current})
-
-    status = "disabled" if current else "enabled"
-    await interaction.response.send_message(
-        f"{'🔓' if current else '🔒'} Membership requirement **{status}** for **{script_name}**.", ephemeral=True)
-
-
-@app_commands.choices(feature=[
-    app_commands.Choice(name="Meow easter egg", value="meow"),
-])
-@ks_group.command(name="fun", description="[Admin] Toggle the bot's fun little features in this server.")
-@app_commands.describe(feature="Which fun feature to toggle")
-@app_commands.checks.has_permissions(administrator=True)
-async def ks_fun(interaction: discord.Interaction, feature: app_commands.Choice[str]):
-    settings = get_fun_settings(interaction.guild.id)
-    key = feature.value
-    settings[key] = not settings.get(key, True)
-    state = "enabled" if settings[key] else "disabled"
-    await interaction.response.send_message(
-        f"✅ **{feature.name}** is now **{state}** in this server.", ephemeral=True)
-
 
 bot.tree.add_command(ks_group)
 
 
+# ---------------------------------------------------------------------------
+# /antispam — global anti-scam protection (4+ links/attachments)
+# ---------------------------------------------------------------------------
+
+antispam_group = app_commands.Group(
+    name="antispam",
+    description="Protect the server from link/attachment scam posts.",
+)
+
+
+@antispam_group.command(name="enable", description="Turn anti-scam deletion on.")
+@app_commands.describe(channel="Only protect this channel (leave blank = all channels)")
+@app_commands.checks.has_permissions(administrator=True)
+async def antispam_enable(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if channel:
+        s = get_settings(interaction.guild.id)
+        channels = [str(c) for c in (s.get("antispam_channels") or [])]
+        if str(channel.id) not in channels:
+            channels.append(str(channel.id))
+        update_settings(interaction.guild.id, {
+            "antispam_enabled": True,
+            "antispam_channels": channels,
+        })
+        await interaction.response.send_message(
+            f"🛡️ Anti-scam protection **enabled** for {channel.mention}. "
+            "Messages with 4+ links or attachments will be deleted.",
+            ephemeral=True)
+    else:
+        update_settings(interaction.guild.id, {
+            "antispam_enabled": True,
+            "antispam_channels": [],
+        })
+        await interaction.response.send_message(
+            "🛡️ Anti-scam protection **enabled server-wide**. "
+            "Messages with 4+ links or attachments will be deleted in every channel.",
+            ephemeral=True)
+
+
+@antispam_group.command(name="disable", description="Turn anti-scam deletion off.")
+@app_commands.checks.has_permissions(administrator=True)
+async def antispam_disable(interaction: discord.Interaction):
+    update_settings(interaction.guild.id, {"antispam_enabled": False})
+    await interaction.response.send_message(
+        "🛑 Anti-scam protection **disabled**.", ephemeral=True)
+
+
+@antispam_group.command(name="status", description="Show the current anti-scam configuration.")
+@app_commands.checks.has_permissions(administrator=True)
+async def antispam_status(interaction: discord.Interaction):
+    s = get_settings(interaction.guild.id)
+    enabled = s.get("antispam_enabled", False)
+    channels = s.get("antispam_channels") or []
+    if not enabled:
+        await interaction.response.send_message("Anti-scam is currently **disabled**.", ephemeral=True)
+        return
+    if not channels:
+        scope = "**every channel**"
+    else:
+        scope = "only: " + " ".join(f"<#{c}>" for c in channels)
+    await interaction.response.send_message(
+        f"🛡️ Anti-scam is **enabled** — protecting {scope}.", ephemeral=True)
+
+
+@antispam_group.command(name="addchannel", description="Protect an additional channel.")
+@app_commands.describe(channel="The channel to protect")
+@app_commands.checks.has_permissions(administrator=True)
+async def antispam_addchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    s = get_settings(interaction.guild.id)
+    channels = [str(c) for c in (s.get("antispam_channels") or [])]
+    if str(channel.id) in channels:
+        await interaction.response.send_message(f"{channel.mention} is already protected.", ephemeral=True)
+        return
+    channels.append(str(channel.id))
+    update_settings(interaction.guild.id, {
+        "antispam_enabled": True,
+        "antispam_channels": channels,
+    })
+    await interaction.response.send_message(f"✅ Now protecting {channel.mention}.", ephemeral=True)
+
+
+@antispam_group.command(name="removechannel", description="Stop protecting a channel.")
+@app_commands.describe(channel="The channel to remove")
+@app_commands.checks.has_permissions(administrator=True)
+async def antispam_removechannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    s = get_settings(interaction.guild.id)
+    channels = [str(c) for c in (s.get("antispam_channels") or []) if str(c) != str(channel.id)]
+    update_settings(interaction.guild.id, {"antispam_channels": channels})
+    await interaction.response.send_message(f"✅ Removed protection from {channel.mention}.", ephemeral=True)
+
+
+bot.tree.add_command(antispam_group)
+
+
 @bot.event
 async def on_member_remove(member):
-    # Owner-server premium keys (legacy key_store).
     if is_owner_guild(member.guild.id):
         count = delete_keys_by_discord_id(member.id)
         if count > 0:
@@ -1374,14 +1381,10 @@ async def on_member_remove(member):
                 embed.add_field(name="Keys Revoked", value=str(count), inline=False)
                 await log_channel.send(embed=embed)
 
-    # Multi-tenant /ks keys for this (or any) guild.
     guild_config = get_guild_config(member.guild.id)
     if guild_config:
         guild_count = delete_guild_keys_by_user(member.guild.id, member.id)
         if guild_count > 0:
-            # Log to the guild owner's DMs by default (we have no guaranteed
-            # channel in a customer's server). Never leak this into the
-            # owner-server's personal log channel.
             try:
                 guild_owner = member.guild.owner
                 if guild_owner:
@@ -1401,7 +1404,6 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # DMs / system messages: only process commands, ignore fun logic.
     if message.guild is None:
         await bot.process_commands(message)
         return
@@ -1410,12 +1412,8 @@ async def on_message(message):
         await bot.process_commands(message)
         return
 
-    fun = get_fun_settings(message.guild.id)
-
-    # Anti-spam (link/attachment flood) only for the owner server's monitored
-    # channels OR for servers that enable it (currently off by default for
-    # customers since MONITORED_CHANNELS are owner-specific).
-    if is_owner_guild(message.guild.id) and fun.get("antispam", True) and message.channel.id in MONITORED_CHANNELS:
+    owner_protected = is_owner_guild(message.guild.id) and message.channel.id in MONITORED_CHANNELS
+    if owner_protected or antispam_active(message.guild.id, message.channel.id):
         link_count = len(URL_PATTERN.findall(message.content or ""))
         attachment_count = len(message.attachments)
 
@@ -1431,7 +1429,7 @@ async def on_message(message):
                 try:
                     await message.delete()
                     logger.info(
-                        f"Deleted message {message.id} from {message.author} in "
+                        f"Deleted scam-spam message {message.id} from {message.author} in "
                         f"channel {message.channel.id} (links={link_count}, attachments={attachment_count})"
                     )
                 except discord.Forbidden:
@@ -1442,63 +1440,51 @@ async def on_message(message):
 
     content = message.content or ""
 
-    # "meow" reply easter egg — owner server by default, toggleable per guild.
-    if fun.get("meow", True):
-        cleaned_content = re.sub(r'<@!?\d+>', '', content).strip()
-        words = re.findall(r'\b\w+[!?.]*\b', cleaned_content)
+    cleaned_content = re.sub(r'<@!?\d+>', '', content).strip()
+    words = re.findall(r'\b\w+[!?.]*\b', cleaned_content)
 
-        all_meows = all(re.match(r'meow[!?.]*$', word, re.IGNORECASE) for word in words) if words else False
+    all_meows = all(re.match(r'meow[!?.]*$', word, re.IGNORECASE) for word in words) if words else False
 
-        if all_meows and words:
-            meow_weights = [5, 4, 3, 2, 1, 1]
-            possible_counts = list(range(2, 8))
+    if all_meows and words:
+        meow_weights = [5, 4, 3, 2, 1, 1]
+        possible_counts = list(range(2, 8))
 
-            if last_meow_count in possible_counts:
-                last_index = possible_counts.index(last_meow_count)
-                weights = meow_weights[:]
-                weights[last_index] = 0
-            else:
-                weights = meow_weights
+        if last_meow_count in possible_counts:
+            last_index = possible_counts.index(last_meow_count)
+            weights = meow_weights[:]
+            weights[last_index] = 0
+        else:
+            weights = meow_weights
 
-            meow_count = random.choices(possible_counts, weights=weights)[0]
-            last_meow_count = meow_count
-            punctuation = random.choice(["", "!", "!!", "."])
-            symbol_chance = random.randint(1, 3)
-            symbol = random.choice(cute_symbols) if symbol_chance == 1 else ""
+        meow_count = random.choices(possible_counts, weights=weights)[0]
+        last_meow_count = meow_count
+        punctuation = random.choice(["", "!", "!!", "."])
+        symbol_chance = random.randint(1, 3)
+        symbol = random.choice(cute_symbols) if symbol_chance == 1 else ""
 
-            await message.reply(("meow " * meow_count).strip() + punctuation + (" " + symbol if symbol else ""), mention_author=False)
+        await message.reply(("meow " * meow_count).strip() + punctuation + (" " + symbol if symbol else ""), mention_author=False)
 
-    # "good boy" boost reactions — owner server only (channels are owner-specific).
-    if is_owner_guild(message.guild.id) and fun.get("good_boy", True):
-        boost_channels = {TARGET_CHANNEL_ID, BOOST_TEST_CHANNEL_ID}
+    is_system_boost = message.type in BOOST_TYPES
+    content_lower = content.lower()
+    is_beg = ("good boy" in content_lower or "goodboy" in content_lower) and bot.user in message.mentions
 
-        if message.channel.id in boost_channels:
-            content_lower = content.lower()
-            is_system_boost = message.type in BOOST_TYPES
+    if is_system_boost or is_beg:
+        if not message.author:
+            pass
+        else:
+            user_id = message.author.id
 
-            is_text_boost = any(pattern in content_lower for pattern in [
-                "just boosted the server",
-                "boosted the server"
-            ])
+            if user_id not in recent_boosts:
+                recent_boosts[user_id] = True
 
-            is_text_boost = is_text_boost and not is_system_boost
+                if user_id in pending_tasks:
+                    try:
+                        pending_tasks[user_id].cancel()
+                    except Exception:
+                        pass
 
-            if is_text_boost or is_system_boost:
-                if not message.author:
-                    return
-
-                user_id = message.author.id
-
-                if user_id not in recent_boosts:
-                    recent_boosts[user_id] = True
-
-                    if user_id in pending_tasks:
-                        try:
-                            pending_tasks[user_id].cancel()
-                        except:
-                            pass
-
-                    pending_tasks[user_id] = bot.loop.create_task(send_good_boy_after_delay(user_id, message.channel))
+                pending_tasks[user_id] = bot.loop.create_task(
+                    send_good_boy_after_delay(user_id, message.channel))
 
     await bot.process_commands(message)
 
@@ -1518,18 +1504,9 @@ async def on_ready():
     try:
         await asyncio.sleep(5)
 
-        # --- Instant command cleanup -------------------------------------
-        # tree.sync() only upserts; it never removes commands that were
-        # deleted or renamed in code, so stale/old commands linger for up to
-        # an hour. We diff what's currently registered against what the bot
-        # actually defines and delete the extras immediately.
-        #
-        # A command is "global" when it has no guild_ids binding. The /ks
-        # group is global; the legacy premium commands are bound to the owner
-        # guild and must NOT be counted as global.
         def _is_global(cmd):
             gids = getattr(cmd, "guild_ids", None)
-            return not gids  # empty/None -> global
+            return not gids
 
         desired_global = {c.name for c in bot.tree.get_commands(guild=None) if _is_global(c)}
         current_global = await bot.http.get_global_commands(bot.user.id)
@@ -1537,29 +1514,22 @@ async def on_ready():
         for cmd_id in stale_global:
             await bot.http.delete_global_command(bot.user.id, cmd_id)
             print(f"Deleted stale global command {cmd_id}")
-
-        # Owner guild: only the legacy commands (guild=OWNER_GUILD_ID) plus a
-        # copy of global commands should live there. Remove anything else.
         owner_guild = discord.Object(id=OWNER_GUILD_ID)
-        desired_owner = {c.name for c in bot.tree.get_commands(guild=owner_guild)}
-        # Global commands get copied in below, so include them in the desired set.
-        desired_owner |= {c.name for c in bot.tree.get_commands(guild=None)}
+        legacy_names = {
+            c.name for c in bot.tree.get_commands(guild=owner_guild)
+            if getattr(c, "guild_ids", None) and OWNER_GUILD_ID in c.guild_ids
+        }
         current_owner = await bot.http.get_guild_commands(bot.user.id, OWNER_GUILD_ID)
-        stale_owner = [c["id"] for c in current_owner if c["name"] not in desired_owner]
+        stale_owner = [c["id"] for c in current_owner if c["name"] not in legacy_names]
         for cmd_id in stale_owner:
             await bot.http.delete_guild_command(bot.user.id, OWNER_GUILD_ID, cmd_id)
-            print(f"Deleted stale owner-guild command {cmd_id}")
+            print(f"Deleted stale/duplicate owner-guild command {cmd_id}")
 
-        # Sync GLOBAL commands first (the /ks service must appear in every
-        # server that invites the bot). Then copy the global commands into the
-        # owner guild too so /ks works there alongside the legacy guild-only
-        # commands.
         global_synced = await bot.tree.sync()
         print(f"Synced {len(global_synced)} global commands (removed {len(stale_global)} stale)")
 
-        bot.tree.copy_global_to(guild=owner_guild)
         synced = await bot.tree.sync(guild=owner_guild)
-        print(f"Synced {len(synced)} commands to owner guild (removed {len(stale_owner)} stale)")
+        print(f"Synced {len(synced)} legacy commands to owner guild (removed {len(stale_owner)} stale/duplicate)")
 
     except discord.HTTPException as e:
         if e.status == 429:
