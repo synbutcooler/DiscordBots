@@ -208,7 +208,7 @@ def delete_script_profile(profile_id):
         return False
     try:
         script_profiles_collection.delete_one({"_id": profile_id})
-        if guild_keys_collection:
+        if guild_keys_collection is not None:
             guild_keys_collection.delete_many({"profile_id": profile_id})
         return True
     except Exception as e:
