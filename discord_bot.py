@@ -1425,31 +1425,64 @@ async def on_message(message):
     # MrBeast/Elon crypto scams). Runs in:
     #   - the owner's always-on MONITORED_CHANNELS, and
     #   - any channel where an admin enabled protection via /antispam.
+    # If a message has attachments/links BUT also real text (not just emojis),
+    # it's almost certainly legit — leave it alone. Scam posts are typically
+    # attachments with no caption or just emoji gibberish.
     owner_protected = is_owner_guild(message.guild.id) and message.channel.id in MONITORED_CHANNELS
     if owner_protected or antispam_active(message.guild.id, message.channel.id):
         link_count = len(URL_PATTERN.findall(message.content or ""))
         attachment_count = len(message.attachments)
 
-        if link_count >= 4 or attachment_count >= 4:
-            perms = message.channel.permissions_for(message.guild.me)
-            if not perms.manage_messages:
-                logger.warning(
-                    f"Missing Manage Messages permission in channel {message.channel.id}, "
-                    f"could not delete message {message.id} from {message.author} "
-                    f"(links={link_count}, attachments={attachment_count})"
+        is_flood = link_count >= 4 or attachment_count >= 4
+        if is_flood:
+            # Strip emojis + common decorative chars to see if there's actual
+            # meaningful text. Discord custom emoji look like <:name:id>.
+            text = message.content or ""
+            text_without_custom = re.sub(r'<a?:\w+:\d+>', '', text)
+            # Remove standard unicode emoji and pictographic/symbol ranges.
+            emoji_pattern = re.compile(
+                "["
+                "\U0001F1E0-\U0001F1FF"  # flags
+                "\U0001F300-\U0001F5FF"  # symbols & pictographs
+                "\U0001F600-\U0001F64F"  # emoticons
+                "\U0001F680-\U0001F6FF"  # transport & map
+                "\U0001F700-\U0001F77F"
+                "\U0001F900-\U0001F9FF"
+                "\U00002600-\U000027BF"  # misc symbols/dingbats
+                "\U0001FA70-\U0001FAFF"
+                "\ufe0f"
+                "]+", flags=re.UNICODE)
+            stripped = emoji_pattern.sub('', text_without_custom)
+            # Also drop URLs, whitespace, and punctuation; what's left is words.
+            stripped = URL_PATTERN.sub('', stripped)
+            stripped = re.sub(r'[\s\W_]+', '', stripped, flags=re.UNICODE)
+            has_real_text = len(stripped) >= 3  # at least 3 word-chars
+
+            if has_real_text:
+                logger.info(
+                    f"Keeping message {message.id} (has real caption text; "
+                    f"links={link_count}, attachments={attachment_count})"
                 )
             else:
-                try:
-                    await message.delete()
-                    logger.info(
-                        f"Deleted scam-spam message {message.id} from {message.author} in "
-                        f"channel {message.channel.id} (links={link_count}, attachments={attachment_count})"
+                perms = message.channel.permissions_for(message.guild.me)
+                if not perms.manage_messages:
+                    logger.warning(
+                        f"Missing Manage Messages permission in channel {message.channel.id}, "
+                        f"could not delete message {message.id} from {message.author} "
+                        f"(links={link_count}, attachments={attachment_count})"
                     )
-                except discord.Forbidden:
-                    logger.warning(f"Forbidden: could not delete message {message.id}")
-                except discord.NotFound:
-                    pass
-            return
+                else:
+                    try:
+                        await message.delete()
+                        logger.info(
+                            f"Deleted scam-spam message {message.id} from {message.author} in "
+                            f"channel {message.channel.id} (links={link_count}, attachments={attachment_count})"
+                        )
+                    except discord.Forbidden:
+                        logger.warning(f"Forbidden: could not delete message {message.id}")
+                    except discord.NotFound:
+                        pass
+                return
 
     content = message.content or ""
 
