@@ -31,12 +31,14 @@ from server_settings import (
     get_settings, update_settings, antispam_active,
 )
 from guild_renewal_system import (
+    GRACE_PERIOD_SECONDS,
     configure_renewal,
     create_or_get_renewal_session,
     format_renewal_timestamp,
     get_renewal_entitlement,
     get_renewal_status,
     process_due_email_reminders,
+    renewal_schedule_description,
 )
 
 logger = logging.getLogger(__name__)
@@ -1195,16 +1197,17 @@ def build_renewal_embed(guild):
     if not configured:
         embed.description = (
             "Sponsored renewal is **not configured**, so this server keeps legacy access.\n\n"
-            "Configure a notification email, IANA timezone, and local renewal time to "
-            "start a three-local-calendar-day sponsored cycle. Each renewal requires "
-            "four sequential LootLabs checkpoints, followed by a 30-minute grace period."
+            "Configure a notification email, timezone, and local renewal time to start a "
+            f"{renewal_schedule_description()}. Each renewal requires four sequential "
+            "LootLabs checkpoints. Use the dropdown below for a common timezone, or "
+            "**Configure** to enter any IANA timezone manually."
         )
         embed.add_field(name="Current state", value="🟠 Legacy access", inline=True)
         return embed
 
     state_labels = {
         "active": "✅ Active",
-        "grace": "⚠️ 30-minute grace",
+        "grace": f"⚠️ {GRACE_PERIOD_SECONDS // 60}-minute grace",
         "blocked": "⛔ Blocked",
         "unavailable": "❌ Temporarily unavailable",
     }
@@ -1236,27 +1239,27 @@ def build_renewal_embed(guild):
             value="Open now — complete all four checkpoints in order.",
             inline=False,
         )
-    embed.set_footer(text="Changing settings never resets the current due date or deletes customer keys.")
+    embed.set_footer(
+        text="Production setting edits preserve the due date; test-mode transitions reset it. Keys are never deleted."
+    )
     return embed
 
 
 class RenewalConfigModal(discord.ui.Modal):
-    def __init__(self, entitlement=None):
-        super().__init__(title="Sponsored Renewal Settings", timeout=300)
+    def __init__(self, entitlement=None, selected_timezone=None):
+        title = "Sponsored Renewal Settings"
+        if selected_timezone:
+            title = f"Renewal · {selected_timezone}"[:45]
+        super().__init__(title=title, timeout=300)
         entitlement = entitlement or {}
+        self.selected_timezone = selected_timezone
+        self.timezone_input = None
         self.email_input = discord.ui.TextInput(
             label="Reminder email",
             placeholder="owner@example.com",
             required=True,
             max_length=254,
             default=str(entitlement.get("email", ""))[:254],
-        )
-        self.timezone_input = discord.ui.TextInput(
-            label="IANA timezone",
-            placeholder="Europe/Sarajevo",
-            required=True,
-            max_length=64,
-            default=str(entitlement.get("timezone", "Europe/Sarajevo"))[:64],
         )
         self.time_input = discord.ui.TextInput(
             label="Local renewal time (24-hour HH:MM)",
@@ -1267,7 +1270,15 @@ class RenewalConfigModal(discord.ui.Modal):
             default=str(entitlement.get("local_time", "18:00"))[:5],
         )
         self.add_item(self.email_input)
-        self.add_item(self.timezone_input)
+        if not selected_timezone:
+            self.timezone_input = discord.ui.TextInput(
+                label="IANA timezone",
+                placeholder="UTC or America/New_York",
+                required=True,
+                max_length=64,
+                default=str(entitlement.get("timezone", "UTC"))[:64],
+            )
+            self.add_item(self.timezone_input)
         self.add_item(self.time_input)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -1281,7 +1292,11 @@ class RenewalConfigModal(discord.ui.Modal):
                 interaction.guild.name,
                 interaction.user.id,
                 self.email_input.value,
-                self.timezone_input.value,
+                (
+                    self.selected_timezone
+                    if self.selected_timezone
+                    else self.timezone_input.value
+                ),
                 self.time_input.value,
             )
         except ValueError as exc:
@@ -1302,7 +1317,47 @@ class RenewalConfigModal(discord.ui.Modal):
         )
 
 
+class RenewalTimezoneSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="UTC", value="UTC", description="Universal coordinated time"),
+            discord.SelectOption(label="US Eastern", value="America/New_York", description="New York, Toronto region"),
+            discord.SelectOption(label="US Central", value="America/Chicago", description="Chicago region"),
+            discord.SelectOption(label="US Mountain", value="America/Denver", description="Denver region"),
+            discord.SelectOption(label="US Pacific", value="America/Los_Angeles", description="Los Angeles region"),
+            discord.SelectOption(label="United Kingdom", value="Europe/London", description="London time"),
+            discord.SelectOption(label="Central Europe", value="Europe/Berlin", description="Berlin and nearby regions"),
+            discord.SelectOption(label="Balkans", value="Europe/Sarajevo", description="Sarajevo and nearby regions"),
+            discord.SelectOption(label="Dubai", value="Asia/Dubai", description="Gulf Standard Time"),
+            discord.SelectOption(label="India", value="Asia/Kolkata", description="India Standard Time"),
+            discord.SelectOption(label="Singapore", value="Asia/Singapore", description="Singapore time"),
+            discord.SelectOption(label="Japan", value="Asia/Tokyo", description="Japan Standard Time"),
+            discord.SelectOption(label="Australia Eastern", value="Australia/Sydney", description="Sydney region"),
+        ]
+        super().__init__(
+            placeholder="Quick configure: choose a timezone…",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if await _deny_if_not_admin(interaction):
+            return
+        entitlement = await asyncio.to_thread(
+            get_renewal_entitlement, interaction.guild.id
+        )
+        await interaction.response.send_modal(
+            RenewalConfigModal(entitlement, selected_timezone=self.values[0])
+        )
+
+
 class RenewalSettingsView(KsPanelView):
+    def __init__(self):
+        super().__init__()
+        self.add_item(RenewalTimezoneSelect())
+
     @discord.ui.button(label="Configure", style=discord.ButtonStyle.primary, emoji="⚙️", row=0)
     async def configure(self, interaction: discord.Interaction, button: discord.ui.Button):
         if await _deny_if_not_admin(interaction):
