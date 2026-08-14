@@ -5,6 +5,7 @@ import secrets
 import string
 import logging
 from pymongo import MongoClient, ASCENDING
+from guild_renewal_system import get_renewal_status
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +261,10 @@ def get_profile_by_name(guild_id, name):
 def create_session(guild_id, discord_id, discord_name, profile_id):
     if guild_sessions_collection is None:
         return None
+    renewal = get_renewal_status(guild_id)
+    if not renewal.get("allows_access", False):
+        logger.info("Blocked verification session creation for unrenewed guild %s", guild_id)
+        return None
     try:
         guild_sessions_collection.delete_many({
             "guild_id": str(guild_id),
@@ -414,6 +419,10 @@ def get_active_guild_key(guild_id, discord_id, profile_id):
 def create_guild_key(guild_id, discord_id, discord_name, duration_hours, profile_id):
     if guild_keys_collection is None:
         return None
+    renewal = get_renewal_status(guild_id)
+    if not renewal.get("allows_access", False):
+        logger.info("Blocked key creation for unrenewed guild %s", guild_id)
+        return None
     try:
         existing = get_active_guild_key(guild_id, discord_id, profile_id)
         if existing:
@@ -493,6 +502,10 @@ def validate_guild_key(key, hwid, api_secret):
 
         profile_id = profile["profile_id"]
         guild_id = profile["guild_id"]
+
+        renewal = get_renewal_status(guild_id)
+        if not renewal.get("allows_access", False):
+            return False, "Server sponsored access expired. Ask an admin to renew it in Discord."
 
         key_doc = guild_keys_collection.find_one({"_id": key})
         if not key_doc:
