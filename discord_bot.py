@@ -1,6 +1,6 @@
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import asyncio
 import random
 import re
@@ -29,6 +29,14 @@ from guild_key_system import (
 )
 from server_settings import (
     get_settings, update_settings, antispam_active,
+)
+from guild_renewal_system import (
+    configure_renewal,
+    create_or_get_renewal_session,
+    format_renewal_timestamp,
+    get_renewal_entitlement,
+    get_renewal_status,
+    process_due_email_reminders,
 )
 
 logger = logging.getLogger(__name__)
@@ -260,6 +268,16 @@ def normalize_tutorial_url(raw: str):
     return url
 
 
+def _renewal_block_message(status):
+    if status.get("state") == "unavailable":
+        return "❌ Sponsored access could not be checked. Please try again shortly."
+    return (
+        "⛔ This server's sponsored access expired. No keys were deleted, but keys "
+        "cannot be created, claimed, or used until an admin opens `/ks setup`, "
+        "chooses **Sponsored Renewal**, and completes all four checkpoints."
+    )
+
+
 class KeyClaimView(discord.ui.View):
     def __init__(self, session_token, gateway_url, guild_id, profile_id, tutorial=None):
         super().__init__(timeout=1800)
@@ -299,6 +317,13 @@ class KeyClaimView(discord.ui.View):
 
         if str(interaction.user.id) != session.get('discord_id'):
             await interaction.response.send_message("❌ This isn't your session.", ephemeral=True)
+            return
+
+        renewal = await asyncio.to_thread(get_renewal_status, self.guild_id)
+        if not renewal.get("allows_access", False):
+            await interaction.response.send_message(
+                _renewal_block_message(renewal), ephemeral=True
+            )
             return
 
         if not session.get('completed'):
@@ -363,6 +388,13 @@ class ProfileSelectForKey(discord.ui.Select):
         super().__init__(placeholder="Select a script...", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
+        renewal = await asyncio.to_thread(get_renewal_status, self.guild_id)
+        if not renewal.get("allows_access", False):
+            await interaction.response.send_message(
+                _renewal_block_message(renewal), ephemeral=True
+            )
+            return
+
         profile_id = self.values[0]
         profile = self.profiles_map.get(profile_id)
 
@@ -896,6 +928,16 @@ class ManagementView(KsPanelView):
         )
         self.stop()
 
+    @discord.ui.button(label="Sponsored Renewal", style=discord.ButtonStyle.primary, emoji="💎", row=2)
+    async def sponsored_renewal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await _deny_if_not_admin(interaction):
+            return
+        embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
+        await interaction.response.edit_message(
+            content=None, embed=embed, view=RenewalSettingsView()
+        )
+        self.stop()
+
 
 class BackToDashboardButton(discord.ui.Button):
     def __init__(self):
@@ -1135,6 +1177,197 @@ class MembershipSelect(discord.ui.Select):
             self.view.stop()
 
 
+def build_renewal_embed(guild):
+    status = get_renewal_status(guild.id)
+    configured = status.get("configured", False)
+    state = status.get("state", "legacy")
+    colors = {
+        "legacy": discord.Color.orange(),
+        "active": discord.Color.green(),
+        "grace": discord.Color.gold(),
+        "blocked": discord.Color.red(),
+        "unavailable": discord.Color.red(),
+    }
+    embed = discord.Embed(
+        title="💎 Sponsored Renewal",
+        color=colors.get(state, discord.Color.blurple()),
+    )
+    if not configured:
+        embed.description = (
+            "Sponsored renewal is **not configured**, so this server keeps legacy access.\n\n"
+            "Configure a notification email, IANA timezone, and local renewal time to "
+            "start a three-local-calendar-day sponsored cycle. Each renewal requires "
+            "four sequential LootLabs checkpoints, followed by a 30-minute grace period."
+        )
+        embed.add_field(name="Current state", value="🟠 Legacy access", inline=True)
+        return embed
+
+    state_labels = {
+        "active": "✅ Active",
+        "grace": "⚠️ 30-minute grace",
+        "blocked": "⛔ Blocked",
+        "unavailable": "❌ Temporarily unavailable",
+    }
+    embed.description = status.get("message", "")
+    embed.add_field(name="Current state", value=state_labels.get(state, state), inline=True)
+    embed.add_field(name="Cycle", value=str(status.get("cycle", 1)), inline=True)
+    embed.add_field(name="Email", value=status.get("email") or "Not set", inline=False)
+    timezone_name = status.get("timezone", "UTC")
+    due_at = status.get("due_at")
+    grace_at = status.get("grace_ends_at")
+    due_value = format_renewal_timestamp(due_at, timezone_name)
+    if due_at:
+        due_value += f"\n<t:{int(due_at)}:R>"
+    grace_value = format_renewal_timestamp(grace_at, timezone_name)
+    if grace_at:
+        grace_value += f"\n<t:{int(grace_at)}:R>"
+    embed.add_field(name="Due", value=due_value, inline=True)
+    embed.add_field(name="Grace ends", value=grace_value, inline=True)
+    if not status.get("renewal_available") and status.get("renewal_opens_at"):
+        opens = int(status["renewal_opens_at"])
+        embed.add_field(
+            name="Renewal window",
+            value=f"Opens <t:{opens}:F> (<t:{opens}:R>)",
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="Renewal window",
+            value="Open now — complete all four checkpoints in order.",
+            inline=False,
+        )
+    embed.set_footer(text="Changing settings never resets the current due date or deletes customer keys.")
+    return embed
+
+
+class RenewalConfigModal(discord.ui.Modal):
+    def __init__(self, entitlement=None):
+        super().__init__(title="Sponsored Renewal Settings", timeout=300)
+        entitlement = entitlement or {}
+        self.email_input = discord.ui.TextInput(
+            label="Reminder email",
+            placeholder="owner@example.com",
+            required=True,
+            max_length=254,
+            default=str(entitlement.get("email", ""))[:254],
+        )
+        self.timezone_input = discord.ui.TextInput(
+            label="IANA timezone",
+            placeholder="Europe/Sarajevo",
+            required=True,
+            max_length=64,
+            default=str(entitlement.get("timezone", "Europe/Sarajevo"))[:64],
+        )
+        self.time_input = discord.ui.TextInput(
+            label="Local renewal time (24-hour HH:MM)",
+            placeholder="18:30",
+            required=True,
+            min_length=5,
+            max_length=5,
+            default=str(entitlement.get("local_time", "18:00"))[:5],
+        )
+        self.add_item(self.email_input)
+        self.add_item(self.timezone_input)
+        self.add_item(self.time_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if await _deny_if_not_admin(interaction):
+            return
+        await interaction.response.defer()
+        try:
+            await asyncio.to_thread(
+                configure_renewal,
+                interaction.guild.id,
+                interaction.guild.name,
+                interaction.user.id,
+                self.email_input.value,
+                self.timezone_input.value,
+                self.time_input.value,
+            )
+        except ValueError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+        except Exception:
+            logger.exception("Failed to configure sponsored renewal")
+            await interaction.followup.send(
+                "❌ Renewal settings could not be saved. Check the database and try again.",
+                ephemeral=True,
+            )
+            return
+        embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
+        await interaction.edit_original_response(
+            content="✅ Sponsored renewal settings saved.",
+            embed=embed,
+            view=RenewalSettingsView(),
+        )
+
+
+class RenewalSettingsView(KsPanelView):
+    @discord.ui.button(label="Configure", style=discord.ButtonStyle.primary, emoji="⚙️", row=0)
+    async def configure(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await _deny_if_not_admin(interaction):
+            return
+        entitlement = await asyncio.to_thread(
+            get_renewal_entitlement, interaction.guild.id
+        )
+        await interaction.response.send_modal(RenewalConfigModal(entitlement))
+
+    @discord.ui.button(label="Start / Continue Renewal", style=discord.ButtonStyle.success, emoji="🔗", row=0)
+    async def renew(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await _deny_if_not_admin(interaction):
+            return
+        await interaction.response.defer()
+        try:
+            session_token = await asyncio.to_thread(
+                create_or_get_renewal_session,
+                interaction.guild.id,
+                interaction.user.id,
+            )
+        except ValueError as exc:
+            await interaction.followup.send(f"⏳ {exc}", ephemeral=True)
+            return
+        except Exception:
+            logger.exception("Failed to create renewal session")
+            await interaction.followup.send(
+                "❌ Could not create a renewal session. Try again shortly.", ephemeral=True
+            )
+            return
+
+        renewal_url = f"{SERVER_BASE_URL.rstrip('/')}/ks/renew/{session_token}"
+        embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
+        embed.description = (
+            "Your private renewal session is ready. Open it and complete all four "
+            "LootLabs checkpoints in order. The session expires in six hours."
+        )
+        await interaction.edit_original_response(
+            content=None,
+            embed=embed,
+            view=RenewalLinkView(renewal_url),
+        )
+        self.stop()
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = await asyncio.to_thread(build_dashboard_embed, interaction.guild)
+        await interaction.response.edit_message(
+            content=None, embed=embed, view=ManagementView()
+        )
+        self.stop()
+
+
+class RenewalLinkView(KsPanelView):
+    def __init__(self, renewal_url):
+        super().__init__()
+        self.add_item(discord.ui.Button(
+            label="Open four-step renewal",
+            style=discord.ButtonStyle.link,
+            emoji="🔗",
+            url=renewal_url,
+            row=0,
+        ))
+        self.add_item(BackToDashboardButton())
+
+
 def build_dashboard_embed(guild):
     """The management panel embed shown by /ks setup when already configured."""
     config = get_guild_config(guild.id)
@@ -1149,6 +1382,19 @@ def build_dashboard_embed(guild):
     status = "✅ Enabled" if (config and config.get('enabled')) else "❌ Disabled"
     embed.add_field(name="Status", value=status, inline=True)
     embed.add_field(name="Scripts", value=str(len(profiles)), inline=True)
+    renewal = get_renewal_status(guild.id)
+    renewal_labels = {
+        "legacy": "🟠 Legacy access",
+        "active": "✅ Sponsored active",
+        "grace": "⚠️ Renewal grace",
+        "blocked": "⛔ Renewal required",
+        "unavailable": "❌ Renewal unavailable",
+    }
+    embed.add_field(
+        name="Sponsored access",
+        value=renewal_labels.get(renewal.get("state"), "Unknown"),
+        inline=True,
+    )
 
     if profiles:
         lines = []
@@ -1274,6 +1520,13 @@ async def ks_getkey(interaction: discord.Interaction):
     config = await asyncio.to_thread(get_guild_config, interaction.guild.id)
     if not config or not config.get('enabled'):
         await interaction.followup.send("❌ Key system is not set up for this server.", ephemeral=True)
+        return
+
+    renewal = await asyncio.to_thread(get_renewal_status, interaction.guild.id)
+    if not renewal.get("allows_access", False):
+        await interaction.followup.send(
+            _renewal_block_message(renewal), ephemeral=True
+        )
         return
 
     profiles = await asyncio.to_thread(get_script_profiles, interaction.guild.id)
@@ -1838,9 +2091,31 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
+@tasks.loop(minutes=5)
+async def renewal_email_reminder_loop():
+    try:
+        result = await asyncio.to_thread(process_due_email_reminders)
+        if result.get("sent") or result.get("failed"):
+            logger.info(
+                "Renewal email run: sent=%s failed=%s",
+                result.get("sent", 0),
+                result.get("failed", 0),
+            )
+    except Exception:
+        # Missing/broken SMTP must never stop key service or kill the loop.
+        logger.exception("Renewal email reminder run failed")
+
+
+@renewal_email_reminder_loop.before_loop
+async def before_renewal_email_reminder_loop():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     print(f'Main bot logged in as {bot.user}')
+    if not renewal_email_reminder_loop.is_running():
+        renewal_email_reminder_loop.start()
 
     expired = cleanup_expired()
     if expired > 0:
