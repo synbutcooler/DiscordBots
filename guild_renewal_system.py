@@ -138,8 +138,8 @@ def validate_renewal_settings(email, timezone_name, local_time):
     timezone_name = (timezone_name or "").strip()
     local_time = (local_time or "").strip()
 
-    if len(email) > 254 or not _EMAIL_RE.fullmatch(email):
-        raise ValueError("Enter a valid notification email address.")
+    if email and (len(email) > 254 or not _EMAIL_RE.fullmatch(email)):
+        raise ValueError("Enter a valid notification email address, or leave it blank.")
     if not _TIME_RE.fullmatch(local_time):
         raise ValueError("Renewal time must use 24-hour HH:MM format, for example 18:30.")
     try:
@@ -377,6 +377,8 @@ def request_email_verification(
     email, timezone_name, local_time = validate_renewal_settings(
         email, timezone_name, local_time
     )
+    if not email:
+        raise ValueError("Enter an email to verify, or leave it blank to use Discord DMs only.")
     now = time.time() if now is None else float(now)
     guild_id = str(guild_id)
     existing = renewal_email_verifications_collection.find_one({"_id": guild_id})
@@ -1103,29 +1105,53 @@ def _reminder_event(entitlement, now):
     return None
 
 
+def _reminder_copy(entitlement, event):
+    timezone_name = entitlement.get("timezone", "UTC")
+    due_text = format_renewal_timestamp(entitlement["due_at"], timezone_name)
+    grace_text = format_renewal_timestamp(
+        entitlement.get("grace_ends_at"), timezone_name
+    )
+    labels = {
+        "one_day": "Renewal is due within 24 hours",
+        "one_hour": "Renewal is due within one hour",
+        "grace": (
+            f"Renewal is now in the {GRACE_PERIOD_SECONDS // 60}-minute grace period"
+        ),
+        "blocked": "Service access is blocked until renewal",
+    }
+    guild_name = entitlement.get("guild_name", "your Discord server")
+    subject = f"[{guild_name}] {labels[event]}"
+    body = (
+        f"{labels[event]} for {guild_name}.\n\n"
+        f"Due: {due_text}\n"
+        f"Grace ends: {grace_text}\n\n"
+        "Open that Discord server, run /ks setup, choose Service Renewal, "
+        "and complete all four LootLabs checkpoints. Existing customer keys "
+        "remain stored while access is blocked.\n"
+    )
+    return labels[event], subject, body, due_text, grace_text
+
+
+def mark_discord_reminder_sent(notification_id):
+    if renewal_notifications_collection is None:
+        return
+    renewal_notifications_collection.update_one(
+        {"_id": notification_id},
+        {"$set": {"discord_sent_at": time.time()}},
+    )
+
+
 def process_due_email_reminders(now=None):
-    """Send one idempotent reminder for the guild's current reminder window."""
-    global _email_missing_logged
+    """Queue Discord DMs and optionally send email for the current reminder window."""
     if renewal_entitlements_collection is None or renewal_notifications_collection is None:
-        return {"configured": False, "sent": 0, "failed": 0}
-    if not _email_settings():
-        if not _email_missing_logged:
-            logger.warning(
-                "Email is not configured; set BREVO_API_KEY/BREVO_FROM_EMAIL "
-                "or SMTP_HOST/SMTP_FROM"
-            )
-            _email_missing_logged = True
-        return {"configured": False, "sent": 0, "failed": 0}
+        return {"configured": False, "sent": 0, "failed": 0, "discord": []}
 
     now = time.time() if now is None else float(now)
     sent = 0
     failed = 0
-    cursor = renewal_entitlements_collection.find(
-        {"enabled": True, "email": {"$type": "string", "$ne": ""}}
-    )
+    discord = []
+    cursor = renewal_entitlements_collection.find({"enabled": True})
     for entitlement in cursor:
-        if entitlement.get("email_verified") is False:
-            continue
         event = _reminder_event(entitlement, now)
         if not event:
             continue
@@ -1146,50 +1172,47 @@ def process_due_email_reminders(now=None):
                 }
             )
         except DuplicateKeyError:
-            continue
+            pass
+        existing = renewal_notifications_collection.find_one({"_id": notification_id}) or {}
 
-        timezone_name = entitlement.get("timezone", "UTC")
-        due_text = format_renewal_timestamp(entitlement["due_at"], timezone_name)
-        grace_text = format_renewal_timestamp(
-            entitlement.get("grace_ends_at"), timezone_name
-        )
-        labels = {
-            "one_day": "Renewal is due within 24 hours",
-            "one_hour": "Renewal is due within one hour",
-            "grace": (
-                f"Renewal is now in the {GRACE_PERIOD_SECONDS // 60}-minute grace period"
-            ),
-            "blocked": "Service access is blocked until renewal",
-        }
-        subject = f"[{entitlement.get('guild_name', 'Discord server')}] {labels[event]}"
-        body = (
-            f"{labels[event]} for {entitlement.get('guild_name', 'your Discord server')}.\n\n"
-            f"Due: {due_text}\n"
-            f"Grace ends: {grace_text}\n\n"
-            "Open your Discord server, run /ks setup, choose Service Renewal, "
-            "and complete all four LootLabs checkpoints. Existing customer keys "
-            "remain stored while access is blocked.\n"
-        )
-        html_body = _html_email(
-            labels[event],
-            [
-                f"This is a reminder for {entitlement.get('guild_name', 'your Discord server')}.",
-                f"Due: {due_text}",
-                f"Grace ends: {grace_text}",
-                "Open Discord, run /ks setup, choose Service Renewal, and complete all four LootLabs checkpoints. Existing customer keys stay stored while access is blocked.",
-            ],
-        )
-        try:
-            _send_email(entitlement["email"], subject, body, html_body=html_body)
-            renewal_notifications_collection.update_one(
-                {"_id": notification_id}, {"$set": {"sent_at": time.time()}}
+        label, subject, body, due_text, grace_text = _reminder_copy(entitlement, event)
+        email = (entitlement.get("email") or "").strip()
+        email_ok = bool(email) and entitlement.get("email_verified") is not False
+        if email_ok and not existing.get("sent_at") and _email_settings():
+            html_body = _html_email(
+                label,
+                [
+                    f"This is a reminder for {entitlement.get('guild_name', 'your Discord server')}.",
+                    f"Due: {due_text}",
+                    f"Grace ends: {grace_text}",
+                    "Open Discord, run /ks setup, choose Service Renewal, and complete all four LootLabs checkpoints.",
+                ],
             )
-            sent += 1
-        except Exception as exc:
-            failed += 1
-            logger.error(
-                "Renewal email failed for guild %s (%s): %s", guild_id, event, exc
+            try:
+                _send_email(email, subject, body, html_body=html_body)
+                renewal_notifications_collection.update_one(
+                    {"_id": notification_id}, {"$set": {"sent_at": time.time()}}
+                )
+                sent += 1
+            except Exception as exc:
+                failed += 1
+                logger.error(
+                    "Renewal email failed for guild %s (%s): %s", guild_id, event, exc
+                )
+
+        discord_id = str(entitlement.get("owner_discord_id") or "").strip()
+        if discord_id and not existing.get("discord_sent_at"):
+            discord.append(
+                {
+                    "notification_id": notification_id,
+                    "discord_id": discord_id,
+                    "guild_id": guild_id,
+                    "guild_name": entitlement.get("guild_name", "Discord server"),
+                    "event": event,
+                    "subject": subject,
+                    "body": body,
+                    "due_text": due_text,
+                    "grace_text": grace_text,
+                }
             )
-            # Permit the next worker run to retry this event.
-            renewal_notifications_collection.delete_one({"_id": notification_id})
-    return {"configured": True, "sent": sent, "failed": failed}
+    return {"configured": True, "sent": sent, "failed": failed, "discord": discord}
