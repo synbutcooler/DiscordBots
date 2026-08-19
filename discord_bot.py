@@ -33,19 +33,13 @@ from server_settings import (
 from guild_renewal_system import (
     GRACE_PERIOD_SECONDS,
     configure_renewal,
-    confirm_email_verification,
     create_or_get_renewal_session,
-    email_already_verified,
     format_renewal_timestamp,
-    get_pending_email_verification,
     get_renewal_entitlement,
     get_renewal_status,
     mark_discord_reminder_sent,
     process_due_email_reminders,
     renewal_schedule_description,
-    request_email_verification,
-    sender_is_freemail,
-    spoiler_email,
     validate_renewal_settings,
 )
 
@@ -1207,7 +1201,7 @@ def build_renewal_embed(guild):
             "Service renewal is **not configured**, so this server keeps legacy access.\n\n"
             "Set a timezone and local renewal time to start a "
             f"{renewal_schedule_description()}. Reminders go to your **Discord DMs**. "
-            "Email is optional. Each renewal needs four LootLabs checkpoints."
+            "Each renewal needs four LootLabs checkpoints."
         )
         embed.add_field(name="Current state", value="🟠 Legacy access", inline=True)
         return embed
@@ -1221,10 +1215,12 @@ def build_renewal_embed(guild):
     embed.description = status.get("message", "")
     embed.add_field(name="Current state", value=state_labels.get(state, state), inline=True)
     embed.add_field(name="Cycle", value=str(status.get("cycle", 1)), inline=True)
-    email_value = spoiler_email(status.get("email"))
-    if status.get("email") and not status.get("email_verified", True):
-        email_value += "\n⚠️ Not verified yet"
-    embed.add_field(name="Email", value=email_value, inline=False)
+    owner_id = status.get("owner_discord_id")
+    embed.add_field(
+        name="Reminders",
+        value=f"Discord DM → <@{owner_id}>" if owner_id else "Discord DM to the admin who saves settings",
+        inline=False,
+    )
     timezone_name = status.get("timezone", "UTC")
     due_at = status.get("due_at")
     grace_at = status.get("grace_ends_at")
@@ -1255,16 +1251,6 @@ def build_renewal_embed(guild):
     return embed
 
 
-def _freemail_sender_warning():
-    if not sender_is_freemail():
-        return ""
-    return (
-        "\n\n⚠️ Your Brevo/SMTP sender is a **free mailbox** (Gmail/Yahoo/Outlook). "
-        "Those almost always get dropped or sent to spam. Authenticate a real domain "
-        "in Brevo and set `BREVO_FROM_EMAIL` to that domain."
-    )
-
-
 class RenewalConfigModal(discord.ui.Modal):
     def __init__(self, entitlement=None, selected_timezone=None):
         title = "Service Renewal Settings"
@@ -1274,13 +1260,6 @@ class RenewalConfigModal(discord.ui.Modal):
         entitlement = entitlement or {}
         self.selected_timezone = selected_timezone
         self.timezone_input = None
-        self.email_input = discord.ui.TextInput(
-            label="Reminder email (optional)",
-            placeholder="Leave blank — we'll DM you on Discord",
-            required=False,
-            max_length=254,
-            default=str(entitlement.get("email", ""))[:254],
-        )
         self.time_input = discord.ui.TextInput(
             label="Local renewal time (24-hour HH:MM)",
             placeholder="18:30",
@@ -1289,7 +1268,6 @@ class RenewalConfigModal(discord.ui.Modal):
             max_length=5,
             default=str(entitlement.get("local_time", "18:00"))[:5],
         )
-        self.add_item(self.email_input)
         if not selected_timezone:
             self.timezone_input = discord.ui.TextInput(
                 label="IANA timezone",
@@ -1311,52 +1289,15 @@ class RenewalConfigModal(discord.ui.Modal):
             else self.timezone_input.value
         )
         try:
-            email, timezone_name, local_time = validate_renewal_settings(
-                self.email_input.value, timezone_name, self.time_input.value
+            _email, timezone_name, local_time = validate_renewal_settings(
+                "", timezone_name, self.time_input.value
             )
-        except ValueError as exc:
-            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
-            return
-
-        already_verified = await asyncio.to_thread(
-            email_already_verified, interaction.guild.id, email
-        )
-        if (not email) or already_verified:
-            try:
-                await asyncio.to_thread(
-                    configure_renewal,
-                    interaction.guild.id,
-                    interaction.guild.name,
-                    interaction.user.id,
-                    email,
-                    timezone_name,
-                    local_time,
-                )
-            except ValueError as exc:
-                await interaction.followup.send(f"❌ {exc}", ephemeral=True)
-                return
-            except Exception:
-                logger.exception("Failed to configure service renewal")
-                await interaction.followup.send(
-                    "❌ Renewal settings could not be saved. Check the database and try again.",
-                    ephemeral=True,
-                )
-                return
-            embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
-            await interaction.edit_original_response(
-                content="✅ Service renewal settings saved.",
-                embed=embed,
-                view=RenewalSettingsView(),
-            )
-            return
-
-        try:
-            pending = await asyncio.to_thread(
-                request_email_verification,
+            await asyncio.to_thread(
+                configure_renewal,
                 interaction.guild.id,
                 interaction.guild.name,
                 interaction.user.id,
-                email,
+                "",
                 timezone_name,
                 local_time,
             )
@@ -1364,126 +1305,18 @@ class RenewalConfigModal(discord.ui.Modal):
             await interaction.followup.send(f"❌ {exc}", ephemeral=True)
             return
         except Exception:
-            logger.exception("Failed to send renewal email verification")
+            logger.exception("Failed to configure service renewal")
             await interaction.followup.send(
-                "❌ Could not send the verification email. Check Brevo/SMTP settings and try again.",
-                ephemeral=True,
-            )
-            return
-
-        embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
-        await interaction.edit_original_response(
-            content=(
-                f"📧 We sent a 6-digit code to {spoiler_email(pending['email'])}. "
-                "Enter it to finish setup. Check spam and promotions if it is not in the inbox."
-                f"{_freemail_sender_warning()}"
-            ),
-            embed=embed,
-            view=EmailVerifyView(),
-        )
-
-
-class EmailCodeModal(discord.ui.Modal, title="Enter Email Code"):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.code_input = discord.ui.TextInput(
-            label="6-digit code",
-            placeholder="123456",
-            required=True,
-            min_length=6,
-            max_length=8,
-        )
-        self.add_item(self.code_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if await _deny_if_not_admin(interaction):
-            return
-        await interaction.response.defer()
-        try:
-            await asyncio.to_thread(
-                confirm_email_verification,
-                interaction.guild.id,
-                self.code_input.value,
-            )
-        except ValueError as exc:
-            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
-            return
-        except Exception:
-            logger.exception("Failed to confirm renewal email")
-            await interaction.followup.send(
-                "❌ Could not verify that code. Try again shortly.",
+                "❌ Renewal settings could not be saved. Check the database and try again.",
                 ephemeral=True,
             )
             return
         embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
         await interaction.edit_original_response(
-            content="✅ Email verified. Service renewal settings saved.",
+            content="✅ Service renewal saved. Reminders will come as Discord DMs — allow DMs from server members.",
             embed=embed,
             view=RenewalSettingsView(),
         )
-
-
-class EmailVerifyView(KsPanelView):
-    @discord.ui.button(label="Enter Code", style=discord.ButtonStyle.success, emoji="📬", row=0)
-    async def enter_code(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await _deny_if_not_admin(interaction):
-            return
-        await interaction.response.send_modal(EmailCodeModal())
-
-    @discord.ui.button(label="Resend Code", style=discord.ButtonStyle.primary, emoji="🔁", row=0)
-    async def resend_code(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await _deny_if_not_admin(interaction):
-            return
-        await interaction.response.defer()
-        pending = await asyncio.to_thread(
-            get_pending_email_verification, interaction.guild.id
-        )
-        if not pending:
-            await interaction.followup.send(
-                "❌ No verification is pending. Open **Configure** and enter the email again.",
-                ephemeral=True,
-            )
-            return
-        try:
-            sent = await asyncio.to_thread(
-                request_email_verification,
-                interaction.guild.id,
-                interaction.guild.name,
-                interaction.user.id,
-                pending["email"],
-                pending.get("timezone") or "UTC",
-                pending.get("local_time") or "18:00",
-                None,
-                True,
-            )
-        except ValueError as exc:
-            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
-            return
-        except Exception:
-            logger.exception("Failed to resend renewal email verification")
-            await interaction.followup.send(
-                "❌ Could not resend the code. Check Brevo/SMTP and try again.",
-                ephemeral=True,
-            )
-            return
-        embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
-        await interaction.edit_original_response(
-            content=(
-                f"📧 New code sent to {spoiler_email(sent['email'])}. "
-                "It expires in 15 minutes."
-                f"{_freemail_sender_warning()}"
-            ),
-            embed=embed,
-            view=EmailVerifyView(),
-        )
-
-    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️", row=1)
-    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
-        await interaction.response.edit_message(
-            content=None, embed=embed, view=RenewalSettingsView()
-        )
-        self.stop()
 
 
 class RenewalTimezoneSelect(discord.ui.Select):
@@ -1535,31 +1368,6 @@ class RenewalSettingsView(KsPanelView):
             get_renewal_entitlement, interaction.guild.id
         )
         await interaction.response.send_modal(RenewalConfigModal(entitlement))
-
-    @discord.ui.button(label="Verify Email", style=discord.ButtonStyle.secondary, emoji="📬", row=0)
-    async def verify_email(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await _deny_if_not_admin(interaction):
-            return
-        pending = await asyncio.to_thread(
-            get_pending_email_verification, interaction.guild.id
-        )
-        if not pending:
-            await interaction.response.send_message(
-                "❌ No email verification is pending. Use **Configure** to add or change the inbox.",
-                ephemeral=True,
-            )
-            return
-        embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
-        await interaction.response.edit_message(
-            content=(
-                f"📧 Enter the code sent to {spoiler_email(pending['email'])}, "
-                "or resend it."
-                f"{_freemail_sender_warning()}"
-            ),
-            embed=embed,
-            view=EmailVerifyView(),
-        )
-        self.stop()
 
     @discord.ui.button(label="Start / Continue Renewal", style=discord.ButtonStyle.success, emoji="🔗", row=0)
     async def renew(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2442,3 +2250,4 @@ def start_bot():
 
 if __name__ == "__main__":
     start_bot()
+_bot()
