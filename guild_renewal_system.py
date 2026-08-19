@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 MONGODB_URI = os.environ.get("MONGODB_URI")
 SERVER_BASE_URL = os.environ.get(
-    "SERVER_BASE_URL", "https://valorium.onrender.com"
+    "SERVER_BASE_URL", "https://vadrifts.onrender.com"
 ).rstrip("/")
 
 RENEWAL_PERIOD_DAYS = 3
@@ -73,13 +73,14 @@ if RENEWAL_TEST_CYCLE_MINUTES:
     )
 
 LOOTLABS_API_URL = "https://creators.lootlabs.gg/api/public/content_locker"
+BREVO_EMAIL_API_URL = "https://api.brevo.com/v3/smtp/email"
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 renewal_entitlements_collection = None
 renewal_sessions_collection = None
 renewal_notifications_collection = None
-_smtp_missing_logged = False
+_email_missing_logged = False
 
 if MONGODB_URI and MongoClient is not None:
     try:
@@ -665,6 +666,22 @@ def format_renewal_timestamp(timestamp, timezone_name):
     )
 
 
+def _brevo_settings():
+    """Return HTTPS email settings when the Render-safe Brevo path is enabled."""
+    api_key = (os.environ.get("BREVO_API_KEY") or "").strip()
+    from_address = (os.environ.get("BREVO_FROM_EMAIL") or "").strip()
+    if not api_key or not from_address:
+        return None
+    return {
+        "provider": "brevo",
+        "api_key": api_key,
+        "from_address": from_address,
+        "from_name": (
+            os.environ.get("BREVO_FROM_NAME") or "Vadrifts Key System"
+        ).strip(),
+    }
+
+
 def _smtp_settings():
     host = (os.environ.get("SMTP_HOST") or "").strip()
     from_address = (
@@ -673,6 +690,7 @@ def _smtp_settings():
     if not host or not from_address:
         return None
     return {
+        "provider": "smtp",
         "host": host,
         "port": int(os.environ.get("SMTP_PORT", "587")),
         "username": (os.environ.get("SMTP_USERNAME") or "").strip(),
@@ -684,10 +702,44 @@ def _smtp_settings():
     }
 
 
+def _email_settings():
+    # HTTPS is preferred when configured because free Render services block the
+    # standard SMTP ports. SMTP remains as a backwards-compatible fallback.
+    return _brevo_settings() or _smtp_settings()
+
+
 def _send_email(to_address, subject, body):
-    settings = _smtp_settings()
+    settings = _email_settings()
     if not settings:
-        raise RuntimeError("SMTP is not configured.")
+        raise RuntimeError("Email delivery is not configured.")
+
+    if settings["provider"] == "brevo":
+        try:
+            response = requests.post(
+                BREVO_EMAIL_API_URL,
+                headers={
+                    "accept": "application/json",
+                    "api-key": settings["api_key"],
+                    "content-type": "application/json",
+                },
+                json={
+                    "sender": {
+                        "name": settings["from_name"],
+                        "email": settings["from_address"],
+                    },
+                    "to": [{"email": to_address}],
+                    "subject": subject,
+                    "textContent": body,
+                },
+                timeout=15,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            suffix = f" (HTTP {status})" if status else ""
+            raise RuntimeError(f"Brevo email API request failed{suffix}") from exc
+        return
+
     message = EmailMessage()
     message["From"] = formataddr((settings["from_name"], settings["from_address"]))
     message["To"] = to_address
@@ -721,15 +773,16 @@ def _reminder_event(entitlement, now):
 
 def process_due_email_reminders(now=None):
     """Send one idempotent reminder for the guild's current reminder window."""
-    global _smtp_missing_logged
+    global _email_missing_logged
     if renewal_entitlements_collection is None or renewal_notifications_collection is None:
         return {"configured": False, "sent": 0, "failed": 0}
-    if not _smtp_settings():
-        if not _smtp_missing_logged:
+    if not _email_settings():
+        if not _email_missing_logged:
             logger.warning(
-                "SMTP_HOST/SMTP_FROM are not configured; renewal emails are being skipped"
+                "Email is not configured; set BREVO_API_KEY/BREVO_FROM_EMAIL "
+                "or SMTP_HOST/SMTP_FROM"
             )
-            _smtp_missing_logged = True
+            _email_missing_logged = True
         return {"configured": False, "sent": 0, "failed": 0}
 
     now = time.time() if now is None else float(now)
