@@ -649,8 +649,44 @@ def _lootlabs_error_text(data, status_code):
     return "Unexpected LootLabs response"
 
 
+def _lootlabs_parse(response):
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    loot_url = None
+    if isinstance(data, dict):
+        message = data.get("message")
+        if isinstance(message, dict):
+            loot_url = message.get("loot_url") or message.get("url")
+    ok = (
+        response.status_code < 400
+        and isinstance(data, dict)
+        and data.get("type") != "error"
+        and bool(loot_url)
+    )
+    return ok, loot_url, data, (response.text or "")[:800]
+
+
+def _raise_lootlabs_failure(status_code, data, fallback):
+    if status_code == 401:
+        raise RuntimeError(
+            "LootLabs rejected the API token. Check LOOTLABS_API_TOKEN on the website Render service."
+        )
+    if status_code == 429:
+        raise RuntimeError("LootLabs rate-limited the request. Wait a minute and try again.")
+    hint = _lootlabs_error_text(data, status_code) or fallback
+    lowered = hint.lower()
+    if "creator" in lowered or ("mandatory" in lowered and "detail" in lowered):
+        raise RuntimeError(
+            "LootLabs needs your creator profile filled in (name + avatar image) before it can create links."
+        )
+    raise RuntimeError(f"LootLabs could not create the checkpoint link. {hint}")
+
+
 def _create_lootlabs_link(api_token, payload):
-    """Create a locker link and return (loot_url, raw_data)."""
+    """Create a locker link via POST, then GET if POST cannot reach LootLabs."""
+    last_error = "No response from LootLabs."
     try:
         response = requests.post(
             LOOTLABS_API_URL,
@@ -660,51 +696,48 @@ def _create_lootlabs_link(api_token, payload):
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=15,
+            timeout=25,
         )
+        ok, loot_url, data, body_text = _lootlabs_parse(response)
+        logger.info("LootLabs POST status=%s body=%s", response.status_code, body_text)
+        if ok:
+            return loot_url, data
+        last_error = _lootlabs_error_text(data, response.status_code)
+        if response.status_code in {401, 429} or (
+            isinstance(data, dict) and data.get("type") == "error"
+        ):
+            _raise_lootlabs_failure(response.status_code, data, last_error)
+    except RuntimeError:
+        raise
     except requests.RequestException as exc:
-        logger.error("LootLabs link request failed: %s", exc)
-        raise RuntimeError(
-            "LootLabs could not create the checkpoint link. Try again shortly."
-        ) from exc
+        last_error = f"{type(exc).__name__}: {exc}"
+        logger.error("LootLabs POST failed: %s", last_error)
 
-    body_text = (response.text or "")[:800]
-    logger.info("LootLabs create status=%s body=%s", response.status_code, body_text)
-
+    params = {
+        "api_token": api_token,
+        "title": payload["title"],
+        "url": payload["url"],
+        "tier_id": payload["tier_id"],
+        "number_of_tasks": payload["number_of_tasks"],
+        "theme": payload.get("theme", 1),
+    }
+    if payload.get("thumbnail"):
+        params["thumbnail"] = payload["thumbnail"]
     try:
-        data = response.json()
-    except ValueError:
-        data = None
-
-    if response.status_code == 401:
+        response = requests.get(LOOTLABS_API_URL, params=params, timeout=25)
+        ok, loot_url, data, body_text = _lootlabs_parse(response)
+        logger.info("LootLabs GET status=%s body=%s", response.status_code, body_text)
+        if ok:
+            return loot_url, data
+        _raise_lootlabs_failure(response.status_code, data, last_error)
+    except RuntimeError:
+        raise
+    except requests.RequestException as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        logger.error("LootLabs GET failed: %s", detail)
         raise RuntimeError(
-            "LootLabs rejected the API token. Check LOOTLABS_API_TOKEN on the website."
-        )
-    if response.status_code == 429:
-        raise RuntimeError("LootLabs rate-limited the request. Wait a minute and try again.")
-
-    loot_url = None
-    if isinstance(data, dict):
-        message = data.get("message")
-        if isinstance(message, dict):
-            loot_url = message.get("loot_url") or message.get("url")
-
-    ok = (
-        response.status_code < 400
-        and isinstance(data, dict)
-        and data.get("type") != "error"
-        and bool(loot_url)
-    )
-    if ok:
-        return loot_url, data
-
-    hint = _lootlabs_error_text(data, response.status_code)
-    lowered = hint.lower()
-    if "creator" in lowered or ("mandatory" in lowered and "detail" in lowered):
-        raise RuntimeError(
-            "LootLabs needs your creator profile filled in (name/avatar) before it can create links."
-        )
-    raise RuntimeError(f"LootLabs could not create the checkpoint link. {hint}")
+            f"LootLabs could not create the checkpoint link. {detail}"
+        ) from exc
 
 
 def start_renewal_checkpoint(session_token, client_ip, base_url=None, now=None):
