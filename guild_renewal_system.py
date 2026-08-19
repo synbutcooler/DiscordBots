@@ -496,7 +496,9 @@ def configure_renewal(
     existing = renewal_entitlements_collection.find_one({"_id": guild_id})
 
     same_email = bool(existing and (existing.get("email") or "").lower() == email)
-    if same_email:
+    if not email:
+        verified = False
+    elif same_email:
         stored_flag = existing.get("email_verified")
         inherited = True if stored_flag is None else bool(stored_flag)
         verified = inherited if email_verified is None else bool(email_verified)
@@ -623,6 +625,8 @@ def get_renewal_session(session_token, now=None):
 
 def _lootlabs_settings():
     token = (os.environ.get("LOOTLABS_API_TOKEN") or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
     if not token:
         raise RuntimeError("LootLabs renewal is not configured on the website.")
     try:
@@ -630,6 +634,9 @@ def _lootlabs_settings():
         theme = int(os.environ.get("LOOTLABS_RENEWAL_THEME", "5"))
     except ValueError:
         raise RuntimeError("LootLabs tier/theme environment variables must be numbers.")
+    # Docs list tiers 1-3 as valid; theme 1-5.
+    tier_id = min(max(tier_id, 1), 3)
+    theme = min(max(theme, 1), 5)
     return token, tier_id, theme
 
 
@@ -703,10 +710,10 @@ def _create_lootlabs_link(api_token, payload):
         if ok:
             return loot_url, data
         last_error = _lootlabs_error_text(data, response.status_code)
-        if response.status_code in {401, 429} or (
-            isinstance(data, dict) and data.get("type") == "error"
-        ):
-            _raise_lootlabs_failure(response.status_code, data, last_error)
+        # 4xx is a rejected payload/auth. Retrying GET with the same fields
+        # will not fix it — surface LootLabs' body instead.
+        if response.status_code:
+            _raise_lootlabs_failure(response.status_code, data, last_error or body_text)
     except RuntimeError:
         raise
     except requests.RequestException as exc:
