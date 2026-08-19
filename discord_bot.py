@@ -40,6 +40,7 @@ from guild_renewal_system import (
     get_pending_email_verification,
     get_renewal_entitlement,
     get_renewal_status,
+    mark_discord_reminder_sent,
     process_due_email_reminders,
     renewal_schedule_description,
     request_email_verification,
@@ -1204,11 +1205,9 @@ def build_renewal_embed(guild):
     if not configured:
         embed.description = (
             "Service renewal is **not configured**, so this server keeps legacy access.\n\n"
-            "Configure a notification email, timezone, and local renewal time to start a "
-            f"{renewal_schedule_description()}. The first time you add an email it must be "
-            "verified. Each renewal requires four sequential LootLabs checkpoints. Use the "
-            "dropdown below for a common timezone, or **Configure** to enter any IANA "
-            "timezone manually."
+            "Set a timezone and local renewal time to start a "
+            f"{renewal_schedule_description()}. Reminders go to your **Discord DMs**. "
+            "Email is optional. Each renewal needs four LootLabs checkpoints."
         )
         embed.add_field(name="Current state", value="🟠 Legacy access", inline=True)
         return embed
@@ -1276,9 +1275,9 @@ class RenewalConfigModal(discord.ui.Modal):
         self.selected_timezone = selected_timezone
         self.timezone_input = None
         self.email_input = discord.ui.TextInput(
-            label="Reminder email",
-            placeholder="owner@example.com",
-            required=True,
+            label="Reminder email (optional)",
+            placeholder="Leave blank — we'll DM you on Discord",
+            required=False,
             max_length=254,
             default=str(entitlement.get("email", ""))[:254],
         )
@@ -1322,7 +1321,7 @@ class RenewalConfigModal(discord.ui.Modal):
         already_verified = await asyncio.to_thread(
             email_already_verified, interaction.guild.id, email
         )
-        if already_verified:
+        if (not email) or already_verified:
             try:
                 await asyncio.to_thread(
                     configure_renewal,
@@ -2345,15 +2344,36 @@ async def on_message(message):
 async def renewal_email_reminder_loop():
     try:
         result = await asyncio.to_thread(process_due_email_reminders)
-        if result.get("sent") or result.get("failed"):
+        dm_sent = 0
+        for msg in result.get("discord") or []:
+            try:
+                user = await bot.fetch_user(int(msg["discord_id"]))
+                embed = discord.Embed(
+                    title=msg["subject"],
+                    description=msg["body"],
+                    color=discord.Color.gold(),
+                )
+                await user.send(embed=embed)
+                await asyncio.to_thread(
+                    mark_discord_reminder_sent, msg["notification_id"]
+                )
+                dm_sent += 1
+            except Exception:
+                logger.exception(
+                    "Renewal Discord DM failed for user %s guild %s",
+                    msg.get("discord_id"),
+                    msg.get("guild_id"),
+                )
+        if result.get("sent") or result.get("failed") or dm_sent:
             logger.info(
-                "Renewal email run: sent=%s failed=%s",
+                "Renewal reminder run: email_sent=%s email_failed=%s discord_sent=%s",
                 result.get("sent", 0),
                 result.get("failed", 0),
+                dm_sent,
             )
     except Exception:
-        # Missing/broken SMTP must never stop key service or kill the loop.
-        logger.exception("Renewal email reminder run failed")
+        # Missing/broken mail must never stop key service or kill the loop.
+        logger.exception("Renewal reminder run failed")
 
 
 @renewal_email_reminder_loop.before_loop
