@@ -505,7 +505,7 @@ def validate_guild_key(key, hwid, api_secret):
 
         renewal = get_renewal_status(guild_id)
         if not renewal.get("allows_access", False):
-            return False, "Server sponsored access expired. Ask an admin to renew it in Discord."
+            return False, "This server's service access expired. Ask an admin to renew it in Discord."
 
         key_doc = guild_keys_collection.find_one({"_id": key})
         if not key_doc:
