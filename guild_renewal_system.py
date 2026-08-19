@@ -1,10 +1,12 @@
-"""Durable guild-sponsored access and four-step LootLabs renewals.
+"""Durable guild service access and four-step LootLabs renewals.
 
 This module is intentionally separate from guild_key_system.py.  The Discord bot
 and website are separate deployments, but both point at the same MongoDB
 collections and use this same document/state-machine contract.
 """
 
+import hashlib
+import html
 import logging
 import os
 import re
@@ -64,6 +66,9 @@ CHECKPOINT_COUNT = 4
 RENEWAL_OPEN_SECONDS = 24 * 60 * 60
 RENEWAL_SESSION_SECONDS = 6 * 60 * 60
 MIN_CHECKPOINT_SECONDS = int(os.environ.get("RENEWAL_MIN_CHECKPOINT_SECONDS", "25"))
+EMAIL_VERIFY_SECONDS = 15 * 60
+EMAIL_VERIFY_ATTEMPTS = 5
+EMAIL_RESEND_SECONDS = 45
 
 if RENEWAL_TEST_CYCLE_MINUTES:
     logger.warning(
@@ -76,10 +81,17 @@ LOOTLABS_API_URL = "https://creators.lootlabs.gg/api/public/content_locker"
 BREVO_EMAIL_API_URL = "https://api.brevo.com/v3/smtp/email"
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+_FREEMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "hotmail.com",
+    "outlook.com", "live.com", "msn.com", "icloud.com", "me.com", "aol.com",
+    "proton.me", "protonmail.com", "gmx.com", "gmx.net", "mail.com",
+    "yandex.com", "zoho.com",
+}
 
 renewal_entitlements_collection = None
 renewal_sessions_collection = None
 renewal_notifications_collection = None
+renewal_email_verifications_collection = None
 _email_missing_logged = False
 
 if MONGODB_URI and MongoClient is not None:
@@ -94,6 +106,7 @@ if MONGODB_URI and MongoClient is not None:
         renewal_entitlements_collection = _db["guild_renewal_entitlements"]
         renewal_sessions_collection = _db["guild_renewal_sessions"]
         renewal_notifications_collection = _db["guild_renewal_notifications"]
+        renewal_email_verifications_collection = _db["guild_renewal_email_verifications"]
 
         renewal_entitlements_collection.create_index(
             [("enabled", ASCENDING), ("due_at", ASCENDING)]
@@ -105,6 +118,9 @@ if MONGODB_URI and MongoClient is not None:
             [("guild_id", ASCENDING), ("admin_discord_id", ASCENDING), ("completed", ASCENDING)]
         )
         renewal_notifications_collection.create_index(
+            "expires_at_ttl", expireAfterSeconds=0
+        )
+        renewal_email_verifications_collection.create_index(
             "expires_at_ttl", expireAfterSeconds=0
         )
         logger.info("Guild renewal collections initialized")
@@ -211,7 +227,7 @@ def derive_renewal_status(entitlement, now=None):
             "state": "legacy",
             "allows_access": True,
             "renewal_available": False,
-            "message": "Sponsored renewal is not configured; legacy access remains active.",
+            "message": "Service renewal is not configured; legacy access remains active.",
         }
 
     due_at = float(entitlement.get("due_at", 0))
@@ -228,6 +244,13 @@ def derive_renewal_status(entitlement, now=None):
         state = "blocked"
         allows_access = False
 
+    stored_email = entitlement.get("email", "")
+    verified_flag = entitlement.get("email_verified")
+    if verified_flag is None:
+        email_verified = bool(stored_email)
+    else:
+        email_verified = bool(verified_flag)
+
     result = {
         "configured": True,
         "state": state,
@@ -239,20 +262,21 @@ def derive_renewal_status(entitlement, now=None):
         "cycle": int(entitlement.get("cycle", 1)),
         "timezone": entitlement.get("timezone", "UTC"),
         "local_time": entitlement.get("local_time", "00:00"),
-        "email": entitlement.get("email", ""),
+        "email": stored_email,
+        "email_verified": email_verified,
         "guild_name": entitlement.get("guild_name", "Discord server"),
         "owner_discord_id": entitlement.get("owner_discord_id"),
     }
     if state == "active":
-        result["message"] = "Sponsored access is active."
+        result["message"] = "Service access is active."
     elif state == "grace":
         grace_minutes = GRACE_PERIOD_SECONDS // 60
         result["message"] = (
-            f"Sponsored access is in its {grace_minutes}-minute grace period."
+            f"Service access is in its {grace_minutes}-minute grace period."
         )
     else:
         result["message"] = (
-            "Sponsored access expired. A server admin must complete the four renewal checkpoints."
+            "Service access expired. A server admin must complete the four renewal checkpoints."
         )
     return result
 
@@ -272,7 +296,7 @@ def get_renewal_status(guild_id, now=None):
                 "state": "unavailable",
                 "allows_access": False,
                 "renewal_available": False,
-                "message": "Sponsored access could not be checked. Please try again shortly.",
+                "message": "Service access could not be checked. Please try again shortly.",
             }
         return derive_renewal_status(None, now)
     try:
@@ -284,8 +308,169 @@ def get_renewal_status(guild_id, now=None):
             "state": "unavailable",
             "allows_access": False,
             "renewal_available": False,
-            "message": "Sponsored access could not be checked. Please try again shortly.",
+            "message": "Service access could not be checked. Please try again shortly.",
         }
+
+
+def email_already_verified(guild_id, email):
+    """True when this guild already owns this address as a verified reminder inbox."""
+    email = (email or "").strip().lower()
+    entitlement = get_renewal_entitlement(guild_id)
+    if not entitlement or not email:
+        return False
+    stored = (entitlement.get("email") or "").strip().lower()
+    if stored != email:
+        return False
+    flag = entitlement.get("email_verified")
+    if flag is None:
+        return True
+    return bool(flag)
+
+
+def get_pending_email_verification(guild_id, now=None):
+    if renewal_email_verifications_collection is None:
+        return None
+    now = time.time() if now is None else float(now)
+    doc = renewal_email_verifications_collection.find_one({"_id": str(guild_id)})
+    if not doc:
+        return None
+    if now >= float(doc.get("expires_at", 0)):
+        renewal_email_verifications_collection.delete_one({"_id": str(guild_id)})
+        return None
+    return {
+        "email": doc.get("email", ""),
+        "timezone": doc.get("timezone", "UTC"),
+        "local_time": doc.get("local_time", "18:00"),
+        "expires_at": float(doc.get("expires_at", 0)),
+        "attempts": int(doc.get("attempts", 0)),
+        "last_sent_at": float(doc.get("last_sent_at", 0)),
+    }
+
+
+def _code_digest(guild_id, code):
+    secret = (
+        os.environ.get("DISCORD_KEY_API_SECRET")
+        or os.environ.get("BREVO_API_KEY")
+        or "vadrifts-email-verify"
+    )
+    return hashlib.sha256(f"{secret}:{guild_id}:{code}".encode("utf-8")).hexdigest()
+
+
+def request_email_verification(
+    guild_id,
+    guild_name,
+    owner_discord_id,
+    email,
+    timezone_name,
+    local_time,
+    now=None,
+    force_resend=False,
+):
+    """Store pending settings and email a one-time 6-digit code."""
+    if renewal_email_verifications_collection is None:
+        raise RuntimeError("Renewal database is unavailable.")
+    if not _email_settings():
+        raise RuntimeError(
+            "Email delivery is not configured. Set BREVO_API_KEY and BREVO_FROM_EMAIL."
+        )
+
+    email, timezone_name, local_time = validate_renewal_settings(
+        email, timezone_name, local_time
+    )
+    now = time.time() if now is None else float(now)
+    guild_id = str(guild_id)
+    existing = renewal_email_verifications_collection.find_one({"_id": guild_id})
+    last_sent = float((existing or {}).get("last_sent_at", 0))
+    if existing and not force_resend and now - last_sent < EMAIL_RESEND_SECONDS:
+        wait = int(EMAIL_RESEND_SECONDS - (now - last_sent))
+        raise ValueError(f"Wait {wait}s before requesting another code.")
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    expires_at = now + EMAIL_VERIFY_SECONDS
+    document = {
+        "guild_id": guild_id,
+        "guild_name": (guild_name or "Discord server")[:200],
+        "owner_discord_id": str(owner_discord_id),
+        "email": email,
+        "timezone": timezone_name,
+        "local_time": local_time,
+        "code_hash": _code_digest(guild_id, code),
+        "attempts": 0,
+        "created_at": float((existing or {}).get("created_at", now)),
+        "last_sent_at": now,
+        "expires_at": expires_at,
+        "expires_at_ttl": datetime.fromtimestamp(expires_at, timezone.utc),
+    }
+    renewal_email_verifications_collection.update_one(
+        {"_id": guild_id}, {"$set": document}, upsert=True
+    )
+
+    subject = "Verify your Vadrifts service email"
+    text_body = (
+        f"Use this code to confirm the reminder email for {document['guild_name']}:\n\n"
+        f"    {code}\n\n"
+        "It expires in 15 minutes. If you did not request this, ignore the email.\n"
+    )
+    html_body = _html_email(
+        "Confirm your reminder email",
+        [
+            f"Use this code to confirm the reminder inbox for {document['guild_name']}.",
+            "It expires in 15 minutes. If you did not request this, you can ignore the email.",
+        ],
+        code=code,
+    )
+    _send_email(email, subject, text_body, html_body=html_body)
+    return {
+        "email": email,
+        "expires_in": EMAIL_VERIFY_SECONDS,
+        "from_is_freemail": sender_is_freemail(),
+    }
+
+
+def confirm_email_verification(guild_id, code, now=None):
+    """Apply pending settings after the owner proves they control the inbox."""
+    if renewal_email_verifications_collection is None:
+        raise RuntimeError("Renewal database is unavailable.")
+    now = time.time() if now is None else float(now)
+    guild_id = str(guild_id)
+    pending = renewal_email_verifications_collection.find_one({"_id": guild_id})
+    if not pending or now >= float(pending.get("expires_at", 0)):
+        if pending:
+            renewal_email_verifications_collection.delete_one({"_id": guild_id})
+        raise ValueError("That code expired. Submit your email again to get a new one.")
+
+    attempts = int(pending.get("attempts", 0))
+    if attempts >= EMAIL_VERIFY_ATTEMPTS:
+        renewal_email_verifications_collection.delete_one({"_id": guild_id})
+        raise ValueError("Too many incorrect attempts. Request a new code.")
+
+    submitted = re.sub(r"\s+", "", str(code or ""))
+    expected = pending.get("code_hash") or ""
+    if len(submitted) != 6 or not submitted.isdigit() or not expected:
+        renewal_email_verifications_collection.update_one(
+            {"_id": guild_id}, {"$inc": {"attempts": 1}}
+        )
+        remaining = EMAIL_VERIFY_ATTEMPTS - attempts - 1
+        raise ValueError(f"That code is incorrect. {max(remaining, 0)} attempt(s) left.")
+    if not secrets.compare_digest(_code_digest(guild_id, submitted), expected):
+        renewal_email_verifications_collection.update_one(
+            {"_id": guild_id}, {"$inc": {"attempts": 1}}
+        )
+        remaining = EMAIL_VERIFY_ATTEMPTS - attempts - 1
+        raise ValueError(f"That code is incorrect. {max(remaining, 0)} attempt(s) left.")
+
+    document = configure_renewal(
+        pending["guild_id"],
+        pending.get("guild_name"),
+        pending.get("owner_discord_id"),
+        pending["email"],
+        pending["timezone"],
+        pending["local_time"],
+        now=now,
+        email_verified=True,
+    )
+    renewal_email_verifications_collection.delete_one({"_id": guild_id})
+    return document
 
 
 def configure_renewal(
@@ -296,6 +481,7 @@ def configure_renewal(
     timezone_name,
     local_time,
     now=None,
+    email_verified=None,
 ):
     """Enable/update settings; only explicit test-mode transitions reset the due date."""
     if renewal_entitlements_collection is None:
@@ -306,6 +492,16 @@ def configure_renewal(
     now = time.time() if now is None else float(now)
     guild_id = str(guild_id)
     existing = renewal_entitlements_collection.find_one({"_id": guild_id})
+
+    same_email = bool(existing and (existing.get("email") or "").lower() == email)
+    if same_email:
+        stored_flag = existing.get("email_verified")
+        inherited = True if stored_flag is None else bool(stored_flag)
+        verified = inherited if email_verified is None else bool(email_verified)
+    else:
+        verified = bool(email_verified)
+        if not verified:
+            raise ValueError("Verify this email before saving it.")
 
     test_cycle_enabled = bool(RENEWAL_TEST_CYCLE_MINUTES)
     existing_was_test = bool(existing and existing.get("timing_mode") == "test")
@@ -331,6 +527,10 @@ def configure_renewal(
         "guild_name": (guild_name or "Discord server")[:200],
         "owner_discord_id": str(owner_discord_id),
         "email": email,
+        "email_verified": verified,
+        "email_verified_at": (
+            now if verified else existing.get("email_verified_at") if existing else None
+        ),
         "timezone": timezone_name,
         "local_time": local_time,
         "timing_mode": "test" if test_cycle_enabled else "production",
@@ -357,7 +557,7 @@ def create_or_get_renewal_session(guild_id, admin_discord_id, now=None):
     admin_discord_id = str(admin_discord_id)
     status = get_renewal_status(guild_id, now)
     if not status.get("configured"):
-        raise ValueError("Configure sponsored renewal before starting checkpoints.")
+        raise ValueError("Configure service renewal before starting checkpoints.")
     if not status.get("renewal_available"):
         raise ValueError(
             "Renewal opens 24 hours before the current due time."
@@ -431,6 +631,80 @@ def _lootlabs_settings():
     return token, tier_id, theme
 
 
+def _lootlabs_error_text(data, status_code):
+    if isinstance(data, dict):
+        message = data.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()[:220]
+        if isinstance(message, dict):
+            nested = message.get("error") or message.get("message") or ""
+            if nested:
+                return str(nested)[:220]
+        if data.get("error"):
+            return str(data.get("error"))[:220]
+    if status_code:
+        return f"HTTP {status_code}"
+    return "Unexpected LootLabs response"
+
+
+def _create_lootlabs_link(api_token, payload):
+    """Create a locker link and return (loot_url, raw_data)."""
+    try:
+        response = requests.post(
+            LOOTLABS_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        logger.error("LootLabs link request failed: %s", exc)
+        raise RuntimeError(
+            "LootLabs could not create the checkpoint link. Try again shortly."
+        ) from exc
+
+    body_text = (response.text or "")[:800]
+    logger.info("LootLabs create status=%s body=%s", response.status_code, body_text)
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+
+    if response.status_code == 401:
+        raise RuntimeError(
+            "LootLabs rejected the API token. Check LOOTLABS_API_TOKEN on the website."
+        )
+    if response.status_code == 429:
+        raise RuntimeError("LootLabs rate-limited the request. Wait a minute and try again.")
+
+    loot_url = None
+    if isinstance(data, dict):
+        message = data.get("message")
+        if isinstance(message, dict):
+            loot_url = message.get("loot_url") or message.get("url")
+
+    ok = (
+        response.status_code < 400
+        and isinstance(data, dict)
+        and data.get("type") != "error"
+        and bool(loot_url)
+    )
+    if ok:
+        return loot_url, data
+
+    hint = _lootlabs_error_text(data, response.status_code)
+    lowered = hint.lower()
+    if "creator" in lowered or ("mandatory" in lowered and "detail" in lowered):
+        raise RuntimeError(
+            "LootLabs needs your creator profile filled in (name/avatar) before it can create links."
+        )
+    raise RuntimeError(f"LootLabs could not create the checkpoint link. {hint}")
+
+
 def start_renewal_checkpoint(session_token, client_ip, base_url=None, now=None):
     """Generate/cache the one-task LootLabs link for the expected next step."""
     if renewal_sessions_collection is None:
@@ -467,7 +741,7 @@ def start_renewal_checkpoint(session_token, client_ip, base_url=None, now=None):
         f"{public_base}/ks/renew/complete/{session_token}/{step}/{completion_token}"
     )
     payload = {
-        "title": f"Server renewal {step} of {CHECKPOINT_COUNT}"[:30],
+        "title": f"Renewal {step}/{CHECKPOINT_COUNT}"[:30],
         "url": completion_url,
         "tier_id": tier_id,
         "number_of_tasks": 1,
@@ -477,23 +751,7 @@ def start_renewal_checkpoint(session_token, client_ip, base_url=None, now=None):
     if thumbnail:
         payload["thumbnail"] = thumbnail
 
-    try:
-        response = requests.post(
-            LOOTLABS_API_URL,
-            headers={"Authorization": f"Bearer {api_token}"},
-            json=payload,
-            timeout=15,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        logger.error("LootLabs link creation failed: %s", exc)
-        raise RuntimeError("LootLabs could not create the checkpoint link. Try again shortly.")
-
-    loot_url = (data.get("message") or {}).get("loot_url") if isinstance(data, dict) else None
-    if not loot_url or data.get("type") == "error":
-        logger.error("Unexpected LootLabs response: %r", data)
-        raise RuntimeError("LootLabs rejected the checkpoint link request.")
+    loot_url, _data = _create_lootlabs_link(api_token, payload)
 
     link_field = f"checkpoint_links.{step_key}"
     started_field = f"checkpoint_started_at.{step_key}"
@@ -666,6 +924,27 @@ def format_renewal_timestamp(timestamp, timezone_name):
     )
 
 
+def spoiler_email(email):
+    email = (email or "").strip()
+    if not email:
+        return "Not set"
+    return f"||{email}||"
+
+
+def _is_freemail_address(address):
+    address = (address or "").strip().lower()
+    if "@" not in address:
+        return False
+    return address.rsplit("@", 1)[-1] in _FREEMAIL_DOMAINS
+
+
+def sender_is_freemail():
+    settings = _email_settings()
+    if not settings:
+        return False
+    return _is_freemail_address(settings.get("from_address"))
+
+
 def _brevo_settings():
     """Return HTTPS email settings when the Render-safe Brevo path is enabled."""
     api_key = (os.environ.get("BREVO_API_KEY") or "").strip()
@@ -708,12 +987,54 @@ def _email_settings():
     return _brevo_settings() or _smtp_settings()
 
 
-def _send_email(to_address, subject, body):
+def _html_email(title, paragraphs, code=None):
+    blocks = [
+        "<div style=\"font-family:Inter,Segoe UI,Arial,sans-serif;max-width:560px;"
+        "margin:0 auto;padding:28px 24px;background:#0b0b0f;color:#f5f5f7;"
+        "border-radius:18px\">",
+        f"<h2 style=\"margin:0 0 16px;font-size:22px;color:#c4b5fd\">{html.escape(title)}</h2>",
+    ]
+    for paragraph in paragraphs:
+        blocks.append(
+            f"<p style=\"margin:0 0 12px;line-height:1.65;color:#d4d4d8\">{html.escape(paragraph)}</p>"
+        )
+    if code:
+        blocks.append(
+            "<p style=\"margin:20px 0;padding:16px 18px;background:#1b1030;"
+            "border:1px solid #5b21b6;border-radius:12px;font-size:28px;"
+            f"letter-spacing:8px;font-weight:800;color:#fff;text-align:center\">{html.escape(code)}</p>"
+        )
+    blocks.append(
+        "<p style=\"margin:22px 0 0;font-size:12px;color:#71717a\">Vadrifts Key System</p></div>"
+    )
+    return "".join(blocks)
+
+
+def _send_email(to_address, subject, body, html_body=None):
     settings = _email_settings()
     if not settings:
         raise RuntimeError("Email delivery is not configured.")
 
+    if _is_freemail_address(settings["from_address"]) and not getattr(_send_email, "_freemail_warned", False):
+        logger.warning(
+            "BREVO_FROM_EMAIL/SMTP sender %s is a freemail address; Gmail/Yahoo will "
+            "usually drop or spam these. Authenticate a real domain in Brevo.",
+            settings["from_address"],
+        )
+        _send_email._freemail_warned = True
+
     if settings["provider"] == "brevo":
+        payload = {
+            "sender": {
+                "name": settings["from_name"],
+                "email": settings["from_address"],
+            },
+            "to": [{"email": to_address}],
+            "subject": subject,
+            "textContent": body,
+        }
+        if html_body:
+            payload["htmlContent"] = html_body
         try:
             response = requests.post(
                 BREVO_EMAIL_API_URL,
@@ -722,22 +1043,30 @@ def _send_email(to_address, subject, body):
                     "api-key": settings["api_key"],
                     "content-type": "application/json",
                 },
-                json={
-                    "sender": {
-                        "name": settings["from_name"],
-                        "email": settings["from_address"],
-                    },
-                    "to": [{"email": to_address}],
-                    "subject": subject,
-                    "textContent": body,
-                },
+                json=payload,
                 timeout=15,
             )
             response.raise_for_status()
         except requests.RequestException as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
+            detail = ""
+            resp = getattr(exc, "response", None)
+            if resp is not None:
+                detail = (resp.text or "")[:300]
             suffix = f" (HTTP {status})" if status else ""
+            logger.error("Brevo send failed%s: %s", suffix, detail or exc)
             raise RuntimeError(f"Brevo email API request failed{suffix}") from exc
+        message_id = None
+        try:
+            message_id = (response.json() or {}).get("messageId")
+        except ValueError:
+            message_id = None
+        logger.info(
+            "Brevo accepted email to %s subject=%r messageId=%s",
+            to_address,
+            subject,
+            message_id or "unknown",
+        )
         return
 
     message = EmailMessage()
@@ -745,6 +1074,8 @@ def _send_email(to_address, subject, body):
     message["To"] = to_address
     message["Subject"] = subject
     message.set_content(body)
+    if html_body:
+        message.add_alternative(html_body, subtype="html")
 
     smtp_class = smtplib.SMTP_SSL if settings["use_ssl"] else smtplib.SMTP
     with smtp_class(settings["host"], settings["port"], timeout=15) as smtp:
@@ -753,6 +1084,7 @@ def _send_email(to_address, subject, body):
         if settings["username"]:
             smtp.login(settings["username"], settings["password"])
         smtp.send_message(message)
+    logger.info("SMTP accepted email to %s subject=%r", to_address, subject)
 
 
 def _reminder_event(entitlement, now):
@@ -792,6 +1124,8 @@ def process_due_email_reminders(now=None):
         {"enabled": True, "email": {"$type": "string", "$ne": ""}}
     )
     for entitlement in cursor:
+        if entitlement.get("email_verified") is False:
+            continue
         event = _reminder_event(entitlement, now)
         if not event:
             continue
@@ -825,19 +1159,28 @@ def process_due_email_reminders(now=None):
             "grace": (
                 f"Renewal is now in the {GRACE_PERIOD_SECONDS // 60}-minute grace period"
             ),
-            "blocked": "Sponsored access is blocked until renewal",
+            "blocked": "Service access is blocked until renewal",
         }
         subject = f"[{entitlement.get('guild_name', 'Discord server')}] {labels[event]}"
         body = (
             f"{labels[event]} for {entitlement.get('guild_name', 'your Discord server')}.\n\n"
             f"Due: {due_text}\n"
             f"Grace ends: {grace_text}\n\n"
-            "Open your Discord server, run /ks setup, choose Sponsored Renewal, "
+            "Open your Discord server, run /ks setup, choose Service Renewal, "
             "and complete all four LootLabs checkpoints. Existing customer keys "
             "remain stored while access is blocked.\n"
         )
+        html_body = _html_email(
+            labels[event],
+            [
+                f"This is a reminder for {entitlement.get('guild_name', 'your Discord server')}.",
+                f"Due: {due_text}",
+                f"Grace ends: {grace_text}",
+                "Open Discord, run /ks setup, choose Service Renewal, and complete all four LootLabs checkpoints. Existing customer keys stay stored while access is blocked.",
+            ],
+        )
         try:
-            _send_email(entitlement["email"], subject, body)
+            _send_email(entitlement["email"], subject, body, html_body=html_body)
             renewal_notifications_collection.update_one(
                 {"_id": notification_id}, {"$set": {"sent_at": time.time()}}
             )
