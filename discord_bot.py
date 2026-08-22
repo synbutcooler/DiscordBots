@@ -1442,14 +1442,12 @@ class RenewalSettingsView(KsPanelView):
         logger.info("Renewal session ready url=%s", renewal_url)
         embed = discord.Embed(
             title="Service Renewal",
-            description=(
-                "Open this page and complete all four LootLabs checkpoints.\n"
-                f"{renewal_url}"
-            ),
+            description="Tap **Open renewal page** below. Discord cannot auto-open tabs.",
             color=discord.Color.gold(),
         )
+        embed.add_field(name="Link", value=renewal_url, inline=False)
         view = RenewalLinkView(renewal_url)
-        await _show(f"✅ Session ready\n{renewal_url}", embed=embed, view=view)
+        await _show("✅ Session ready", embed=embed, view=view)
         self.stop()
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
@@ -1467,7 +1465,7 @@ class RenewalLinkView(KsPanelView):
         self.timeout = 900
         if renewal_url.startswith(("http://", "https://")):
             self.add_item(discord.ui.Button(
-                label="Open four-step renewal",
+                label="Open renewal page",
                 style=discord.ButtonStyle.link,
                 url=renewal_url,
                 row=0,
