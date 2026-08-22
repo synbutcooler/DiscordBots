@@ -1198,11 +1198,20 @@ def build_renewal_embed(guild):
         "grace": discord.Color.gold(),
         "blocked": discord.Color.red(),
         "unavailable": discord.Color.red(),
+        "exempt": discord.Color.green(),
     }
     embed = discord.Embed(
         title="💎 Service Renewal",
         color=colors.get(state, discord.Color.blurple()),
     )
+    if state == "exempt":
+        embed.description = (
+            "This server has **permanent service access**. "
+            "No checkpoints, no due date."
+        )
+        embed.add_field(name="Current state", value="♾️ Permanent", inline=True)
+        embed.set_footer(text="Keys are never deleted.")
+        return embed
     if not configured:
         embed.description = (
             "Service renewal is **not configured**, so this server keeps legacy access.\n\n"
@@ -1575,6 +1584,7 @@ def build_dashboard_embed(guild):
         "grace": "⚠️ Renewal grace",
         "blocked": "⛔ Renewal required",
         "unavailable": "❌ Renewal unavailable",
+        "exempt": "♾️ Permanent",
     }
     embed.add_field(
         name="Service access",
