@@ -1355,9 +1355,31 @@ class RenewalTimezoneSelect(discord.ui.Select):
         )
 
 
+async def _renewal_notice(interaction: discord.Interaction, text: str) -> None:
+    """Show an error on the panel and as a followup so it cannot vanish."""
+    try:
+        await interaction.edit_original_response(content=text)
+    except Exception:
+        pass
+    try:
+        await interaction.followup.send(text, ephemeral=True)
+    except Exception:
+        logger.exception("Could not send renewal notice")
+
+
+def _public_renewal_url(session_token: str) -> str:
+    base = (SERVER_BASE_URL or "").strip().rstrip("/")
+    if base.startswith("http://"):
+        base = "https://" + base[len("http://"):]
+    if not base.startswith("https://"):
+        base = "https://" + base.lstrip("/")
+    return f"{base}/ks/renew/{session_token}"
+
+
 class RenewalSettingsView(KsPanelView):
     def __init__(self):
         super().__init__()
+        self.timeout = 900
         self.add_item(RenewalTimezoneSelect())
 
     @discord.ui.button(label="Configure", style=discord.ButtonStyle.primary, emoji="⚙️", row=0)
@@ -1373,7 +1395,13 @@ class RenewalSettingsView(KsPanelView):
     async def renew(self, interaction: discord.Interaction, button: discord.ui.Button):
         if await _deny_if_not_admin(interaction):
             return
-        await interaction.response.defer()
+        logger.info(
+            "Start renewal clicked by %s in guild %s",
+            interaction.user.id,
+            interaction.guild.id,
+        )
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         try:
             session_token = await asyncio.to_thread(
                 create_or_get_renewal_session,
@@ -1381,26 +1409,36 @@ class RenewalSettingsView(KsPanelView):
                 interaction.user.id,
             )
         except ValueError as exc:
-            await interaction.followup.send(f"⏳ {exc}", ephemeral=True)
+            await _renewal_notice(interaction, f"⏳ {exc}")
             return
         except Exception:
             logger.exception("Failed to create renewal session")
-            await interaction.followup.send(
-                "❌ Could not create a renewal session. Try again shortly.", ephemeral=True
+            await _renewal_notice(
+                interaction,
+                "❌ Could not create a renewal session. Check the bot logs and try `/ks setup` again.",
             )
             return
 
-        renewal_url = f"{SERVER_BASE_URL.rstrip('/')}/ks/renew/{session_token}"
+        renewal_url = _public_renewal_url(session_token)
         embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
         embed.description = (
-            "Your private renewal session is ready. Open it and complete all four "
-            "LootLabs checkpoints in order. The session expires in six hours."
+            "Your private renewal session is ready. Complete all four LootLabs "
+            "checkpoints. The session expires in six hours."
         )
-        await interaction.edit_original_response(
-            content=None,
-            embed=embed,
-            view=RenewalLinkView(renewal_url),
-        )
+        embed.add_field(name="Renewal page", value=renewal_url, inline=False)
+        view = RenewalLinkView(renewal_url)
+        try:
+            await interaction.edit_original_response(
+                content="✅ Session ready — use the button or the link below.",
+                embed=embed,
+                view=view,
+            )
+        except Exception:
+            logger.exception("Failed to attach renewal link view for %s", renewal_url)
+            await interaction.followup.send(
+                f"✅ Session ready. Open this page:\n{renewal_url}",
+                ephemeral=True,
+            )
         self.stop()
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
@@ -1415,13 +1453,14 @@ class RenewalSettingsView(KsPanelView):
 class RenewalLinkView(KsPanelView):
     def __init__(self, renewal_url):
         super().__init__()
-        self.add_item(discord.ui.Button(
-            label="Open four-step renewal",
-            style=discord.ButtonStyle.link,
-            emoji="🔗",
-            url=renewal_url,
-            row=0,
-        ))
+        self.timeout = 900
+        if renewal_url.startswith(("http://", "https://")):
+            self.add_item(discord.ui.Button(
+                label="Open four-step renewal",
+                style=discord.ButtonStyle.link,
+                url=renewal_url,
+                row=0,
+            ))
         self.add_item(BackToDashboardButton())
 
 
