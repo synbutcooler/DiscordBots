@@ -36,6 +36,12 @@ MONGODB_URI = os.environ.get("MONGODB_URI")
 SERVER_BASE_URL = (
     os.environ.get("SERVER_BASE_URL") or "https://vadrifts.onrender.com"
 ).strip().rstrip("/")
+OWNER_GUILD_ID = (os.environ.get("OWNER_GUILD_ID") or "1241797935100989594").strip()
+
+
+def is_renewal_exempt(guild_id):
+    """Owner guild skips the paid cycle. Guild id comes from the server, never the client."""
+    return str(guild_id or "") == OWNER_GUILD_ID
 
 RENEWAL_PERIOD_DAYS = 3
 
@@ -290,6 +296,22 @@ def get_renewal_entitlement(guild_id):
 
 def get_renewal_status(guild_id, now=None):
     """Get dynamic access state. Missing records deliberately keep legacy access."""
+    if is_renewal_exempt(guild_id):
+        return {
+            "configured": True,
+            "state": "exempt",
+            "allows_access": True,
+            "renewal_available": False,
+            "exempt": True,
+            "message": "This server has permanent service access.",
+            "cycle": 0,
+            "timezone": "UTC",
+            "local_time": "00:00",
+            "email": "",
+            "email_verified": False,
+            "guild_name": "Discord server",
+            "owner_discord_id": None,
+        }
     if renewal_entitlements_collection is None:
         if MONGODB_URI:
             return {
@@ -581,6 +603,8 @@ def _create_or_get_renewal_session_inner(guild_id, admin_discord_id, now):
         status.get("renewal_available"),
         status.get("state"),
     )
+    if is_renewal_exempt(guild_id):
+        raise ValueError("This server has permanent access and does not need renewal.")
     if not status.get("configured"):
         raise ValueError("Configure service renewal before starting checkpoints.")
     if not status.get("renewal_available"):
@@ -1340,6 +1364,8 @@ def process_due_email_reminders(now=None):
         if not event:
             continue
         guild_id = str(entitlement["_id"])
+        if is_renewal_exempt(guild_id):
+            continue
         cycle = int(entitlement.get("cycle", 1))
         notification_id = f"{guild_id}:{cycle}:{event}"
         try:
