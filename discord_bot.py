@@ -1417,18 +1417,12 @@ class RenewalSettingsView(KsPanelView):
                 logger.exception("edit_original_response failed")
 
         try:
-            session_token = await asyncio.wait_for(
-                asyncio.to_thread(
-                    create_or_get_renewal_session,
-                    interaction.guild.id,
-                    interaction.user.id,
-                ),
-                timeout=12,
+            # Same Mongo path as the dashboard embed — do it here so a stuck
+            # thread-pool worker cannot leave the panel on "Starting…".
+            session_token = create_or_get_renewal_session(
+                interaction.guild.id,
+                interaction.user.id,
             )
-        except asyncio.TimeoutError:
-            logger.error("create_or_get_renewal_session timed out")
-            await _show("❌ Timed out creating the session. Check MONGODB_URI on the bot.")
-            return
         except ValueError as exc:
             logger.warning("Start renewal rejected: %s", exc)
             await _show(f"⏳ {exc}")
