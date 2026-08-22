@@ -46,6 +46,12 @@ from guild_renewal_system import (
 
 logger = logging.getLogger(__name__)
 
+# Dedicated pool so a stuck Mongo write cannot exhaust asyncio's default
+# executor (that would freeze /ks setup, getkey, reminders, everything).
+_renewal_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="ks-renew"
+)
+
 TARGET_CHANNEL_ID = 1389210900489044048
 AUTH_CHANNEL_ID = 1287714060716081183
 LOG_CHANNEL_ID = 1270314848764559494
@@ -941,9 +947,7 @@ class ManagementView(KsPanelView):
         view = RenewalSettingsView()
         await interaction.response.edit_message(content=None, embed=embed, view=view)
         self.stop()
-        view.prime_task = asyncio.create_task(
-            view.prime_session(interaction.guild.id, interaction.user.id)
-        )
+        view.start_prime(interaction.guild.id, interaction.user.id)
 
 
 class BackToDashboardButton(discord.ui.Button):
@@ -1321,9 +1325,7 @@ class RenewalConfigModal(discord.ui.Modal):
             embed=embed,
             view=view,
         )
-        view.prime_task = asyncio.create_task(
-            view.prime_session(interaction.guild.id, interaction.user.id)
-        )
+        view.start_prime(interaction.guild.id, interaction.user.id)
 
 
 class RenewalTimezoneSelect(discord.ui.Select):
@@ -1375,19 +1377,102 @@ async def _renewal_notice(interaction: discord.Interaction, text: str) -> None:
 
 
 def _public_renewal_url(session_token: str) -> str:
-    base = (SERVER_BASE_URL or "").strip().rstrip("/")
+    base = "".join(ch for ch in (SERVER_BASE_URL or "") if not ch.isspace()).rstrip("/")
+    if not base:
+        base = "https://vadrifts.onrender.com"
     if base.startswith("http://"):
         base = "https://" + base[len("http://"):]
     if not base.startswith("https://"):
         base = "https://" + base.lstrip("/")
-    return f"{base}/ks/renew/{session_token}"
+    token = "".join(ch for ch in str(session_token or "") if ch.isalnum() or ch in "-_")
+    return f"{base}/ks/renew/{token}"
+
+
+async def _prepare_renewal_session(guild_id, admin_id, timeout=8):
+    """Create/reuse a session off the event loop. Never call Mongo here directly."""
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                _renewal_pool,
+                create_or_get_renewal_session,
+                guild_id,
+                admin_id,
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.error("renewal session create timed out guild=%s", guild_id)
+        raise RuntimeError(
+            "Database took too long to start the renewal session. Hit Start again."
+        )
 
 
 class RenewalSettingsView(KsPanelView):
     def __init__(self):
         super().__init__()
         self.timeout = 900
+        self.session_token = None
+        self.prime_task = None
         self.add_item(RenewalTimezoneSelect())
+
+    def start_prime(self, guild_id, admin_id):
+        if self.prime_task and not self.prime_task.done():
+            return
+        try:
+            self.prime_task = asyncio.create_task(self.prime_session(guild_id, admin_id))
+        except Exception:
+            logger.exception("Could not start renewal prime task")
+
+    async def prime_session(self, guild_id, admin_id):
+        try:
+            self.session_token = await _prepare_renewal_session(guild_id, admin_id)
+            logger.info("Primed renewal session guild=%s", guild_id)
+        except Exception:
+            logger.exception("prime_session failed guild=%s", guild_id)
+
+    async def _deliver_link(self, interaction: discord.Interaction, session_token: str):
+        renewal_url = _public_renewal_url(session_token)
+        logger.info("Renewal session ready url=%s", renewal_url)
+        embed = discord.Embed(
+            title="Service Renewal",
+            description="Tap **Open renewal page** below. Discord cannot auto-open tabs.",
+            color=discord.Color.gold(),
+        )
+        embed.add_field(name="Link", value=renewal_url, inline=False)
+        view = RenewalLinkView(renewal_url)
+        payload = {"content": "✅ Session ready", "embed": embed, "view": view}
+        try:
+            if interaction.response.is_done():
+                await interaction.edit_original_response(**payload)
+            else:
+                await interaction.response.edit_message(**payload)
+        except Exception:
+            logger.exception("Could not attach renewal link button")
+            try:
+                await interaction.followup.send(
+                    content=f"✅ Open this renewal page:\n{renewal_url}",
+                    embed=embed,
+                    view=view,
+                    ephemeral=True,
+                )
+            except Exception:
+                logger.exception("Renewal link followup also failed")
+                return
+        self.stop()
+
+    async def _show_notice(self, interaction: discord.Interaction, text: str):
+        try:
+            if interaction.response.is_done():
+                await interaction.edit_original_response(content=text)
+            else:
+                await interaction.response.edit_message(content=text)
+        except Exception:
+            logger.exception("Could not update renewal notice")
+        try:
+            await interaction.followup.send(text, ephemeral=True)
+        except Exception:
+            pass
 
     @discord.ui.button(label="Configure", style=discord.ButtonStyle.primary, emoji="⚙️", row=0)
     async def configure(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1407,49 +1492,41 @@ class RenewalSettingsView(KsPanelView):
             interaction.user.id,
             interaction.guild.id,
         )
+
+        token = self.session_token
+        if not token and self.prime_task and not self.prime_task.done():
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(content="⏳ Starting renewal…")
+            try:
+                await asyncio.wait_for(asyncio.shield(self.prime_task), timeout=8)
+            except asyncio.TimeoutError:
+                logger.warning("Waiting for primed session timed out")
+            token = self.session_token
+
+        if token:
+            await self._deliver_link(interaction, token)
+            return
+
         if not interaction.response.is_done():
             await interaction.response.edit_message(content="⏳ Starting renewal…")
 
-        async def _show(content, embed=None, view=None):
-            try:
-                await interaction.message.edit(content=content, embed=embed, view=view)
-                return
-            except Exception:
-                logger.exception("interaction.message.edit failed")
-            try:
-                await interaction.edit_original_response(
-                    content=content, embed=embed, view=view
-                )
-            except Exception:
-                logger.exception("edit_original_response failed")
-
         try:
-            # Same Mongo path as the dashboard embed — do it here so a stuck
-            # thread-pool worker cannot leave the panel on "Starting…".
-            session_token = create_or_get_renewal_session(
-                interaction.guild.id,
-                interaction.user.id,
+            token = await _prepare_renewal_session(
+                interaction.guild.id, interaction.user.id
             )
         except ValueError as exc:
             logger.warning("Start renewal rejected: %s", exc)
-            await _show(f"⏳ {exc}")
+            await self._show_notice(interaction, f"⏳ {exc}")
             return
         except Exception as exc:
             logger.exception("Failed to create renewal session")
-            await _show(f"❌ Could not create a renewal session: {exc}")
+            await self._show_notice(
+                interaction, f"❌ Could not create a renewal session: {exc}"
+            )
             return
 
-        renewal_url = _public_renewal_url(session_token)
-        logger.info("Renewal session ready url=%s", renewal_url)
-        embed = discord.Embed(
-            title="Service Renewal",
-            description="Tap **Open renewal page** below. Discord cannot auto-open tabs.",
-            color=discord.Color.gold(),
-        )
-        embed.add_field(name="Link", value=renewal_url, inline=False)
-        view = RenewalLinkView(renewal_url)
-        await _show("✅ Session ready", embed=embed, view=view)
-        self.stop()
+        self.session_token = token
+        await self._deliver_link(interaction, token)
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1598,6 +1675,7 @@ class SetupLinksModal(discord.ui.Modal, title="Set Monetization Links"):
 
         result = "Set: " + ", ".join(set_links) if set_links else "All links cleared"
         await interaction.response.send_message(f"✅ Links updated for **{self.profile['name']}**. {result}", ephemeral=True)
+
 
 
 ks_group = app_commands.Group(name="ks", description="Key System commands")
