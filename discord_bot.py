@@ -4,6 +4,7 @@ from discord.ext import commands, tasks
 import asyncio
 import concurrent.futures
 import random
+import secrets
 import re
 import time
 import logging
@@ -38,6 +39,7 @@ from guild_renewal_system import (
     format_renewal_timestamp,
     get_renewal_entitlement,
     get_renewal_status,
+    insert_renewal_session,
     mark_discord_reminder_sent,
     process_due_email_reminders,
     renewal_schedule_description,
@@ -1453,7 +1455,11 @@ class RenewalSettingsView(KsPanelView):
         )
         embed.add_field(name="Link", value=renewal_url, inline=False)
         view = RenewalLinkView(renewal_url)
-        payload = {"content": "✅ Session ready", "embed": embed, "view": view}
+        payload = {
+            "content": f"✅ Session ready\n{renewal_url}",
+            "embed": embed,
+            "view": view,
+        }
         try:
             if interaction.response.is_done():
                 await interaction.edit_original_response(**payload)
@@ -1472,6 +1478,23 @@ class RenewalSettingsView(KsPanelView):
                 logger.exception("Renewal link followup also failed")
                 return
         self.stop()
+
+    async def _persist_session(self, guild_id, admin_id, token):
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    _renewal_pool,
+                    insert_renewal_session,
+                    guild_id,
+                    admin_id,
+                    token,
+                ),
+                timeout=12,
+            )
+            logger.info("Persisted renewal session guild=%s", guild_id)
+        except Exception:
+            logger.exception("Background renewal persist failed guild=%s", guild_id)
 
     async def _show_notice(self, interaction: discord.Interaction, text: str):
         try:
@@ -1504,41 +1527,20 @@ class RenewalSettingsView(KsPanelView):
             interaction.user.id,
             interaction.guild.id,
         )
-
-        token = self.session_token
-        if not token and self.prime_task and not self.prime_task.done():
-            if not interaction.response.is_done():
-                await interaction.response.edit_message(content="⏳ Starting renewal…")
-            try:
-                await asyncio.wait_for(asyncio.shield(self.prime_task), timeout=8)
-            except asyncio.TimeoutError:
-                logger.warning("Waiting for primed session timed out")
-            token = self.session_token
-
-        if token:
-            await self._deliver_link(interaction, token)
-            return
-
-        if not interaction.response.is_done():
-            await interaction.response.edit_message(content="⏳ Starting renewal…")
-
-        try:
-            token = await _prepare_renewal_session(
-                interaction.guild.id, interaction.user.id
-            )
-        except ValueError as exc:
-            logger.warning("Start renewal rejected: %s", exc)
-            await self._show_notice(interaction, f"⏳ {exc}")
-            return
-        except Exception as exc:
-            logger.exception("Failed to create renewal session")
-            await self._show_notice(
-                interaction, f"❌ Could not create a renewal session: {exc}"
+        if is_owner_guild(interaction.guild.id):
+            await interaction.response.edit_message(
+                content="♾️ This server has permanent access. No renewal needed."
             )
             return
 
+        token = self.session_token or secrets.token_urlsafe(32)
         self.session_token = token
         await self._deliver_link(interaction, token)
+        asyncio.create_task(
+            self._persist_session(
+                interaction.guild.id, interaction.user.id, token
+            )
+        )
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
