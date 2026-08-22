@@ -1252,9 +1252,12 @@ def build_renewal_embed(guild):
             value="Open now — complete all four checkpoints in order.",
             inline=False,
         )
-    embed.set_footer(
-        text="Production setting edits preserve the due date; test-mode transitions reset it. Keys are never deleted."
+    embed.add_field(
+        name="Schedule",
+        value=renewal_schedule_description().capitalize(),
+        inline=False,
     )
+    embed.set_footer(text="Keys are never deleted.")
     return embed
 
 
@@ -1338,7 +1341,7 @@ class RenewalTimezoneSelect(discord.ui.Select):
             discord.SelectOption(label="US Pacific", value="America/Los_Angeles", description="Los Angeles region"),
             discord.SelectOption(label="United Kingdom", value="Europe/London", description="London time"),
             discord.SelectOption(label="Central Europe", value="Europe/Berlin", description="Berlin and nearby regions"),
-            discord.SelectOption(label="Balkans", value="Europe/Sarajevo", description="Sarajevo and nearby regions"),
+            discord.SelectOption(label="Southeast Europe", value="Europe/Belgrade", description="CET / CEST"),
             discord.SelectOption(label="Dubai", value="Asia/Dubai", description="Gulf Standard Time"),
             discord.SelectOption(label="India", value="Asia/Kolkata", description="India Standard Time"),
             discord.SelectOption(label="Singapore", value="Asia/Singapore", description="Singapore time"),
