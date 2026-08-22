@@ -2,6 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import asyncio
+import concurrent.futures
 import random
 import re
 import time
@@ -937,10 +938,12 @@ class ManagementView(KsPanelView):
         if await _deny_if_not_admin(interaction):
             return
         embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
-        await interaction.response.edit_message(
-            content=None, embed=embed, view=RenewalSettingsView()
-        )
+        view = RenewalSettingsView()
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
         self.stop()
+        view.prime_task = asyncio.create_task(
+            view.prime_session(interaction.guild.id, interaction.user.id)
+        )
 
 
 class BackToDashboardButton(discord.ui.Button):
@@ -1312,10 +1315,14 @@ class RenewalConfigModal(discord.ui.Modal):
             )
             return
         embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
+        view = RenewalSettingsView()
         await interaction.edit_original_response(
             content="✅ Service renewal saved. Reminders will come as Discord DMs — allow DMs from server members.",
             embed=embed,
-            view=RenewalSettingsView(),
+            view=view,
+        )
+        view.prime_task = asyncio.create_task(
+            view.prime_session(interaction.guild.id, interaction.user.id)
         )
 
 
