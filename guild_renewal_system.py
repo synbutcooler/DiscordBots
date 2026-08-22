@@ -559,7 +559,14 @@ def create_or_get_renewal_session(guild_id, admin_discord_id, now=None):
     now = time.time() if now is None else float(now)
     guild_id = str(guild_id)
     admin_discord_id = str(admin_discord_id)
+    logger.info("create_or_get_renewal_session guild=%s admin=%s", guild_id, admin_discord_id)
     status = get_renewal_status(guild_id, now)
+    logger.info(
+        "renewal status configured=%s available=%s state=%s",
+        status.get("configured"),
+        status.get("renewal_available"),
+        status.get("state"),
+    )
     if not status.get("configured"):
         raise ValueError("Configure service renewal before starting checkpoints.")
     if not status.get("renewal_available"):
