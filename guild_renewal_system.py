@@ -13,6 +13,7 @@ import re
 import secrets
 import smtplib
 import time
+from contextlib import nullcontext
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -32,9 +33,9 @@ except ImportError:  # Pure state/date tests do not need the database driver.
 logger = logging.getLogger(__name__)
 
 MONGODB_URI = os.environ.get("MONGODB_URI")
-SERVER_BASE_URL = os.environ.get(
-    "SERVER_BASE_URL", "https://vadrifts.onrender.com"
-).rstrip("/")
+SERVER_BASE_URL = (
+    os.environ.get("SERVER_BASE_URL") or "https://vadrifts.onrender.com"
+).strip().rstrip("/")
 
 RENEWAL_PERIOD_DAYS = 3
 
@@ -552,6 +553,14 @@ def configure_renewal(
     return document
 
 
+def _mongo_deadline(seconds=6):
+    try:
+        from pymongo import timeout as mongo_timeout
+        return mongo_timeout(seconds)
+    except Exception:
+        return nullcontext()
+
+
 def create_or_get_renewal_session(guild_id, admin_discord_id, now=None):
     """Create an expiring admin-bound session once its 24-hour window opens."""
     if renewal_sessions_collection is None:
@@ -560,6 +569,11 @@ def create_or_get_renewal_session(guild_id, admin_discord_id, now=None):
     guild_id = str(guild_id)
     admin_discord_id = str(admin_discord_id)
     logger.info("create_or_get_renewal_session guild=%s admin=%s", guild_id, admin_discord_id)
+    with _mongo_deadline(6):
+        return _create_or_get_renewal_session_inner(guild_id, admin_discord_id, now)
+
+
+def _create_or_get_renewal_session_inner(guild_id, admin_discord_id, now):
     status = get_renewal_status(guild_id, now)
     logger.info(
         "renewal status configured=%s available=%s state=%s",
