@@ -8,8 +8,10 @@ import secrets
 import re
 import time
 import logging
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from config import DISCORD_TOKEN
+from config import DISCORD_TOKEN, GEMINI_API_KEY, GEMINI_MODEL
+from gemini_mommy import GeminiMommyClient, GeminiMommyError
 from key_store import (
     create_key_for_user,
     delete_keys_by_discord_id,
@@ -90,6 +92,79 @@ pending_tasks = {}
 last_meow_count = None
 cute_symbols = [">///<", "^-^", "o///o", "x3"]
 submitted_hwids = {}
+
+# Gemini-backed persona state belongs only to the main/non-stickied bot.  The
+# history is intentionally short and in-memory: it disappears on restart and
+# is never written to MongoDB.
+mommy_client = GeminiMommyClient(GEMINI_API_KEY, GEMINI_MODEL)
+mommy_histories = defaultdict(lambda: deque(maxlen=8))  # four short turns
+mommy_user_cooldowns = {}
+mommy_semaphore = asyncio.Semaphore(2)
+MOMMY_USER_COOLDOWN_SECONDS = 12
+MAX_MOMMY_CONVERSATIONS = 500
+
+
+class MommyCooldownError(RuntimeError):
+    def __init__(self, retry_after):
+        self.retry_after = max(1, int(retry_after + 0.999))
+        super().__init__(f"Try again in {self.retry_after} seconds.")
+
+
+async def generate_mommy_reply(guild_id, channel_id, user, prompt):
+    """Apply anti-spam limits, call Gemini off-loop, and keep short context."""
+    if not mommy_client.configured:
+        raise GeminiMommyError(
+            "Mommy AI isn't configured yet. An admin needs to add GEMINI_API_KEY."
+        )
+
+    now = time.monotonic()
+    user_key = (guild_id, user.id)
+    next_allowed = mommy_user_cooldowns.get(user_key, 0)
+    if next_allowed > now:
+        raise MommyCooldownError(next_allowed - now)
+    # Reserve the cooldown before awaiting so simultaneous messages cannot both
+    # consume the free API quota.
+    mommy_user_cooldowns[user_key] = now + MOMMY_USER_COOLDOWN_SECONDS
+
+    # Keep these process-local maps bounded on bots installed in many servers.
+    if len(mommy_user_cooldowns) > 1000:
+        expired = [key for key, deadline in mommy_user_cooldowns.items() if deadline <= now]
+        for key in expired:
+            mommy_user_cooldowns.pop(key, None)
+
+    history_key = (guild_id, channel_id, user.id)
+    if history_key not in mommy_histories and len(mommy_histories) >= MAX_MOMMY_CONVERSATIONS:
+        mommy_histories.pop(next(iter(mommy_histories)))
+    history = mommy_histories[history_key]
+
+    async with mommy_semaphore:
+        reply = await asyncio.to_thread(
+            mommy_client.generate,
+            display_name=user.display_name,
+            prompt=prompt,
+            history=list(history),
+        )
+
+    history.append({"role": "user", "text": prompt[:1500]})
+    history.append({"role": "model", "text": reply[:1500]})
+    return reply
+
+
+async def message_is_reply_to_bot(message):
+    """Check a Discord reply without fetching unless its target is unresolved."""
+    reference = message.reference
+    if not reference or not reference.message_id or not bot.user:
+        return False
+
+    resolved = reference.resolved
+    if isinstance(resolved, discord.Message):
+        return resolved.author.id == bot.user.id
+
+    try:
+        referenced = await message.channel.fetch_message(reference.message_id)
+        return referenced.author.id == bot.user.id
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return False
 
 
 async def send_good_boy_after_delay(user_id, channel):
@@ -2043,7 +2118,7 @@ def build_antispam_embed(guild):
 
 
 # ---------------------------------------------------------------------------
-# /fun — toggle the bot's little fun features (meow, good boy)
+# /fun — toggle the bot's little fun features (meow, good boy, Mommy AI)
 # ---------------------------------------------------------------------------
 
 class FunView(discord.ui.View):
@@ -2082,11 +2157,35 @@ class FunView(discord.ui.View):
             content=f"🐶 Good-boy boosts {'enabled' if new_val else 'disabled'}.",
             embed=build_fun_embed(interaction.guild), view=self)
 
+    @discord.ui.button(label="Mommy AI: OFF", style=discord.ButtonStyle.secondary, emoji="👑", custom_id="fun_mommy")
+    async def toggle_mommy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            return
+        if not mommy_client.configured:
+            await interaction.response.send_message(
+                "❌ Add `GEMINI_API_KEY` to the bot's environment before enabling Mommy AI.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        s = get_settings(interaction.guild.id)
+        new_val = not s.get("fun_mommy", False)
+        update_settings(interaction.guild.id, {"fun_mommy": new_val})
+        button.label = f"Mommy AI: {'ON' if new_val else 'OFF'}"
+        button.style = discord.ButtonStyle.success if new_val else discord.ButtonStyle.secondary
+        await interaction.followup.edit_message(
+            interaction.message.id,
+            content=(f"👑 Mommy AI {'enabled' if new_val else 'disabled'}. "
+                     "Mention the bot, reply to it, or use `/mommy` to chat."),
+            embed=build_fun_embed(interaction.guild), view=self)
+
 
 def build_fun_embed(guild):
     s = get_settings(guild.id)
     meow = s.get("fun_meow", True)
     goodboy = s.get("fun_goodboy", False)
+    mommy = s.get("fun_mommy", False)
     embed = discord.Embed(title="🎉 Fun Features", color=discord.Color.blurple())
     embed.add_field(
         name=f"🐱 Meow replies — {'ON' if meow else 'OFF'}",
@@ -2101,6 +2200,19 @@ def build_fun_embed(guild):
                "spammy with frequent boosts."),
         inline=False,
     )
+    embed.add_field(
+        name=f"👑 Mommy AI — {'ON' if mommy else 'OFF'}",
+        value=("A playful, bossy-but-caring **all-ages/non-sexual** Gemini persona. "
+               "Users can mention the bot, reply to it, or run `/mommy`. Off by default; "
+               "enabled messages and short context are sent to Google's Gemini API."),
+        inline=False,
+    )
+    if not mommy_client.configured:
+        embed.add_field(
+            name="⚠️ Gemini not configured",
+            value="Set `GEMINI_API_KEY` in the bot environment before enabling Mommy AI.",
+            inline=False,
+        )
     embed.set_footer(text="Use the buttons below to toggle. Settings save instantly.")
     return embed
 
@@ -2112,11 +2224,60 @@ async def fun_setup(interaction: discord.Interaction):
     s = get_settings(interaction.guild.id)
     meow = s.get("fun_meow", True)
     goodboy = s.get("fun_goodboy", False)
+    mommy = s.get("fun_mommy", False)
     view.toggle_meow.label = f"Meow: {'ON' if meow else 'OFF'}"
     view.toggle_meow.style = discord.ButtonStyle.success if meow else discord.ButtonStyle.secondary
     view.toggle_goodboy.label = f"Good boy: {'ON' if goodboy else 'OFF'}"
     view.toggle_goodboy.style = discord.ButtonStyle.success if goodboy else discord.ButtonStyle.secondary
+    view.toggle_mommy.label = f"Mommy AI: {'ON' if mommy else 'OFF'}"
+    view.toggle_mommy.style = discord.ButtonStyle.success if mommy else discord.ButtonStyle.secondary
     await interaction.response.send_message(embed=build_fun_embed(interaction.guild), view=view, ephemeral=True)
+
+
+@bot.tree.command(name="mommy", description="Talk to the bot's playful, bossy-but-caring AI persona.")
+@app_commands.describe(prompt="What you want to say")
+async def mommy_command(interaction: discord.Interaction, prompt: str):
+    if interaction.guild is None or interaction.channel_id is None:
+        await interaction.response.send_message(
+            "Use this command in a server where Mommy AI is enabled.", ephemeral=True
+        )
+        return
+
+    settings = get_settings(interaction.guild.id)
+    if not settings.get("fun_mommy", False):
+        await interaction.response.send_message(
+            "Mommy AI is off in this server. An admin can enable it with `/fun`.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+    try:
+        reply = await generate_mommy_reply(
+            interaction.guild.id,
+            interaction.channel_id,
+            interaction.user,
+            prompt,
+        )
+    except MommyCooldownError as exc:
+        await interaction.followup.send(
+            f"Easy, darling. Try again in {exc.retry_after}s.", ephemeral=True
+        )
+        return
+    except GeminiMommyError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+        return
+    except Exception:
+        logger.exception("Unexpected Mommy AI slash-command failure")
+        await interaction.followup.send(
+            "Mommy AI tripped over something. Try again shortly.", ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        reply,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @bot.tree.command(name="antispam", description="Configure anti-scam link/attachment protection.")
@@ -2237,8 +2398,57 @@ async def on_message(message):
     content = message.content or ""
     fun = get_settings(message.guild.id)
 
+    # Opt-in Gemini persona. It only responds when directly addressed, so it
+    # does not butt into normal conversation or burn the free API quota.
+    mommy_handled = False
+    if fun.get("fun_mommy", False):
+        directly_mentioned = bot.user in message.mentions
+        replying_to_bot = await message_is_reply_to_bot(message)
+        if directly_mentioned or replying_to_bot:
+            prompt = re.sub(rf'<@!?{bot.user.id}>', '', content).strip()
+            if not prompt:
+                prompt = "Give me a brief in-character greeting."
+
+            try:
+                async with message.channel.typing():
+                    reply = await generate_mommy_reply(
+                        message.guild.id,
+                        message.channel.id,
+                        message.author,
+                        prompt,
+                    )
+                await message.reply(
+                    reply,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                mommy_handled = True
+            except MommyCooldownError:
+                # A reaction gives feedback without letting cooldown spam create
+                # a wall of bot messages.
+                try:
+                    await message.add_reaction("⏳")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+                mommy_handled = True
+            except GeminiMommyError as exc:
+                await message.reply(
+                    str(exc),
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                mommy_handled = True
+            except Exception:
+                logger.exception("Unexpected Mommy AI mention/reply failure")
+                await message.reply(
+                    "Mommy AI tripped over something. Try again shortly.",
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                mommy_handled = True
+
     # "meow" easter egg — on by default, toggle with /fun.
-    if fun.get("fun_meow", True):
+    if not mommy_handled and fun.get("fun_meow", True):
         cleaned_content = re.sub(r'<@!?\d+>', '', content).strip()
         words = re.findall(r'\b\w+[!?.]*\b', cleaned_content)
 
@@ -2266,7 +2476,7 @@ async def on_message(message):
     # "good boy" — OFF by default, toggle with /fun. Fires on real Discord
     # boost messages, and as a little joke when someone @mentions the bot and
     # asks for a good boy.
-    if fun.get("fun_goodboy", False):
+    if not mommy_handled and fun.get("fun_goodboy", False):
         is_system_boost = message.type in BOOST_TYPES
         content_lower = content.lower()
         is_beg = ("good boy" in content_lower or "goodboy" in content_lower) and bot.user in message.mentions
