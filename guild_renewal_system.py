@@ -630,6 +630,51 @@ def get_renewal_session(session_token, now=None):
         return None
 
 
+def static_renewal_links():
+    """Four dashboard lockers. Preferred over the create-link API."""
+    links = []
+    for step in range(1, CHECKPOINT_COUNT + 1):
+        url = (os.environ.get(f"LOOTLABS_RENEWAL_LINK_{step}") or "").strip()
+        links.append(url)
+    if all(url.startswith(("http://", "https://")) for url in links):
+        return links
+    blob = (os.environ.get("LOOTLABS_RENEWAL_LINKS") or "").strip()
+    if blob:
+        parts = [part.strip() for part in re.split(r"[\s,]+", blob) if part.strip()]
+        http_parts = [part for part in parts if part.startswith(("http://", "https://"))]
+        if len(http_parts) >= CHECKPOINT_COUNT:
+            return http_parts[:CHECKPOINT_COUNT]
+    return None
+
+
+def find_open_renewal_session_by_ip(client_ip, now=None):
+    if renewal_sessions_collection is None or not client_ip:
+        return None
+    now = time.time() if now is None else float(now)
+    return renewal_sessions_collection.find_one(
+        {
+            "ip": client_ip,
+            "completed": False,
+            "expires_at": {"$gt": now},
+        },
+        sort=[("created_at", -1)],
+    )
+
+
+def complete_static_renewal_step(step, client_ip, session_token=None, now=None):
+    """Finish a step after a static locker, using the cookie session or IP."""
+    now = time.time() if now is None else float(now)
+    session = get_renewal_session(session_token, now) if session_token else None
+    if not session:
+        session = find_open_renewal_session_by_ip(client_ip, now)
+    if not session:
+        raise ValueError("No renewal session found. Open the Discord link first.")
+    token = (session.get("step_tokens") or {}).get(str(int(step)), "")
+    result = complete_renewal_checkpoint(session["_id"], step, token, client_ip, now)
+    result["session_token"] = session["_id"]
+    return result
+
+
 def _lootlabs_settings():
     token = (os.environ.get("LOOTLABS_API_TOKEN") or "").strip()
     if token.lower().startswith("bearer "):
@@ -815,6 +860,38 @@ def start_renewal_checkpoint(session_token, client_ip, base_url=None, now=None):
     cached = (session.get("checkpoint_links") or {}).get(step_key)
     if cached:
         return cached, step
+
+    static_links = static_renewal_links()
+    if static_links:
+        loot_url = static_links[step - 1]
+        link_field = f"checkpoint_links.{step_key}"
+        started_field = f"checkpoint_started_at.{step_key}"
+        result = renewal_sessions_collection.update_one(
+            {
+                "_id": session_token,
+                "current_step": step,
+                "completed": False,
+                link_field: {"$exists": False},
+                "$or": [{"ip": None}, {"ip": client_ip}],
+            },
+            {
+                "$set": {
+                    link_field: loot_url,
+                    started_field: now,
+                    "ip": client_ip,
+                    "updated_at": now,
+                    "link_mode": "static",
+                }
+            },
+        )
+        if result.modified_count:
+            logger.info("Using static LootLabs locker for step=%s", step)
+            return loot_url, step
+        session = get_renewal_session(session_token, now)
+        winner = ((session or {}).get("checkpoint_links") or {}).get(step_key)
+        if winner and (not session.get("ip") or session.get("ip") == client_ip):
+            return winner, step
+        raise ValueError("Checkpoint state changed. Reload the renewal page.")
 
     api_token, tier_id, theme = _lootlabs_settings()
     completion_token = (session.get("step_tokens") or {}).get(step_key)
