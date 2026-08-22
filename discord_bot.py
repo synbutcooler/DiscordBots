@@ -1400,47 +1400,56 @@ class RenewalSettingsView(KsPanelView):
             interaction.user.id,
             interaction.guild.id,
         )
-        # First response MUST change the message so a click can never look dead.
         if not interaction.response.is_done():
             await interaction.response.edit_message(content="⏳ Starting renewal…")
 
+        async def _show(content, embed=None, view=None):
+            try:
+                await interaction.message.edit(content=content, embed=embed, view=view)
+                return
+            except Exception:
+                logger.exception("interaction.message.edit failed")
+            try:
+                await interaction.edit_original_response(
+                    content=content, embed=embed, view=view
+                )
+            except Exception:
+                logger.exception("edit_original_response failed")
+
         try:
-            session_token = await asyncio.to_thread(
-                create_or_get_renewal_session,
-                interaction.guild.id,
-                interaction.user.id,
+            session_token = await asyncio.wait_for(
+                asyncio.to_thread(
+                    create_or_get_renewal_session,
+                    interaction.guild.id,
+                    interaction.user.id,
+                ),
+                timeout=12,
             )
+        except asyncio.TimeoutError:
+            logger.error("create_or_get_renewal_session timed out")
+            await _show("❌ Timed out creating the session. Check MONGODB_URI on the bot.")
+            return
         except ValueError as exc:
             logger.warning("Start renewal rejected: %s", exc)
-            await interaction.edit_original_response(content=f"⏳ {exc}")
+            await _show(f"⏳ {exc}")
             return
         except Exception as exc:
             logger.exception("Failed to create renewal session")
-            await interaction.edit_original_response(
-                content=f"❌ Could not create a renewal session: {exc}"
-            )
+            await _show(f"❌ Could not create a renewal session: {exc}")
             return
 
         renewal_url = _public_renewal_url(session_token)
         logger.info("Renewal session ready url=%s", renewal_url)
-        embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
-        embed.description = (
-            "Open this page and complete all four LootLabs checkpoints.\n"
-            f"{renewal_url}"
+        embed = discord.Embed(
+            title="Service Renewal",
+            description=(
+                "Open this page and complete all four LootLabs checkpoints.\n"
+                f"{renewal_url}"
+            ),
+            color=discord.Color.gold(),
         )
-        try:
-            await interaction.edit_original_response(
-                content=f"✅ Session ready\n{renewal_url}",
-                embed=embed,
-                view=RenewalLinkView(renewal_url),
-            )
-        except Exception:
-            logger.exception("Link button rejected; sending URL only")
-            await interaction.edit_original_response(
-                content=f"✅ Session ready — open this:\n{renewal_url}",
-                embed=embed,
-                view=BackOnlyView(),
-            )
+        view = RenewalLinkView(renewal_url)
+        await _show(f"✅ Session ready\n{renewal_url}", embed=embed, view=view)
         self.stop()
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
