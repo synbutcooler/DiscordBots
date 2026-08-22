@@ -647,39 +647,76 @@ def _lootlabs_settings():
     return token, tier_id, theme
 
 
-def _lootlabs_error_text(data, status_code):
+def _extract_loot_url(data):
+    """Pull a locker URL out of the several shapes LootLabs returns."""
+    if data is None:
+        return None
+    if isinstance(data, str):
+        text = data.strip()
+        if text.startswith(("http://", "https://")):
+            return text
+        if text and " " not in text and 2 < len(text) < 80:
+            return f"https://loot-link.com/s?{text}"
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    for key in ("loot_url", "lootUrl", "locker_url", "short_url"):
+        value = data.get(key)
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            return value
+
+    short = data.get("short") or data.get("slug")
+    if isinstance(short, str) and short.strip():
+        short = short.strip()
+        if short.startswith(("http://", "https://")):
+            return short
+        return f"https://loot-link.com/s?{short}"
+
+    for key in ("message", "data", "result"):
+        nested = data.get(key)
+        if nested is not None and nested is not data:
+            found = _extract_loot_url(nested)
+            if found:
+                return found
+    return None
+
+
+def _lootlabs_error_text(data, status_code, body_text=""):
     if isinstance(data, dict):
-        message = data.get("message")
-        if isinstance(message, str) and message.strip():
-            return message.strip()[:220]
-        if isinstance(message, dict):
-            nested = message.get("error") or message.get("message") or ""
-            if nested:
-                return str(nested)[:220]
-        if data.get("error"):
-            return str(data.get("error"))[:220]
+        if data.get("type") == "error" or data.get("error"):
+            message = data.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()[:220]
+            if isinstance(message, dict):
+                nested = message.get("error") or message.get("message") or ""
+                if nested:
+                    return str(nested)[:220]
+            if data.get("error") and data.get("error") is not True:
+                return str(data.get("error"))[:220]
+        snippet = (body_text or "")[:220].strip()
+        if snippet:
+            return snippet
+    elif body_text:
+        return body_text[:220].strip()
     if status_code:
         return f"HTTP {status_code}"
     return "Unexpected LootLabs response"
 
 
 def _lootlabs_parse(response):
+    body_text = (response.text or "")[:800]
     try:
         data = response.json()
     except ValueError:
         data = None
-    loot_url = None
-    if isinstance(data, dict):
-        message = data.get("message")
-        if isinstance(message, dict):
-            loot_url = message.get("loot_url") or message.get("url")
+    loot_url = _extract_loot_url(data)
     ok = (
         response.status_code < 400
-        and isinstance(data, dict)
-        and data.get("type") != "error"
         and bool(loot_url)
+        and not (isinstance(data, dict) and data.get("type") == "error")
     )
-    return ok, loot_url, data, (response.text or "")[:800]
+    return ok, loot_url, data, body_text
 
 
 def _raise_lootlabs_failure(status_code, data, fallback):
@@ -689,8 +726,8 @@ def _raise_lootlabs_failure(status_code, data, fallback):
         )
     if status_code == 429:
         raise RuntimeError("LootLabs rate-limited the request. Wait a minute and try again.")
-    hint = _lootlabs_error_text(data, status_code) or fallback
-    lowered = hint.lower()
+    hint = _lootlabs_error_text(data, status_code, fallback) or fallback
+    lowered = str(hint).lower()
     if "creator" in lowered or ("mandatory" in lowered and "detail" in lowered):
         raise RuntimeError(
             "LootLabs needs your creator profile filled in (name + avatar image) before it can create links."
@@ -716,9 +753,7 @@ def _create_lootlabs_link(api_token, payload):
         logger.info("LootLabs POST status=%s body=%s", response.status_code, body_text)
         if ok:
             return loot_url, data
-        last_error = _lootlabs_error_text(data, response.status_code)
-        # 4xx is a rejected payload/auth. Retrying GET with the same fields
-        # will not fix it — surface LootLabs' body instead.
+        last_error = _lootlabs_error_text(data, response.status_code, body_text)
         if response.status_code:
             _raise_lootlabs_failure(response.status_code, data, last_error or body_text)
     except RuntimeError:
@@ -785,20 +820,31 @@ def start_renewal_checkpoint(session_token, client_ip, base_url=None, now=None):
     completion_token = (session.get("step_tokens") or {}).get(step_key)
     if not completion_token:
         raise RuntimeError("Renewal checkpoint token is missing.")
-    public_base = (base_url or SERVER_BASE_URL).rstrip("/")
+    public_base = (base_url or SERVER_BASE_URL or "").strip().rstrip("/")
+    if public_base.startswith("http://"):
+        public_base = "https://" + public_base[len("http://"):]
+    if not public_base.startswith("https://"):
+        public_base = "https://" + public_base.lstrip("/")
     completion_url = (
         f"{public_base}/ks/renew/complete/{session_token}/{step}/{completion_token}"
     )
     payload = {
-        "title": f"Renewal {step}/{CHECKPOINT_COUNT}"[:30],
+        "title": f"Checkpoint {step} of {CHECKPOINT_COUNT}"[:30],
         "url": completion_url,
         "tier_id": tier_id,
         "number_of_tasks": 1,
         "theme": theme,
     }
     thumbnail = (os.environ.get("LOOTLABS_RENEWAL_THUMBNAIL") or "").strip()
-    if thumbnail:
+    if thumbnail.startswith(("http://", "https://")):
         payload["thumbnail"] = thumbnail
+    logger.info(
+        "Creating LootLabs locker title=%r dest=%s tier=%s theme=%s",
+        payload["title"],
+        completion_url,
+        tier_id,
+        theme,
+    )
 
     loot_url, _data = _create_lootlabs_link(api_token, payload)
 
