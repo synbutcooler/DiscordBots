@@ -1400,8 +1400,10 @@ class RenewalSettingsView(KsPanelView):
             interaction.user.id,
             interaction.guild.id,
         )
+        # First response MUST change the message so a click can never look dead.
         if not interaction.response.is_done():
-            await interaction.response.defer()
+            await interaction.response.edit_message(content="⏳ Starting renewal…")
+
         try:
             session_token = await asyncio.to_thread(
                 create_or_get_renewal_session,
@@ -1409,35 +1411,35 @@ class RenewalSettingsView(KsPanelView):
                 interaction.user.id,
             )
         except ValueError as exc:
-            await _renewal_notice(interaction, f"⏳ {exc}")
+            logger.warning("Start renewal rejected: %s", exc)
+            await interaction.edit_original_response(content=f"⏳ {exc}")
             return
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to create renewal session")
-            await _renewal_notice(
-                interaction,
-                "❌ Could not create a renewal session. Check the bot logs and try `/ks setup` again.",
+            await interaction.edit_original_response(
+                content=f"❌ Could not create a renewal session: {exc}"
             )
             return
 
         renewal_url = _public_renewal_url(session_token)
+        logger.info("Renewal session ready url=%s", renewal_url)
         embed = await asyncio.to_thread(build_renewal_embed, interaction.guild)
         embed.description = (
-            "Your private renewal session is ready. Complete all four LootLabs "
-            "checkpoints. The session expires in six hours."
+            "Open this page and complete all four LootLabs checkpoints.\n"
+            f"{renewal_url}"
         )
-        embed.add_field(name="Renewal page", value=renewal_url, inline=False)
-        view = RenewalLinkView(renewal_url)
         try:
             await interaction.edit_original_response(
-                content="✅ Session ready — use the button or the link below.",
+                content=f"✅ Session ready\n{renewal_url}",
                 embed=embed,
-                view=view,
+                view=RenewalLinkView(renewal_url),
             )
         except Exception:
-            logger.exception("Failed to attach renewal link view for %s", renewal_url)
-            await interaction.followup.send(
-                f"✅ Session ready. Open this page:\n{renewal_url}",
-                ephemeral=True,
+            logger.exception("Link button rejected; sending URL only")
+            await interaction.edit_original_response(
+                content=f"✅ Session ready — open this:\n{renewal_url}",
+                embed=embed,
+                view=BackOnlyView(),
             )
         self.stop()
 
