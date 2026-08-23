@@ -12,14 +12,16 @@ logger = logging.getLogger(__name__)
 MONGODB_URI = os.environ.get("MONGODB_URI")
 
 settings_collection = None
+# Warm cache so /fun buttons can ACK Discord within 3s even if Mongo is slow.
+_SETTINGS_CACHE = {}
 
 if MONGODB_URI:
     try:
         _client = MongoClient(
             MONGODB_URI,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=5000,
-            socketTimeoutMS=10000,
+            serverSelectionTimeoutMS=1500,
+            connectTimeoutMS=1500,
+            socketTimeoutMS=2000,
         )
         _db = _client["vadrifts_bots"]
         settings_collection = _db["server_settings"]
@@ -39,24 +41,42 @@ DEFAULTS = {
 }
 
 
+def peek_settings(guild_id) -> dict:
+    """Never hits Mongo. Cache if warm, otherwise defaults."""
+    cached = _SETTINGS_CACHE.get(str(guild_id))
+    return dict(cached) if cached is not None else dict(DEFAULTS)
+
+
+def apply_settings_local(guild_id, updates: dict) -> dict:
+    """Optimistic in-memory write so the UI can ACK before Mongo finishes."""
+    merged = peek_settings(guild_id)
+    merged.update(updates)
+    _SETTINGS_CACHE[str(guild_id)] = merged
+    return dict(merged)
+
+
 def get_settings(guild_id) -> dict:
+    cached = _SETTINGS_CACHE.get(str(guild_id))
     if settings_collection is None:
-        return dict(DEFAULTS)
+        return dict(cached) if cached is not None else dict(DEFAULTS)
     try:
         doc = settings_collection.find_one({"guild_id": str(guild_id)})
     except Exception as e:
         logger.error(f"Failed to load settings for {guild_id}: {e}")
-        return dict(DEFAULTS)
+        return dict(cached) if cached is not None else dict(DEFAULTS)
     if not doc:
-        return dict(DEFAULTS)
-    merged = dict(DEFAULTS)
-    for k in DEFAULTS:
-        if k in doc:
-            merged[k] = doc[k]
-    return merged
+        merged = dict(DEFAULTS)
+    else:
+        merged = dict(DEFAULTS)
+        for k in DEFAULTS:
+            if k in doc:
+                merged[k] = doc[k]
+    _SETTINGS_CACHE[str(guild_id)] = merged
+    return dict(merged)
 
 
 def update_settings(guild_id, updates: dict):
+    apply_settings_local(guild_id, updates)
     if settings_collection is None:
         return False
     try:
