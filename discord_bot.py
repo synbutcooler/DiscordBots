@@ -174,24 +174,50 @@ def request_mommy_reply(display_name, prompt, history):
     )
     contents.append({"role": "user", "parts": [{"text": text}]})
 
+    models = []
+    configured_model = (GEMINI_MODEL or "").strip().strip("\"'")
+    if configured_model.startswith("models/"):
+        configured_model = configured_model[7:]
+    for model in (
+        configured_model,
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash-lite",
+    ):
+        if model and model not in models:
+            models.append(model)
+
+    payload = {
+        "system_instruction": {"parts": [{"text": MOMMY_SYSTEM_PROMPT}]},
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.95,
+            "topP": 0.95,
+            "maxOutputTokens": 240,
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+    response = None
+    selected_model = None
+
     try:
-        response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_API_KEY,
-            },
-            json={
-                "system_instruction": {"parts": [{"text": MOMMY_SYSTEM_PROMPT}]},
-                "contents": contents,
-                "generationConfig": {
-                    "temperature": 0.95,
-                    "topP": 0.95,
-                    "maxOutputTokens": 240,
-                },
-            },
-            timeout=25,
-        )
+        for model in models:
+            candidate = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers=headers,
+                json=payload,
+                timeout=25,
+            )
+            if candidate.status_code != 404:
+                response = candidate
+                selected_model = model
+                break
+            logger.warning("Gemini model unavailable: %s", model)
+        if response is None:
+            response = candidate
     except requests.Timeout as exc:
         raise GeminiMommyError("i took too long to think... try again in a sec [sad]") from exc
     except requests.RequestException as exc:
@@ -204,11 +230,13 @@ def request_mommy_reply(display_name, prompt, history):
         logger.error("Gemini rejected the API key: HTTP %s", response.status_code)
         raise GeminiMommyError("my Gemini key isn't working... tell an admin [sad]")
     if response.status_code == 404:
-        logger.error("Gemini model was not found: %s", GEMINI_MODEL)
-        raise GeminiMommyError("my Gemini model went missing... tell an admin [sad]")
+        logger.error("No configured Gemini model was available: %s", ", ".join(models))
+        raise GeminiMommyError("all my Gemini models went missing... tell an admin [sad]")
     if not response.ok:
         logger.warning("Gemini returned HTTP %s: %.500s", response.status_code, response.text)
         raise GeminiMommyError("my brain glitched... try again soon [sad]")
+    if selected_model != configured_model:
+        logger.info("Gemini fell back from %s to %s", configured_model, selected_model)
 
     try:
         data = response.json()
