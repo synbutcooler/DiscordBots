@@ -35,6 +35,7 @@ DEFAULTS = {
     # Fun features (per-guild toggles, configured via /fun).
     "fun_meow": True,       # bot replies to all-"meow" messages (on by default)
     "fun_goodboy": False,   # says "good boy" after a boost (off by default)
+    "fun_mommy": False,     # Gemini mommy persona (owner guild only)
 }
 
 
