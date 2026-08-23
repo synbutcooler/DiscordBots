@@ -33,7 +33,7 @@ from guild_key_system import (
 )
 from server_settings import (
     get_settings, update_settings, antispam_active,
-    peek_settings, apply_settings_local,
+    peek_settings, apply_settings_local, warmup_settings,
 )
 from guild_renewal_system import (
     GRACE_PERIOD_SECONDS,
@@ -2293,10 +2293,12 @@ class AntiSpamChannelSelect(discord.ui.ChannelSelect):
             return
         await interaction.response.defer(ephemeral=True)
         channels = [str(c.id) for c in self.values]
-        update_settings(interaction.guild.id, {
+        payload = {
             "antispam_enabled": True,
             "antispam_channels": channels,
-        })
+        }
+        apply_settings_local(interaction.guild.id, payload)
+        asyncio.create_task(asyncio.to_thread(update_settings, interaction.guild.id, payload))
         view = AntiSpamView()
         if channels:
             msg = ("🛡️ **Applied instantly.** Protection is now ON for the "
@@ -2319,8 +2321,9 @@ class AntiSpamView(discord.ui.View):
             await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        update_settings(interaction.guild.id, {
-            "antispam_enabled": True, "antispam_channels": []})
+        payload = {"antispam_enabled": True, "antispam_channels": []}
+        apply_settings_local(interaction.guild.id, payload)
+        asyncio.create_task(asyncio.to_thread(update_settings, interaction.guild.id, payload))
         view = AntiSpamView()
         await interaction.followup.edit_message(
             interaction.message.id,
@@ -2333,7 +2336,9 @@ class AntiSpamView(discord.ui.View):
             await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        update_settings(interaction.guild.id, {"antispam_enabled": False})
+        payload = {"antispam_enabled": False}
+        apply_settings_local(interaction.guild.id, payload)
+        asyncio.create_task(asyncio.to_thread(update_settings, interaction.guild.id, payload))
         view = AntiSpamView()
         await interaction.followup.edit_message(
             interaction.message.id,
@@ -2342,7 +2347,7 @@ class AntiSpamView(discord.ui.View):
 
 
 def build_antispam_embed(guild):
-    s = get_settings(guild.id)
+    s = peek_settings(guild.id)
     enabled = s.get("antispam_enabled", False)
     channels = s.get("antispam_channels") or []
     if not enabled:
@@ -2500,13 +2505,14 @@ def _apply_fun_button_labels(view, settings):
 @bot.tree.command(name="fun", description="Toggle the bot's fun little features.")
 @app_commands.checks.has_permissions(administrator=True)
 async def fun_setup(interaction: discord.Interaction):
+    # ACK first. Anything before this can trip Discord's 3s timeout.
+    await interaction.response.defer(ephemeral=True)
     view = FunView(interaction.guild)
     s = peek_settings(interaction.guild.id)
     _apply_fun_button_labels(view, s)
-    await interaction.response.send_message(
+    await interaction.edit_original_response(
         embed=build_fun_embed(interaction.guild, settings=s),
         view=view,
-        ephemeral=True,
     )
 
     async def _refresh_from_mongo():
@@ -2689,7 +2695,7 @@ async def on_message(message):
                 return
 
     content = message.content or ""
-    fun = get_settings(message.guild.id)
+    fun = peek_settings(message.guild.id)
 
     mommy_handled = False
     if is_owner_guild(message.guild.id) and fun.get("fun_mommy", False):
@@ -2834,17 +2840,26 @@ async def on_ready():
         renewal_email_reminder_loop.start()
 
     try:
-        await asyncio.to_thread(get_settings, OWNER_GUILD_ID)
+        guild_ids = [g.id for g in bot.guilds]
+        if OWNER_GUILD_ID not in guild_ids:
+            guild_ids.append(OWNER_GUILD_ID)
+        await asyncio.to_thread(warmup_settings, guild_ids)
     except Exception:
-        logger.exception("Failed to prefetch owner-guild settings")
+        logger.exception("Failed to prefetch guild settings")
 
-    expired = cleanup_expired()
-    if expired > 0:
-        print(f"Cleaned up {expired} expired premium keys")
+    try:
+        expired = await asyncio.to_thread(cleanup_expired)
+        if expired > 0:
+            print(f"Cleaned up {expired} expired premium keys")
+    except Exception:
+        logger.exception("Premium key cleanup failed")
 
-    guild_expired = cleanup_expired_guild_keys()
-    if guild_expired > 0:
-        print(f"Cleaned up {guild_expired} expired guild keys")
+    try:
+        guild_expired = await asyncio.to_thread(cleanup_expired_guild_keys)
+        if guild_expired > 0:
+            print(f"Cleaned up {guild_expired} expired guild keys")
+    except Exception:
+        logger.exception("Guild key cleanup failed")
 
     try:
         await asyncio.sleep(5)
