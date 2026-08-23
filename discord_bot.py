@@ -33,6 +33,7 @@ from guild_key_system import (
 )
 from server_settings import (
     get_settings, update_settings, antispam_active,
+    peek_settings, apply_settings_local,
 )
 from guild_renewal_system import (
     GRACE_PERIOD_SECONDS,
@@ -2323,19 +2324,21 @@ class FunView(discord.ui.View):
                     ephemeral=True,
                 )
                 return False
-        s = get_settings(interaction.guild.id)
+        # Never block the 3s Discord ACK on Mongo. Flip cache + UI first.
+        s = peek_settings(interaction.guild.id)
         new_val = not s.get(key, default)
-        update_settings(interaction.guild.id, {key: new_val})
+        local = apply_settings_local(interaction.guild.id, {key: new_val})
         button.label = f"{label}: {'ON' if new_val else 'OFF'}"
         button.style = discord.ButtonStyle.success if new_val else discord.ButtonStyle.secondary
-        # Edit the original component message via the interaction token.
+        # interaction.response.edit_message uses the interaction token.
         # followup.edit_message() hits Discord's webhook host and was getting
         # Cloudflare 429 HTML instead of a JSON API response.
         await interaction.response.edit_message(
             content=f"{emoji} {on_text if new_val else off_text}",
-            embed=build_fun_embed(interaction.guild),
+            embed=build_fun_embed(interaction.guild, settings=local),
             view=self,
         )
+        asyncio.create_task(asyncio.to_thread(update_settings, interaction.guild.id, {key: new_val}))
         return True
 
     @discord.ui.button(label="Meow: ON", style=discord.ButtonStyle.success, emoji="🐱", custom_id="fun_meow")
@@ -2366,8 +2369,8 @@ class FunView(discord.ui.View):
         )
 
 
-def build_fun_embed(guild):
-    s = get_settings(guild.id)
+def build_fun_embed(guild, settings=None):
+    s = settings if settings is not None else peek_settings(guild.id)
     meow = s.get("fun_meow", True)
     goodboy = s.get("fun_goodboy", False)
     mommy = s.get("fun_mommy", False) if is_owner_guild(guild.id) else False
@@ -2406,20 +2409,43 @@ def build_fun_embed(guild):
 
 @bot.tree.command(name="fun", description="Toggle the bot's fun little features.")
 @app_commands.checks.has_permissions(administrator=True)
-async def fun_setup(interaction: discord.Interaction):
-    view = FunView(interaction.guild)
-    s = get_settings(interaction.guild.id)
-    meow = s.get("fun_meow", True)
-    goodboy = s.get("fun_goodboy", False)
+def _apply_fun_button_labels(view, settings):
+    meow = settings.get("fun_meow", True)
+    goodboy = settings.get("fun_goodboy", False)
     view.toggle_meow.label = f"Meow: {'ON' if meow else 'OFF'}"
     view.toggle_meow.style = discord.ButtonStyle.success if meow else discord.ButtonStyle.secondary
     view.toggle_goodboy.label = f"Good boy: {'ON' if goodboy else 'OFF'}"
     view.toggle_goodboy.style = discord.ButtonStyle.success if goodboy else discord.ButtonStyle.secondary
     if view.show_mommy:
-        mommy = s.get("fun_mommy", False)
+        mommy = settings.get("fun_mommy", False)
         view.toggle_mommy.label = f"Mommy AI: {'ON' if mommy else 'OFF'}"
         view.toggle_mommy.style = discord.ButtonStyle.success if mommy else discord.ButtonStyle.secondary
-    await interaction.response.send_message(embed=build_fun_embed(interaction.guild), view=view, ephemeral=True)
+
+
+async def fun_setup(interaction: discord.Interaction):
+    view = FunView(interaction.guild)
+    s = peek_settings(interaction.guild.id)
+    _apply_fun_button_labels(view, s)
+    await interaction.response.send_message(
+        embed=build_fun_embed(interaction.guild, settings=s),
+        view=view,
+        ephemeral=True,
+    )
+
+    async def _refresh_from_mongo():
+        fresh = await asyncio.to_thread(get_settings, interaction.guild.id)
+        if fresh == s:
+            return
+        _apply_fun_button_labels(view, fresh)
+        try:
+            await interaction.edit_original_response(
+                embed=build_fun_embed(interaction.guild, settings=fresh),
+                view=view,
+            )
+        except discord.HTTPException:
+            pass
+
+    asyncio.create_task(_refresh_from_mongo())
 
 
 @bot.tree.command(
@@ -2435,7 +2461,7 @@ async def mommy_command(interaction: discord.Interaction, prompt: str):
         )
         return
 
-    settings = get_settings(interaction.guild.id)
+    settings = peek_settings(interaction.guild.id)
     if not settings.get("fun_mommy", False):
         await interaction.response.send_message(
             "Mommy AI is off. An admin can enable it with `/fun`.",
@@ -2729,6 +2755,11 @@ async def on_ready():
     print(f'Main bot logged in as {bot.user}')
     if not renewal_email_reminder_loop.is_running():
         renewal_email_reminder_loop.start()
+
+    try:
+        await asyncio.to_thread(get_settings, OWNER_GUILD_ID)
+    except Exception:
+        logger.exception("Failed to prefetch owner-guild settings")
 
     expired = cleanup_expired()
     if expired > 0:
