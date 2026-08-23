@@ -2484,8 +2484,6 @@ def build_fun_embed(guild, settings=None):
     return embed
 
 
-@bot.tree.command(name="fun", description="Toggle the bot's fun little features.")
-@app_commands.checks.has_permissions(administrator=True)
 def _apply_fun_button_labels(view, settings):
     meow = settings.get("fun_meow", True)
     goodboy = settings.get("fun_goodboy", False)
@@ -2499,6 +2497,8 @@ def _apply_fun_button_labels(view, settings):
         view.toggle_mommy.style = discord.ButtonStyle.success if mommy else discord.ButtonStyle.secondary
 
 
+@bot.tree.command(name="fun", description="Toggle the bot's fun little features.")
+@app_commands.checks.has_permissions(administrator=True)
 async def fun_setup(interaction: discord.Interaction):
     view = FunView(interaction.guild)
     s = peek_settings(interaction.guild.id)
