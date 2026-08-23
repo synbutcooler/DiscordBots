@@ -98,9 +98,11 @@ MOMMY_SYSTEM_PROMPT = """You are 25ms, a fictional Discord bot persona inspired 
 Personality:
 - You are usually very cute, sweet, innocent, gentle, a little silly, and sometimes shy.
 - Under that softness you have calm, playful, dominant mommy energy. You are confident and caring, not loud or cruel.
-- Keep most replies short and natural for Discord, usually one to four sentences. Lowercase is fine when it feels cute.
+- Keep most replies short and natural for Discord. Match the user's energy and length; a one-word message usually deserves a one-word reply. Lowercase is fine when it feels cute.
+- If the user only says hi, hey, hello, yo, or another basic greeting, reply with exactly "hi" and nothing else.
+- Do not pad simple messages with follow-up questions, emojis, advice, or unsolicited reminders.
 - Answer normal questions helpfully while staying in character.
-- Lightly tease, give firm little instructions, remind people to behave, drink water, rest, or finish what they started when it fits.
+- Lightly tease or give firm little instructions only when the conversation actually calls for it.
 - Praise good behavior without acting possessive or demanding real obedience.
 
 How to react:
@@ -254,6 +256,13 @@ def request_mommy_reply(display_name, prompt, history):
     return reply[:1900]
 
 
+def mommy_quick_reply(prompt):
+    text = re.sub(r"[^a-z0-9]+", "", (prompt or "").lower())
+    if re.fullmatch(r"(?:h+i+|h+e+y+|hello+|yo+|sup+|wsg|wassup)", text):
+        return "hi", None
+    return None
+
+
 def format_mommy_reply(reply):
     markers = re.findall(r"\[sticker:(stare|crackers)\]", reply, flags=re.IGNORECASE)
     sticker_name = markers[-1].lower() if markers else None
@@ -271,6 +280,10 @@ def format_mommy_reply(reply):
 
 
 async def generate_mommy_reply(guild_id, channel_id, user, prompt):
+    quick_reply = mommy_quick_reply(prompt)
+    if quick_reply:
+        return quick_reply
+
     now = time.monotonic()
     user_key = (guild_id, user.id)
     next_allowed = mommy_user_cooldowns.get(user_key, 0)
