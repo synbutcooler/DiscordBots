@@ -32,7 +32,7 @@ from guild_key_system import (
     SERVER_BASE_URL
 )
 from server_settings import (
-    get_settings, update_settings, antispam_active,
+    get_settings, update_settings,
 )
 from guild_renewal_system import (
     GRACE_PERIOD_SECONDS,
@@ -2303,37 +2303,72 @@ class FunView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
 
+    async def _toggle(self, interaction, key, default, message):
+        await interaction.response.defer(ephemeral=True)
+        settings = await asyncio.to_thread(get_settings, interaction.guild.id)
+        new_value = not settings.get(key, default)
+        saved = await asyncio.to_thread(
+            update_settings, interaction.guild.id, {key: new_value}
+        )
+        if not saved:
+            await interaction.edit_original_response(
+                content="❌ I couldn't save that setting. Check the MongoDB connection.",
+                embed=build_fun_embed(interaction.guild, settings),
+                view=make_fun_view(settings),
+            )
+            self.stop()
+            return
+        settings[key] = new_value
+        await interaction.edit_original_response(
+            content=message(new_value),
+            embed=build_fun_embed(interaction.guild, settings),
+            view=make_fun_view(settings),
+        )
+        self.stop()
+
+    async def on_error(self, interaction, error, item):
+        logger.error(
+            "FunView failed on %s",
+            getattr(item, "custom_id", item),
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ That button failed. Check the bot logs for the full error.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ That button failed. Check the bot logs for the full error.",
+                    ephemeral=True,
+                )
+        except Exception:
+            pass
+
     @discord.ui.button(label="Meow: ON", style=discord.ButtonStyle.success, emoji="🐱", custom_id="fun_meow")
     async def toggle_meow(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
-        s = get_settings(interaction.guild.id)
-        new_val = not s.get("fun_meow", True)
-        update_settings(interaction.guild.id, {"fun_meow": new_val})
-        button.label = f"Meow: {'ON' if new_val else 'OFF'}"
-        button.style = discord.ButtonStyle.success if new_val else discord.ButtonStyle.secondary
-        await interaction.followup.edit_message(
-            interaction.message.id,
-            content=f"🐱 Meow replies {'enabled' if new_val else 'disabled'}.",
-            embed=build_fun_embed(interaction.guild), view=self)
+        await self._toggle(
+            interaction,
+            "fun_meow",
+            True,
+            lambda value: f"🐱 Meow replies {'enabled' if value else 'disabled'}.",
+        )
 
     @discord.ui.button(label="Good boy: OFF", style=discord.ButtonStyle.secondary, emoji="🐶", custom_id="fun_goodboy")
     async def toggle_goodboy(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
-        s = get_settings(interaction.guild.id)
-        new_val = not s.get("fun_goodboy", False)
-        update_settings(interaction.guild.id, {"fun_goodboy": new_val})
-        button.label = f"Good boy: {'ON' if new_val else 'OFF'}"
-        button.style = discord.ButtonStyle.success if new_val else discord.ButtonStyle.secondary
-        await interaction.followup.edit_message(
-            interaction.message.id,
-            content=f"🐶 Good-boy boosts {'enabled' if new_val else 'disabled'}.",
-            embed=build_fun_embed(interaction.guild), view=self)
+        await self._toggle(
+            interaction,
+            "fun_goodboy",
+            False,
+            lambda value: f"🐶 Good-boy boosts {'enabled' if value else 'disabled'}.",
+        )
 
     @discord.ui.button(label="Mommy AI: OFF", style=discord.ButtonStyle.secondary, emoji="👑", custom_id="fun_mommy")
     async def toggle_mommy(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2346,24 +2381,35 @@ class FunView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        await interaction.response.defer(ephemeral=True)
-        s = get_settings(interaction.guild.id)
-        new_val = not s.get("fun_mommy", False)
-        update_settings(interaction.guild.id, {"fun_mommy": new_val})
-        button.label = f"Mommy AI: {'ON' if new_val else 'OFF'}"
-        button.style = discord.ButtonStyle.success if new_val else discord.ButtonStyle.secondary
-        await interaction.followup.edit_message(
-            interaction.message.id,
-            content=(f"👑 Mommy AI {'enabled' if new_val else 'disabled'}. "
-                     "Mention the bot, reply to it, or use `/mommy` to chat."),
-            embed=build_fun_embed(interaction.guild), view=self)
+        await self._toggle(
+            interaction,
+            "fun_mommy",
+            False,
+            lambda value: (
+                f"👑 Mommy AI {'enabled' if value else 'disabled'}. "
+                "Mention the bot, reply to it, or use `/mommy` to chat."
+            ),
+        )
 
 
-def build_fun_embed(guild):
-    s = get_settings(guild.id)
-    meow = s.get("fun_meow", True)
-    goodboy = s.get("fun_goodboy", False)
-    mommy = s.get("fun_mommy", False)
+def make_fun_view(settings):
+    view = FunView()
+    meow = settings.get("fun_meow", True)
+    goodboy = settings.get("fun_goodboy", False)
+    mommy = settings.get("fun_mommy", False)
+    view.toggle_meow.label = f"Meow: {'ON' if meow else 'OFF'}"
+    view.toggle_meow.style = discord.ButtonStyle.success if meow else discord.ButtonStyle.secondary
+    view.toggle_goodboy.label = f"Good boy: {'ON' if goodboy else 'OFF'}"
+    view.toggle_goodboy.style = discord.ButtonStyle.success if goodboy else discord.ButtonStyle.secondary
+    view.toggle_mommy.label = f"Mommy AI: {'ON' if mommy else 'OFF'}"
+    view.toggle_mommy.style = discord.ButtonStyle.success if mommy else discord.ButtonStyle.secondary
+    return view
+
+
+def build_fun_embed(guild, settings):
+    meow = settings.get("fun_meow", True)
+    goodboy = settings.get("fun_goodboy", False)
+    mommy = settings.get("fun_mommy", False)
     embed = discord.Embed(title="🎉 Fun Features", color=discord.Color.blurple())
     embed.add_field(
         name=f"🐱 Meow replies — {'ON' if meow else 'OFF'}",
@@ -2399,18 +2445,12 @@ def build_fun_embed(guild):
 @bot.tree.command(name="fun", description="Toggle the bot's fun little features.")
 @app_commands.checks.has_permissions(administrator=True)
 async def fun_setup(interaction: discord.Interaction):
-    view = FunView()
-    s = get_settings(interaction.guild.id)
-    meow = s.get("fun_meow", True)
-    goodboy = s.get("fun_goodboy", False)
-    mommy = s.get("fun_mommy", False)
-    view.toggle_meow.label = f"Meow: {'ON' if meow else 'OFF'}"
-    view.toggle_meow.style = discord.ButtonStyle.success if meow else discord.ButtonStyle.secondary
-    view.toggle_goodboy.label = f"Good boy: {'ON' if goodboy else 'OFF'}"
-    view.toggle_goodboy.style = discord.ButtonStyle.success if goodboy else discord.ButtonStyle.secondary
-    view.toggle_mommy.label = f"Mommy AI: {'ON' if mommy else 'OFF'}"
-    view.toggle_mommy.style = discord.ButtonStyle.success if mommy else discord.ButtonStyle.secondary
-    await interaction.response.send_message(embed=build_fun_embed(interaction.guild), view=view, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    settings = await asyncio.to_thread(get_settings, interaction.guild.id)
+    await interaction.edit_original_response(
+        embed=build_fun_embed(interaction.guild, settings),
+        view=make_fun_view(settings),
+    )
 
 
 @bot.tree.command(name="mommy", description="Talk to 25ms's cute, sweet, quietly bossy AI persona.")
@@ -2422,15 +2462,14 @@ async def mommy_command(interaction: discord.Interaction, prompt: str):
         )
         return
 
-    settings = get_settings(interaction.guild.id)
+    await interaction.response.defer()
+    settings = await asyncio.to_thread(get_settings, interaction.guild.id)
     if not settings.get("fun_mommy", False):
-        await interaction.response.send_message(
-            "Mommy AI is off in this server. An admin can enable it with `/fun`.",
-            ephemeral=True,
+        await interaction.edit_original_response(
+            content="Mommy AI is off in this server. An admin can enable it with `/fun`."
         )
         return
 
-    await interaction.response.defer()
     try:
         reply, sticker_name = await generate_mommy_reply(
             interaction.guild.id,
@@ -2439,18 +2478,18 @@ async def mommy_command(interaction: discord.Interaction, prompt: str):
             prompt,
         )
     except MommyCooldownError as exc:
-        await interaction.followup.send(
-            f"Easy, darling. Try again in {exc.retry_after}s.", ephemeral=True
+        await interaction.edit_original_response(
+            content=f"Easy, darling. Try again in {exc.retry_after}s."
         )
         return
     except GeminiMommyError as exc:
         error_reply, _ = format_mommy_reply(str(exc))
-        await interaction.followup.send(error_reply, ephemeral=True)
+        await interaction.edit_original_response(content=error_reply)
         return
     except Exception:
         logger.exception("Unexpected Mommy AI slash-command failure")
-        await interaction.followup.send(
-            "Mommy AI tripped over something. Try again shortly.", ephemeral=True
+        await interaction.edit_original_response(
+            content="Mommy AI tripped over something. Try again shortly."
         )
         return
 
@@ -2516,8 +2555,13 @@ async def on_message(message):
     # If a message has attachments/links BUT also real text (not just emojis),
     # it's almost certainly legit — leave it alone. Scam posts are typically
     # attachments with no caption or just emoji gibberish.
+    fun = await asyncio.to_thread(get_settings, message.guild.id)
     owner_protected = is_owner_guild(message.guild.id) and message.channel.id in MONITORED_CHANNELS
-    if owner_protected or antispam_active(message.guild.id, message.channel.id):
+    antispam_channels = fun.get("antispam_channels") or []
+    configured_protected = fun.get("antispam_enabled", False) and (
+        not antispam_channels or str(message.channel.id) in {str(c) for c in antispam_channels}
+    )
+    if owner_protected or configured_protected:
         link_count = len(URL_PATTERN.findall(message.content or ""))
         attachment_count = len(message.attachments)
 
@@ -2573,7 +2617,6 @@ async def on_message(message):
                 return
 
     content = message.content or ""
-    fun = get_settings(message.guild.id)
 
     mommy_handled = False
     if fun.get("fun_mommy", False):
