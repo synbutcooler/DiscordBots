@@ -86,7 +86,14 @@ intents.message_content = True
 intents.members = True
 intents.presences = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# members intent would otherwise chunk every guild before on_ready, which
+# freezes slash-command ACKs on Render (and print() is buffered there).
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    chunk_guilds_at_startup=False,
+    max_messages=200,
+)
 
 recent_boosts = {}
 pending_tasks = {}
@@ -2582,9 +2589,10 @@ async def mommy_command(interaction: discord.Interaction, prompt: str):
 @bot.tree.command(name="antispam", description="Configure anti-scam link/attachment protection.")
 @app_commands.checks.has_permissions(administrator=True)
 async def antispam_setup(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     view = AntiSpamView()
-    await interaction.response.send_message(
-        embed=build_antispam_embed(interaction.guild), view=view, ephemeral=True)
+    await interaction.edit_original_response(
+        embed=build_antispam_embed(interaction.guild), view=view)
 
 
 @bot.event
@@ -2834,35 +2842,66 @@ async def before_renewal_email_reminder_loop():
 
 
 @bot.event
+async def on_connect():
+    logger.info("Main bot connected to Discord gateway")
+
+
+@bot.event
 async def on_ready():
-    print(f'Main bot logged in as {bot.user}')
+    logger.info("Main bot logged in as %s (guilds=%s)", bot.user, len(bot.guilds))
     if not renewal_email_reminder_loop.is_running():
         renewal_email_reminder_loop.start()
+    task = getattr(bot, "_startup_task", None)
+    if task is None or task.done():
+        bot._startup_task = asyncio.create_task(_post_ready_startup())
 
+
+@bot.listen("on_interaction")
+async def log_slash_interactions(interaction: discord.Interaction):
+    if interaction.type is discord.InteractionType.application_command:
+        name = getattr(interaction.command, "qualified_name", None) or "unknown"
+        logger.info("Slash /%s from %s in guild %s", name, interaction.user.id, interaction.guild_id)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    logger.exception("App command error: %s", error)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("Something broke. Try again in a sec.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Something broke. Try again in a sec.", ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+async def _post_ready_startup():
     try:
         guild_ids = [g.id for g in bot.guilds]
         if OWNER_GUILD_ID not in guild_ids:
             guild_ids.append(OWNER_GUILD_ID)
-        await asyncio.to_thread(warmup_settings, guild_ids)
+        warmed = await asyncio.to_thread(warmup_settings, guild_ids)
+        logger.info("Warmed settings cache for %s guilds", warmed)
     except Exception:
         logger.exception("Failed to prefetch guild settings")
 
     try:
         expired = await asyncio.to_thread(cleanup_expired)
-        if expired > 0:
-            print(f"Cleaned up {expired} expired premium keys")
+        if expired:
+            logger.info("Cleaned up %s expired premium keys", expired)
     except Exception:
         logger.exception("Premium key cleanup failed")
 
     try:
         guild_expired = await asyncio.to_thread(cleanup_expired_guild_keys)
-        if guild_expired > 0:
-            print(f"Cleaned up {guild_expired} expired guild keys")
+        if guild_expired:
+            logger.info("Cleaned up %s expired guild keys", guild_expired)
     except Exception:
         logger.exception("Guild key cleanup failed")
 
     try:
-        await asyncio.sleep(5)
+        await asyncio.sleep(8)
+
         def _is_global(cmd):
             gids = getattr(cmd, "guild_ids", None)
             return not gids
@@ -2872,7 +2911,8 @@ async def on_ready():
         stale_global = [c["id"] for c in current_global if c["name"] not in desired_global]
         for cmd_id in stale_global:
             await bot.http.delete_global_command(bot.user.id, cmd_id)
-            print(f"Deleted stale global command {cmd_id}")
+            logger.info("Deleted stale global command %s", cmd_id)
+
         owner_guild = discord.Object(id=OWNER_GUILD_ID)
         legacy_names = {
             c.name for c in bot.tree.get_commands(guild=owner_guild)
@@ -2882,28 +2922,32 @@ async def on_ready():
         stale_owner = [c["id"] for c in current_owner if c["name"] not in legacy_names]
         for cmd_id in stale_owner:
             await bot.http.delete_guild_command(bot.user.id, OWNER_GUILD_ID, cmd_id)
-            print(f"Deleted stale/duplicate owner-guild command {cmd_id}")
+            logger.info("Deleted stale/duplicate owner-guild command %s", cmd_id)
 
         global_synced = await bot.tree.sync()
-        print(f"Synced {len(global_synced)} global commands (removed {len(stale_global)} stale)")
+        logger.info("Synced %s global commands (removed %s stale)", len(global_synced), len(stale_global))
 
         synced = await bot.tree.sync(guild=owner_guild)
-        print(f"Synced {len(synced)} legacy commands to owner guild (removed {len(stale_owner)} stale/duplicate)")
-
+        logger.info(
+            "Synced %s owner-guild commands (removed %s stale/duplicate)",
+            len(synced),
+            len(stale_owner),
+        )
     except discord.HTTPException as e:
         if e.status == 429:
-            print("Rate limited - commands already synced, skipping")
+            logger.warning("Rate limited during command sync, skipping")
         else:
-            print(f"Command sync error: {e}")
-    except Exception as e:
-        print(f"Command sync failed: {e}")
+            logger.exception("Command sync error: %s", e)
+    except Exception:
+        logger.exception("Command sync failed")
 
 
 def start_bot():
     try:
+        logger.info("Main bot event loop starting")
         bot.run(DISCORD_TOKEN)
-    except Exception as e:
-        print(f"Main bot error: {e}")
+    except Exception:
+        logger.exception("Main bot crashed")
 
 
 if __name__ == "__main__":
