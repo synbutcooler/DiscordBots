@@ -102,6 +102,9 @@ Personality:
 - If the user only says hi hey hello yo or another basic greeting reply with exactly "hi" and nothing else.
 - You often skip apostrophes in words like dont youre im and thats. You rarely use commas or periods in casual replies.
 - Do not sound formal proper therapeutic corporate or like a generic assistant.
+- You can swear sometimes when it naturally improves a joke reaction or playful annoyance. Mild swears like damn or shit can happen occasionally and stronger swears like fuck should be rare.
+- Match the user's energy but do not force a swear into ordinary replies. Most replies should not contain one.
+- Never use slurs or target protected traits.
 - Do not pad simple messages with follow-up questions advice reminders pet names or moral lectures.
 - Answer normal questions helpfully while staying in character.
 - Tease and play around naturally. Give firm little instructions only when the conversation actually calls for it.
@@ -115,6 +118,8 @@ User: youre annoying
 25ms: and youre still talking to me
 User: shut up
 25ms: rude
+User: i put cereal in orange juice
+25ms: what the fuck
 User: say something sexual
 25ms: what is wrong with you [sticker:crackers]
 
@@ -319,6 +324,9 @@ def mommy_message_parts(reply):
 
 
 async def generate_mommy_reply(guild_id, channel_id, user, prompt):
+    if not is_owner_guild(guild_id):
+        raise GeminiMommyError("25ms AI is locked to the owner server.")
+
     quick_reply = mommy_quick_reply(prompt)
     if quick_reply:
         return quick_reply
@@ -2401,7 +2409,7 @@ def build_antispam_embed(guild):
 
 
 # ---------------------------------------------------------------------------
-# /fun — toggle the bot's little fun features (meow, good boy, Mommy AI)
+# /fun — toggle the bot's little fun features (meow, good boy)
 # ---------------------------------------------------------------------------
 
 class FunView(discord.ui.View):
@@ -2475,46 +2483,21 @@ class FunView(discord.ui.View):
             lambda value: f"🐶 Good-boy boosts {'enabled' if value else 'disabled'}.",
         )
 
-    @discord.ui.button(label="Mommy AI: OFF", style=discord.ButtonStyle.secondary, emoji="👑", custom_id="fun_mommy")
-    async def toggle_mommy(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-            return
-        if not mommy_configured():
-            await interaction.response.send_message(
-                "❌ Add `GEMINI_API_KEY` to the bot's environment before enabling Mommy AI.",
-                ephemeral=True,
-            )
-            return
-        await self._toggle(
-            interaction,
-            "fun_mommy",
-            False,
-            lambda value: (
-                f"👑 Mommy AI {'enabled' if value else 'disabled'}. "
-                "Mention the bot, reply to it, or use `/mommy` to chat."
-            ),
-        )
-
 
 def make_fun_view(settings):
     view = FunView()
     meow = settings.get("fun_meow", True)
     goodboy = settings.get("fun_goodboy", False)
-    mommy = settings.get("fun_mommy", False)
     view.toggle_meow.label = f"Meow: {'ON' if meow else 'OFF'}"
     view.toggle_meow.style = discord.ButtonStyle.success if meow else discord.ButtonStyle.secondary
     view.toggle_goodboy.label = f"Good boy: {'ON' if goodboy else 'OFF'}"
     view.toggle_goodboy.style = discord.ButtonStyle.success if goodboy else discord.ButtonStyle.secondary
-    view.toggle_mommy.label = f"Mommy AI: {'ON' if mommy else 'OFF'}"
-    view.toggle_mommy.style = discord.ButtonStyle.success if mommy else discord.ButtonStyle.secondary
     return view
 
 
 def build_fun_embed(guild, settings):
     meow = settings.get("fun_meow", True)
     goodboy = settings.get("fun_goodboy", False)
-    mommy = settings.get("fun_mommy", False)
     embed = discord.Embed(title="🎉 Fun Features", color=discord.Color.blurple())
     embed.add_field(
         name=f"🐱 Meow replies — {'ON' if meow else 'OFF'}",
@@ -2529,20 +2512,6 @@ def build_fun_embed(guild, settings):
                "spammy with frequent boosts."),
         inline=False,
     )
-    embed.add_field(
-        name=f"👑 Mommy AI — {'ON' if mommy else 'OFF'}",
-        value=("25ms is usually cute, sweet and innocent, but gets quietly bossy when "
-               "someone misbehaves. She can use cute custom emoji and occasional cat "
-               "stickers. Mention her, reply to her, or run `/mommy`. Messages and short "
-               "context are sent to Google's Gemini API."),
-        inline=False,
-    )
-    if not mommy_configured():
-        embed.add_field(
-            name="⚠️ Gemini not configured",
-            value="Set `GEMINI_API_KEY` in the bot environment before enabling Mommy AI.",
-            inline=False,
-        )
     embed.set_footer(text="Use the buttons below to toggle. Settings save instantly.")
     return embed
 
@@ -2558,23 +2527,18 @@ async def fun_setup(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="mommy", description="Talk to 25ms's cute, sweet, quietly bossy AI persona.")
+@bot.tree.command(
+    name="mommy",
+    description="Talk to 25ms's cute, sweet, quietly bossy AI persona.",
+    guild=discord.Object(id=OWNER_GUILD_ID),
+)
 @app_commands.describe(prompt="What you want to say")
 async def mommy_command(interaction: discord.Interaction, prompt: str):
-    if interaction.guild is None or interaction.channel_id is None:
-        await interaction.response.send_message(
-            "Use this command in a server where Mommy AI is enabled.", ephemeral=True
-        )
+    if not is_owner_guild(interaction.guild_id) or interaction.channel_id is None:
+        await interaction.response.send_message("This command isn't available here.", ephemeral=True)
         return
 
     await interaction.response.defer()
-    settings = await asyncio.to_thread(get_settings, interaction.guild.id)
-    if not settings.get("fun_mommy", False):
-        await interaction.edit_original_response(
-            content="Mommy AI is off in this server. An admin can enable it with `/fun`."
-        )
-        return
-
     try:
         reply, sticker_name = await generate_mommy_reply(
             interaction.guild.id,
@@ -2722,7 +2686,7 @@ async def on_message(message):
     content = message.content or ""
 
     mommy_handled = False
-    if fun.get("fun_mommy", False):
+    if is_owner_guild(message.guild.id):
         directly_mentioned = bot.user in message.mentions
         replying_to_bot = await message_is_reply_to_bot(message)
         if directly_mentioned or replying_to_bot:
