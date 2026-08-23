@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import logging
 import threading
@@ -10,18 +9,10 @@ from key_store import get_key, delete_key, lock_hwid, GUILD_ID
 from discord_bot import start_bot
 from stickied_message_bot import start_stickied_bot
 
-# Render swallows buffered print(). Force line-buffered logs so ready/errors show.
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-except Exception:
-    pass
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
