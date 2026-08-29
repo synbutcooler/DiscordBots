@@ -86,7 +86,7 @@ intents.message_content = True
 intents.members = True
 intents.presences = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=("!", "."), intents=intents)
 
 # OBF command — Lua obfuscator for Roblox scripts (owner/admin/role-gated).
 register_obf_commands(bot, owner_id=OWNER_ID, guild_id=OWNER_GUILD_ID)
