@@ -34,6 +34,7 @@ from guild_key_system import (
 from server_settings import (
     get_settings, update_settings,
 )
+from obfuscator import register_obf_commands
 from guild_renewal_system import (
     GRACE_PERIOD_SECONDS,
     configure_renewal,
@@ -86,6 +87,9 @@ intents.members = True
 intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# OBF command — Lua obfuscator for Roblox scripts (owner/admin/role-gated).
+register_obf_commands(bot, owner_id=OWNER_ID, guild_id=OWNER_GUILD_ID)
 
 recent_boosts = {}
 pending_tasks = {}
