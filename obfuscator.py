@@ -6,8 +6,9 @@ Commands added by register_obf_commands():
         DM the bot, attach a .lua file (or paste code after the command),
         get the obfuscated script back as an attachment. Nothing is ever
         posted in a server channel, so nothing leaks.
-    /obf [code]  (owner guild, ephemeral)
-        Quick in-server test for admins. The reply is ephemeral.
+    /obf  (owner guild, ephemeral)
+        Informational only — it does NOT obfuscate. Points people at the
+        bot's DMs and credits feariosz0, who wrote the Kryos engine.
     .obfhelp / !obfhelp
         Prints the KRS_* macro cheatsheet.
 
@@ -63,6 +64,20 @@ class ObfuscationError(RuntimeError):
 
 class EngineNotConfigured(ObfuscationError):
     """No engine reachable."""
+
+
+# Shared blurb for /obf and .obfhelp. The obfuscator is feariosz0's Kryos
+# engine; obfuscation itself only happens in DMs through .obf.
+OBF_INFO = (
+    "🔐 **Lua obfuscator — Kryos v16.0, made by feariosz0**\n\n"
+    "This command doesn't obfuscate anything itself. To obfuscate a script:\n"
+    "1. **DM this bot**\n"
+    "2. Attach your `.lua` file\n"
+    "3. Type `.obf`\n\n"
+    "…or paste code inline with `.obf <code>`. "
+    "Everything stays in DMs, so your source and the result never touch a "
+    "server channel. `.obfhelp` lists the KRS macros."
+)
 
 
 # Authorisation ----------------------------------------------------------------
@@ -313,47 +328,19 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
 
             await _run_and_reply(send, source, label)
 
-    # --- /obf (owner guild, ephemeral quick test) -----------------------------
+    # --- /obf (owner guild, informational — deliberately does NOT obfuscate) --
+    # Obfuscation only ever happens in DMs via .obf, so nothing lands in a
+    # channel. This command exists purely to point people there.
     @bot.tree.command(
         name="obf",
-        description="[Owner/Admin] Obfuscate a Lua script (ephemeral).",
+        description=(
+            "Lua obfuscator by feariosz0 (Kryos v16.0) — DM this bot and use "
+            ".obf to obfuscate a script."
+        ),
         guild=discord.Object(id=guild_id),
     )
-    @app_commands.describe(
-        code="Lua source (or use .obf in DMs with a .lua attachment)"
-    )
-    async def obf_slash(interaction: discord.Interaction, code: str = None):
-        ok, why = check_authorized(interaction.user, owner_id)
-        if not ok:
-            await interaction.response.send_message(why, ephemeral=True)
-            return
-
-        if not (code or "").strip():
-            await interaction.response.send_message(
-                "Paste the script as the `code` argument, or for files DM the "
-                "bot and use `.obf` with a `.lua` attachment instead — "
-                "cleaner and nothing lands in a channel.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        # Cooldown starts counting only when a real obfuscation begins.
-        ok2, wait = check_cooldown(interaction.user.id)
-        if not ok2:
-            await interaction.followup.send(
-                f"⏳ Cooldown — try again in {wait}s.", ephemeral=True)
-            return
-
-        async def send(content, file=None):
-            if file is not None:
-                await interaction.followup.send(
-                    content=content, file=file, ephemeral=True)
-            else:
-                await interaction.followup.send(content=content, ephemeral=True)
-
-        await _run_and_reply(send, code, "pasted code")
+    async def obf_slash(interaction: discord.Interaction):
+        await interaction.response.send_message(OBF_INFO, ephemeral=True)
 
     # --- .obfhelp -------------------------------------------------------------
     @bot.command(name="obfhelp")
@@ -377,5 +364,6 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
             "so it's not run through the VM. Use it when a function misbehaves, "
             "is performance-critical, or when something like `ColorSequence` "
             "gets called at a time the VM can't handle yet.\n\n"
+            "Obfuscator by **feariosz0** (Kryos v16.0).\n"
             "Usage: DM the bot → attach `.lua` → type `.obf`"
         )
