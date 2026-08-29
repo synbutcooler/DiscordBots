@@ -6,6 +6,7 @@ import requests
 from flask import Flask, request, jsonify
 from config import DISCORD_TOKEN, DISCORD_KEY_API_SECRET
 from key_store import get_key, delete_key, lock_hwid, GUILD_ID
+import obf_access
 from discord_bot import start_bot
 from stickied_message_bot import start_stickied_bot
 
@@ -17,6 +18,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+
+def get_client_ip():
+    """Same helper as the website repo — Render sits behind a proxy."""
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    if client_ip and ',' in client_ip:
+        client_ip = client_ip.split(',')[0].strip()
+    return client_ip
 
 SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://vadriftzbots.onrender.com")
 
@@ -37,6 +46,139 @@ def health():
 @app.route('/')
 def index():
     return jsonify({"status": "Bot server running"}), 200
+
+_UNLOCK_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+ body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#1e1f22;
+      color:#dbdee1;display:flex;align-items:center;justify-content:center;
+      min-height:100vh;margin:0;padding:24px;box-sizing:border-box}}
+ .card{{background:#2b2d31;border-radius:12px;padding:32px 28px;max-width:460px;
+        text-align:center;box-shadow:0 8px 24px rgba(0,0,0,.4)}}
+ h1{{font-size:20px;margin:0 0 12px}} p{{line-height:1.6;margin:0 0 12px;font-size:15px}}
+ code{{background:#1e1f22;padding:2px 6px;border-radius:4px;font-size:14px}}
+ .ok{{color:#57f287}} .bad{{color:#ed4245}}
+</style></head><body><div class="card">
+<h1 class="{cls}">{title}</h1>{body}
+</div></body></html>"""
+
+
+_CLAIM_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unlock the obfuscator</title>
+<style>
+ body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#1e1f22;
+      color:#dbdee1;display:flex;align-items:center;justify-content:center;
+      min-height:100vh;margin:0;padding:24px;box-sizing:border-box}}
+ .card{{background:#2b2d31;border-radius:12px;padding:32px 28px;max-width:460px;
+        width:100%;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,.4)}}
+ h1{{font-size:20px;margin:0 0 12px}} p{{line-height:1.6;margin:0 0 14px;font-size:15px}}
+ code{{background:#1e1f22;padding:2px 6px;border-radius:4px}}
+ input{{width:100%;box-sizing:border-box;padding:14px;font-size:22px;text-align:center;
+        letter-spacing:6px;text-transform:uppercase;background:#1e1f22;color:#fff;
+        border:2px solid #404249;border-radius:8px;margin-bottom:14px}}
+ input:focus{{outline:none;border-color:#5865f2}}
+ button{{width:100%;padding:13px;font-size:16px;font-weight:600;background:#5865f2;
+         color:#fff;border:0;border-radius:8px;cursor:pointer}}
+ button:hover{{background:#4752c4}}
+ .ok{{color:#57f287}} .bad{{color:#ed4245}} .hint{{font-size:13px;opacity:.7}}
+</style></head><body><div class="card">{body}</div></body></html>"""
+
+_CLAIM_FORM = """<h1>Enter your unlock code</h1>
+<p>The bot DM'd you a 6-character code when you asked to unlock. Paste it below.</p>
+<form method="post" action="/obf/claim">
+ <input name="code" maxlength="6" autocomplete="off" autofocus
+        placeholder="ABC123" required>
+ <button type="submit">Unlock 24 hours</button>
+</form>
+<p class="hint">Lost the code? DM the bot <code>.obfunlock</code> again.</p>"""
+
+
+@app.route('/obf/claim', methods=['GET'])
+def obf_claim_form():
+    """Destination of the static LootLabs link."""
+    return _CLAIM_PAGE.format(body=_CLAIM_FORM), 200
+
+
+@app.route('/obf/claim', methods=['POST'])
+def obf_claim_submit():
+    code = (request.form.get('code') or '').strip()
+    if not code:
+        return _CLAIM_PAGE.format(body="<h1 class='bad'>No code entered</h1>"
+                                  + _CLAIM_FORM), 400
+
+    # Anti-bypass, same two checks the website's /complete-unlock uses:
+    # the browser must have arrived from a link-locker page, and enough time
+    # must have passed since the bot issued the code.
+    referer = request.headers.get('Referer', '')
+    if not obf_access.is_valid_referrer(referer):
+        logger.warning("obf claim rejected: bad referer %r ip=%s",
+                       referer, get_client_ip())
+        return _CLAIM_PAGE.format(
+            body="<h1 class='bad'>Please complete the checkpoint first</h1>"
+                 "<p>This page has to be reached by finishing the checkpoint. "
+                 "Go back to the link the bot gave you and complete it.</p>"
+                 "<p class='hint'>Bookmarking or refreshing this page won't work.</p>"), 403
+
+    age = obf_access.claim_code_age(code)
+    if age is not None and age < obf_access.min_claim_seconds():
+        wait = int(obf_access.min_claim_seconds() - age) + 1
+        logger.warning("obf claim rejected: too fast (%.1fs) ip=%s",
+                       age, get_client_ip())
+        return _CLAIM_PAGE.format(
+            body=f"<h1 class='bad'>That was too quick</h1>"
+                 f"<p>The checkpoint takes longer than that. Wait about "
+                 f"{wait}s, finish the ads, then submit again.</p>"
+                 + _CLAIM_FORM), 429
+
+    try:
+        discord_id, _expires = obf_access.redeem_claim_code(code)
+    except obf_access.AccessError as exc:
+        logger.error("obf claim failed: %s", exc)
+        return _CLAIM_PAGE.format(
+            body=f"<h1 class='bad'>Something went wrong</h1><p>{exc}</p>"), 500
+
+    if not discord_id:
+        return _CLAIM_PAGE.format(
+            body="<h1 class='bad'>That code isn't valid</h1>"
+                 "<p>It was already used, it expired (codes last 2 hours), or "
+                 "it was mistyped.</p>" + _CLAIM_FORM), 400
+
+    logger.info("obf access claimed via code for discord_id=%s", discord_id)
+    return _CLAIM_PAGE.format(
+        body="<h1 class='ok'>Obfuscator unlocked!</h1>"
+             "<p>You have <strong>24 hours</strong> of obfuscation access.</p>"
+             "<p>Head back to Discord, DM the bot, attach your <code>.lua</code> "
+             "file and type <code>.obf</code>.</p>"
+             "<p class='hint'>You can close this tab.</p>"), 200
+
+
+@app.route('/obf/unlock/<token>')
+def obf_unlock(token):
+    """LootLabs redirects here after the checkpoint is completed."""
+    try:
+        discord_id, expires_at = obf_access.redeem(token)
+    except obf_access.AccessError as exc:
+        logger.error("obf unlock redeem failed: %s", exc)
+        return _UNLOCK_PAGE.format(
+            cls="bad", title="Something went wrong",
+            body=f"<p>{exc}</p><p>Ask the bot owner for help.</p>"), 500
+
+    if not discord_id:
+        return _UNLOCK_PAGE.format(
+            cls="bad", title="This link is no longer valid",
+            body="<p>It was already used, or it expired. Go back to Discord and "
+                 "type <code>.obfunlock</code> for a fresh link.</p>"), 400
+
+    logger.info("obf access redeemed for discord_id=%s", discord_id)
+    return _UNLOCK_PAGE.format(
+        cls="ok", title="Obfuscator unlocked!",
+        body="<p>You have <strong>24 hours</strong> of obfuscation access.</p>"
+             "<p>Head back to Discord, DM the bot, attach your <code>.lua</code> "
+             "file and type <code>.obf</code>.</p>"
+             "<p>You can close this tab.</p>"), 200
+
 
 @app.route('/api/validate-discord-key', methods=['POST'])
 def validate_discord_key():
