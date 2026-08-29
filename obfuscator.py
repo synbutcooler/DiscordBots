@@ -9,6 +9,9 @@ Commands added by register_obf_commands():
     /obf  (owner guild, ephemeral)
         Informational only — it does NOT obfuscate. Points people at the
         bot's DMs and credits feariosz0, who wrote the Kryos engine.
+    .obfunlock
+        Shows remaining unlock time, or hands out a LootLabs checkpoint link
+        that buys OBF_UNLOCK_HOURS (default 24) of access. See obf_access.py.
     .obfhelp / !obfhelp
         Prints the KRS_* macro cheatsheet.
 
@@ -209,9 +212,11 @@ def run_engine(source: str, timeout: int = None, options: dict = None):
 
 # Discord commands -------------------------------------------------------------
 def register_obf_commands(bot, owner_id: int, guild_id: int):
-    """Attach the /obf, .obf and .obfhelp commands to the bot."""
+    """Attach the /obf, .obf, .obfunlock and .obfhelp commands to the bot."""
     import discord
     from discord import app_commands
+
+    import obf_access
 
     async def _member_from_guild(user_id):
         """Resolve a DM user to a Member in the owner guild (roles/permissions)."""
@@ -252,7 +257,7 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
         )
 
     async def _authorize_from_dm(user):
-        """DM check: owner always; otherwise must be a member of the owner guild."""
+        """Privilege check used by .obfhelp: owner, or admin/role in the guild."""
         if user.id == owner_id:
             return True, ""
         member = await _member_from_guild(user.id)
@@ -261,6 +266,62 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
                            "bot's server to use the obfuscator. Join first, "
                            "then DM the bot.")
         return check_authorized(member, owner_id)
+
+    def _fmt_left(seconds: int) -> str:
+        hours, rem = divmod(int(seconds), 3600)
+        return f"{hours}h {rem // 60}m" if hours else f"{rem // 60}m"
+
+    async def _unlock_prompt(user) -> str:
+        """Build the 'go do a checkpoint' message, creating the link on demand."""
+        loop = asyncio.get_running_loop()
+        try:
+            link, code = await loop.run_in_executor(
+                None, obf_access.unlock_offer, user.id, str(user))
+        except obf_access.AccessError as exc:
+            return f"⚠️ I couldn't create an unlock link right now: {exc}"
+
+        hours = obf_access._unlock_hours()
+        if code:
+            # Static-link mode: the destination can't carry a per-user token,
+            # so the landing page asks for this code.
+            steps = (
+                f"1. Open this link: {link}\n"
+                "2. Complete the checkpoint\n"
+                f"3. On the page you land on, enter this code: **`{code}`**\n"
+                f"4. You'll get **{hours} hours** of obfuscation, then it resets."
+            )
+        else:
+            steps = (
+                f"1. Open this link: {link}\n"
+                "2. Complete the checkpoint\n"
+                f"3. You'll get **{hours} hours** of obfuscation, then it resets."
+            )
+        return (
+            "🔒 **The obfuscator needs a one-time checkpoint.**\n\n"
+            f"{steps}\n\n"
+            "Come back here and send `.obf` with your `.lua` attached. "
+            "Nothing is charged per script — a failed obfuscation costs you nothing."
+        )
+
+    async def _check_obf_access(user):
+        """Gate for .obf: bypass IDs always pass, everyone else needs a window."""
+        if (obf_access.gate_disabled()
+                or user.id == owner_id
+                or user.id in obf_access.bypass_ids()):
+            return True, ""
+
+        member = await _member_from_guild(user.id)
+        if member is None:
+            return False, ("You need to be a member of the bot's server to use "
+                           "the obfuscator. Join first, then DM the bot.")
+
+        try:
+            if obf_access.has_access(user.id):
+                return True, ""
+        except obf_access.AccessError as exc:
+            return False, f"⚠️ {exc}"
+
+        return False, await _unlock_prompt(user)
 
     # --- .obf (DMs only, attachment or inline) --------------------------------
     @bot.command(name="obf", aliases=["obfuscate"])
@@ -273,7 +334,7 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
             )
             return
 
-        ok, why = await _authorize_from_dm(ctx.author)
+        ok, why = await _check_obf_access(ctx.author)
         if not ok:
             await ctx.send(why)
             return
@@ -341,6 +402,30 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
     )
     async def obf_slash(interaction: discord.Interaction):
         await interaction.response.send_message(OBF_INFO, ephemeral=True)
+
+    # --- .obfunlock (get/refresh a checkpoint link, show remaining time) ------
+    @bot.command(name="obfunlock", aliases=["obfkey"])
+    async def obfunlock(ctx):
+        if ctx.guild is not None:
+            await ctx.send("🤫 DM me `.obfunlock` — links shouldn't be public.")
+            return
+
+        if (obf_access.gate_disabled()
+                or ctx.author.id == owner_id
+                or ctx.author.id in obf_access.bypass_ids()):
+            await ctx.send("✅ You're on the bypass list — no checkpoint needed. "
+                           "Just DM me `.obf` with your script.")
+            return
+
+        try:
+            left = obf_access.seconds_left(ctx.author.id)
+            if left > 0:
+                await ctx.send(f"✅ Already unlocked — **{_fmt_left(left)}** left. "
+                               "DM me `.obf` with your `.lua` attached.")
+                return
+            await ctx.send(await _unlock_prompt(ctx.author))
+        except obf_access.AccessError as exc:
+            await ctx.send(f"⚠️ {exc}")
 
     # --- .obfhelp -------------------------------------------------------------
     @bot.command(name="obfhelp")
