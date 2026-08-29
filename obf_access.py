@@ -421,6 +421,51 @@ _CLAIM_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 CLAIM_CODE_LEN = 6
 CLAIM_TTL_SECONDS = 2 * 60 * 60
 
+# Anti-bypass, ported from the website repo's /complete-unlock handler.
+# A claim only counts if the browser actually arrived from a link-locker page.
+DEFAULT_ALLOWED_REFERRERS = (
+    "work.ink,www.work.ink,"
+    "lootdest.org,lootlabs.gg,www.lootlabs.gg,links.lootlabs.gg,"
+    "linkvertise.com,www.linkvertise.com,"
+    "link-to.net,direct-link.net,linkvertise.net,"
+    "link-hub.net,link-center.net,up-to-down.net"
+)
+
+# Mirrors the website's MIN_CHECKPOINT_SECONDS. Stops someone scripting
+# "ask the bot for a code, instantly POST it".
+MIN_CLAIM_SECONDS = 20
+
+
+def allowed_referrers():
+    raw = os.environ.get("OBF_ALLOWED_REFERRERS") or DEFAULT_ALLOWED_REFERRERS
+    return [d.strip().lower() for d in raw.split(",") if d.strip()]
+
+
+def is_valid_referrer(referer: str) -> bool:
+    """True if the request came from a link-locker page (same rule as the website)."""
+    referer = (referer or "").lower()
+    if not referer:
+        return False
+    return any(domain in referer for domain in allowed_referrers())
+
+
+def claim_code_age(code: str):
+    """Seconds since this code was issued, or None if unknown."""
+    _require_db()
+    if not code:
+        return None
+    doc = _claims.find_one({"_id": code.strip().upper()})
+    if not doc:
+        return None
+    return time.time() - doc.get("created_at", time.time())
+
+
+def min_claim_seconds() -> int:
+    try:
+        return max(0, int(os.environ.get("OBF_MIN_CLAIM_SECONDS", MIN_CLAIM_SECONDS)))
+    except ValueError:
+        return MIN_CLAIM_SECONDS
+
 
 def static_link() -> str:
     return (os.environ.get("OBF_STATIC_LINK") or "").strip()
