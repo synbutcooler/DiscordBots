@@ -2,27 +2,31 @@
 OBF command support — bridges the Discord bot to the Kryos Lua obfuscator.
 
 Commands added by register_obf_commands():
-    /obf [code]        Slash command. Paste the Lua source (max ~6000 chars).
-                       For bigger scripts use !obf with a .lua attachment.
-    !obf [code]        Prefix command. Uses the rest of the message, or the
-                       attached file if the message has an attachment.
-    !obfhelp           Quick reference for the KRS_* macros.
+    .obf / !obf  (DMs only)
+        DM the bot, attach a .lua file (or paste code after the command),
+        get the obfuscated script back as an attachment. Nothing is ever
+        posted in a server channel, so nothing leaks.
+    /obf [code]  (owner guild, ephemeral)
+        Quick in-server test for admins. The reply is ephemeral.
+    .obfhelp / !obfhelp
+        Prints the KRS_* macro cheatsheet.
 
 Who may use it (in order):
     1. The bot owner (OWNER_ID)                        -> always allowed
-    2. Members with Administrator permission            -> allowed
-    3. Members holding any role in OBF_ALLOWED_ROLE_IDS -> allowed
-       (comma-separated role IDs in the environment, e.g.
-        OBF_ALLOWED_ROLE_IDS=123456789012345678,987654321098765432)
+    2. Members of the owner guild with Administrator   -> allowed
+    3. Members of the owner guild holding any role in
+       OBF_ALLOWED_ROLE_IDS (comma-separated env var)  -> allowed
+
+Because DMs carry no server context, non-owner access is checked against the
+owner guild: you must be a member there, then the usual permission/role rules
+apply. Everyone else gets a plain "nope".
 
 ENGINE — already wired:
-    obfuscator_engine/engine.py runs obfuscator_engine/kryos.lua (Kryos v16.0)
-    through a system lua5.4 (5.3+) interpreter, via subprocess. Nothing to
-    install on the bot side beyond lua5.4 on the host (see Dockerfile).
-
-    If you ever swap engines: either replace obfuscate() in
-    obfuscator_engine/engine.py, or set OBF_ENGINE_CMD to a CLI command that
-    reads the Lua source on stdin and writes the obfuscated result to stdout.
+    obfuscator_engine/engine.py is SELF-CONTAINED: the Kryos v16.0 engine is
+    embedded (encrypted; needs the KRS_ENGINE_KEY env var) and a static
+    Lua 5.4.8 interpreter is embedded too. Nothing to install, nothing else
+    to deploy. Optionally override with OBF_ENGINE_CMD (stdin -> stdout CLI)
+    or KRS_LUA_BIN (different Lua 5.3+ binary).
 """
 
 import asyncio
@@ -58,7 +62,7 @@ class ObfuscationError(RuntimeError):
 
 
 class EngineNotConfigured(ObfuscationError):
-    """No engine reachable — the friend's code hasn't been dropped in yet."""
+    """No engine reachable."""
 
 
 # Authorisation ----------------------------------------------------------------
@@ -80,7 +84,7 @@ def check_authorized(user, owner_id: int):
     if user.id == owner_id:
         return True, ""
 
-    # Administrator permission (works for Members; DM users have no guild)
+    # Administrator permission (Members only; DMs have no guild context)
     guild_perms = getattr(user, "guild_permissions", None)
     if guild_perms is not None and getattr(guild_perms, "administrator", False):
         return True, ""
@@ -114,49 +118,7 @@ def check_cooldown(user_id: int, seconds: int = None):
     return True, 0
 
 
-# Engine loader ----------------------------------------------------------------
-def _load_python_engine():
-    """Find the friend's obfuscator inside obfuscator_engine/ and return a callable."""
-    if not ENGINE_DIR.is_dir():
-        raise EngineNotConfigured(
-            f"No obfuscator_engine/ folder next to obfuscator.py (looked at {ENGINE_DIR})."
-        )
-
-    if str(ENGINE_DIR) not in sys.path:
-        sys.path.insert(0, str(ENGINE_DIR))
-
-    import importlib
-
-    for mod_name in ("engine", "obfuscator", "main", "krs_obfuscator"):
-        try:
-            mod = importlib.import_module(mod_name)
-        except ModuleNotFoundError as exc:
-            # Missing *dependency* of the engine (e.g. luaparser) is a real error.
-            if exc.name != mod_name:
-                raise ObfuscationError(
-                    f"Engine module '{mod_name}' is missing a dependency: {exc.name}. "
-                    f"Install it (pip install {exc.name}) and restart the bot."
-                ) from exc
-            continue
-        except Exception as exc:  # engine crashed on import
-            raise ObfuscationError(f"Engine module '{mod_name}' failed to import: {exc}") from exc
-
-        for fn_name in ("obfuscate", "run", "main"):
-            fn = getattr(mod, fn_name, None)
-            if callable(fn):
-                return fn
-        raise ObfuscationError(
-            f"Engine module '{mod_name}' has no callable named obfuscate/run/main."
-        )
-
-    raise EngineNotConfigured(
-        "No engine found in obfuscator_engine/. Drop your friend's obfuscator "
-        "code in there (e.g. as engine.py with def obfuscate(source): ...) "
-        "or set OBF_ENGINE_CMD to a CLI command that reads stdin and writes "
-        "the obfuscated script to stdout. See README_OBF.md."
-    )
-
-
+# Engine runner ----------------------------------------------------------------
 def _run_cli_engine(cmd, source: str, timeout: int):
     proc = subprocess.run(
         shlex.split(cmd),
@@ -185,10 +147,7 @@ def run_engine(source: str, timeout: int = None, options: dict = None):
         raise ObfuscationError("Empty script — nothing to obfuscate.")
     if len(source.encode("utf-8")) > OBF_MAX_BYTES:
         limit_mb = OBF_MAX_BYTES / 1_000_000
-        if limit_mb < 1:
-            limit_str = f"{OBF_MAX_BYTES:,} bytes"
-        else:
-            limit_str = f"{limit_mb:g} MB"
+        limit_str = f"{limit_mb:g} MB" if limit_mb >= 1 else f"{OBF_MAX_BYTES:,} bytes"
         raise ObfuscationError(
             f"Script is too large (max {limit_str}). "
             "The obfuscator runs on the bot's server, mind the size."
@@ -198,16 +157,28 @@ def run_engine(source: str, timeout: int = None, options: dict = None):
     if cli_cmd:
         return _run_cli_engine(cli_cmd, source, timeout)
 
-    fn = _load_python_engine()
+    # obfuscator_engine/engine.py is the self-contained Kryos runner.
+    engine_path = ENGINE_DIR / "engine.py"
+    if not engine_path.is_file():
+        raise EngineNotConfigured(
+            f"No engine at {engine_path} — obfuscator_engine/engine.py was not "
+            "deployed. Upload it and redeploy."
+        )
+    if str(ENGINE_DIR) not in sys.path:
+        sys.path.insert(0, str(ENGINE_DIR))
     try:
-        result = fn(source, options) if options else fn(source)
+        fn = __import__("engine", fromlist=["obfuscate"]).obfuscate
+    except Exception as exc:
+        raise EngineNotConfigured(
+            f"Engine module failed to import: {exc}"
+        ) from exc
+
+    try:
+        result = fn(source) if options is None else fn(source, options)
     except ObfuscationError:
         raise
-    except TypeError:
-        # Some engines only take the source string.
-        result = fn(source)
     except Exception as exc:
-        raise ObfuscationError(f"Engine raised {type(exc).__name__}: {exc}") from exc
+        raise ObfuscationError(str(exc)) from exc
 
     if not isinstance(result, str) or not result.strip():
         raise ObfuscationError("Engine returned an empty result.")
@@ -216,18 +187,29 @@ def run_engine(source: str, timeout: int = None, options: dict = None):
     if out_len > OBF_MAX_OUTPUT:
         raise ObfuscationError(
             f"Obfuscated output is {out_len / 1_000_000:.1f} MB — too big for a "
-            "Discord attachment. Split the script into smaller pieces and "
-            "obfuscate them separately (raise OBF_MAX_OUTPUT_BYTES only if you "
-            "tested that the bot can still upload it)."
+            "Discord attachment. Split the script into smaller pieces."
         )
     return result
 
 
 # Discord commands -------------------------------------------------------------
 def register_obf_commands(bot, owner_id: int, guild_id: int):
-    """Attach the /obf, !obf and !obfhelp commands to the bot."""
+    """Attach the /obf, .obf and .obfhelp commands to the bot."""
     import discord
     from discord import app_commands
+
+    async def _member_from_guild(user_id):
+        """Resolve a DM user to a Member in the owner guild (roles/permissions)."""
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            return None
+        member = guild.get_member(user_id)
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(user_id)
+        except Exception:
+            return None
 
     def _brief(src_len, out_len, seconds):
         return (f"Obfuscated **{src_len:,}** -> **{out_len:,}** chars "
@@ -239,10 +221,10 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
         try:
             out = await loop.run_in_executor(None, run_engine, source)
         except EngineNotConfigured as exc:
-            await send(f"⚠️ {exc}", file=None, ephemeral=True)
+            await send(f"⚠️ {exc}", file=None)
             return
         except ObfuscationError as exc:
-            await send(f"❌ Obfuscation failed: {exc}", file=None, ephemeral=True)
+            await send(f"❌ Obfuscation failed: {exc}", file=None)
             return
         elapsed = time.monotonic() - started
 
@@ -251,17 +233,94 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
         await send(
             f"✅ {_brief(len(source), len(out), elapsed)}\n"
             f"Source: {source_label}",
-            file=file, ephemeral=True,
+            file=file,
         )
 
-    # --- /obf ----------------------------------------------------------------
+    async def _authorize_from_dm(user):
+        """DM check: owner always; otherwise must be a member of the owner guild."""
+        if user.id == owner_id:
+            return True, ""
+        member = await _member_from_guild(user.id)
+        if member is None:
+            return False, ("This is private — you need to be a member of the "
+                           "bot's server to use the obfuscator. Join first, "
+                           "then DM the bot.")
+        return check_authorized(member, owner_id)
+
+    # --- .obf (DMs only, attachment or inline) --------------------------------
+    @bot.command(name="obf", aliases=["obfuscate"])
+    async def obf_dm(ctx, *, code: str = None):
+        if ctx.guild is not None:
+            await ctx.send(
+                "🤫 This runs in DMs only — attach your `.lua` file here: "
+                "DM the bot and send the script as an attachment. "
+                "Keeps the source and the result private."
+            )
+            return
+
+        ok, why = await _authorize_from_dm(ctx.author)
+        if not ok:
+            await ctx.send(why)
+            return
+
+        source = None
+        label = None
+        if ctx.message.attachments:
+            att = ctx.message.attachments[0]
+            label = att.filename
+            if att.size > OBF_MAX_BYTES:
+                await ctx.send(
+                    f"❌ `{att.filename}` is too large "
+                    f"(max {OBF_MAX_BYTES / 1_000_000:.0f} MB).")
+                return
+            try:
+                raw = await att.read()
+            except Exception as exc:
+                await ctx.send(f"❌ Could not read the attachment: {exc}")
+                return
+            try:
+                source = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                await ctx.send("❌ Attachment is not valid UTF-8 text "
+                               "(is it a .lua file?).")
+                return
+        elif code and code.strip():
+            source = code
+            label = "pasted code"
+        else:
+            await ctx.send(
+                "Send it like this:\n"
+                "1. **DM** this bot\n"
+                "2. Attach your `.lua` script\n"
+                "3. Type `.obf`\n\n"
+                "…or just type `.obf <code>` and I'll run that inline. "
+                "`.obfhelp` shows the KRS macros."
+            )
+            return
+
+        # Cooldown only starts counting when a real obfuscation begins.
+        ok2, wait = check_cooldown(ctx.author.id)
+        if not ok2:
+            await ctx.send(f"⏳ Cooldown — try again in {wait}s.")
+            return
+
+        async with ctx.typing():
+            async def send(content, file=None):
+                if file is not None:
+                    await ctx.send(content=content, file=file)
+                else:
+                    await ctx.send(content=content)
+
+            await _run_and_reply(send, source, label)
+
+    # --- /obf (owner guild, ephemeral quick test) -----------------------------
     @bot.tree.command(
         name="obf",
-        description="[Owner/Admin] Obfuscate a Lua script with the KRS engine.",
+        description="[Owner/Admin] Obfuscate a Lua script (ephemeral).",
         guild=discord.Object(id=guild_id),
     )
     @app_commands.describe(
-        code="Lua source to obfuscate (or run !obf with a .lua attachment for big scripts)"
+        code="Lua source (or use .obf in DMs with a .lua attachment)"
     )
     async def obf_slash(interaction: discord.Interaction, code: str = None):
         ok, why = check_authorized(interaction.user, owner_id)
@@ -271,85 +330,44 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
 
         if not (code or "").strip():
             await interaction.response.send_message(
-                "Paste the script as the `code` argument (e.g. `/obf code: local x = 1`), "
-                "or for longer scripts use `!obf` with a `.lua` file attached.",
+                "Paste the script as the `code` argument, or for files DM the "
+                "bot and use `.obf` with a `.lua` attachment instead — "
+                "cleaner and nothing lands in a channel.",
                 ephemeral=True,
             )
             return
 
+        await interaction.response.defer(ephemeral=True)
+
+        # Cooldown starts counting only when a real obfuscation begins.
         ok2, wait = check_cooldown(interaction.user.id)
         if not ok2:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"⏳ Cooldown — try again in {wait}s.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
-
-        async def send(content, file=None, ephemeral=True):
+        async def send(content, file=None):
             if file is not None:
-                await interaction.followup.send(content=content, file=file, ephemeral=True)
+                await interaction.followup.send(
+                    content=content, file=file, ephemeral=True)
             else:
                 await interaction.followup.send(content=content, ephemeral=True)
 
         await _run_and_reply(send, code, "pasted code")
 
-    # --- !obf ----------------------------------------------------------------
-    @bot.command(name="obf", aliases=["obfuscate"])
-    async def obf_prefix(ctx, *, code: str = None):
-        ok, why = check_authorized(ctx.author, owner_id)
-        if not ok:
-            await ctx.send(why)
-            return
-
-        source = None
-        label = "pasted code"
-        if code and code.strip():
-            source = code
-        elif ctx.message.attachments:
-            att = ctx.message.attachments[0]
-            label = att.filename
-            if att.size > OBF_MAX_BYTES:
-                await ctx.send(f"❌ `{att.filename}` is too large (max {OBF_MAX_BYTES // 1_000_000} MB).")
-                return
-            raw = await att.read()
-            try:
-                source = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                await ctx.send("❌ Attachment is not valid UTF-8 text.")
-                return
-        else:
-            await ctx.send(
-                "Usage: `!obf <lua code>` or attach a `.lua` file to the same message.\n"
-                "Tip: bigger scripts → attach the file. See `!obfhelp` for the macros."
-            )
-            return
-
-        ok2, wait = check_cooldown(ctx.author.id)
-        if not ok2:
-            await ctx.send(f"⏳ Cooldown — try again in {wait}s.")
-            return
-
-        async with ctx.typing():
-            async def send(content, file=None, ephemeral=True):
-                if file is not None:
-                    await ctx.send(content=content, file=file)
-                else:
-                    await ctx.send(content=content)
-
-            await _run_and_reply(send, source, label)
-
-    # --- !obfhelp ------------------------------------------------------------
+    # --- .obfhelp -------------------------------------------------------------
     @bot.command(name="obfhelp")
     async def obfhelp(ctx):
-        ok, why = check_authorized(ctx.author, owner_id)
+        ok, why = await _authorize_from_dm(ctx.author) if ctx.guild is None \
+            else check_authorized(ctx.author, owner_id)
         if not ok:
             await ctx.send(why)
             return
         await ctx.send(
             "**KRS macros** (inside your script, before obfuscating):\n"
             "```lua\n"
-            "local str = KRS_ENCSTR(\"test string\")   -- string is stored encrypted\n"
-            "local num = KRS_ENCNUM(36482)             -- number is stored encrypted\n"
+            "local str = KRS_ENCSTR(\"test string\")   -- string stored encrypted\n"
+            "local num = KRS_ENCNUM(36482)             -- number stored encrypted\n"
             "local f = KRS_NOVIRTUALIZE(function()     -- keep this function OUT of the VM\n"
             "    print(\"hi\")\n"
             "end)\n"
@@ -358,5 +376,6 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
             "`KRS_NOVIRTUALIZE` leaves the function as normal Lua (still encoded), "
             "so it's not run through the VM. Use it when a function misbehaves, "
             "is performance-critical, or when something like `ColorSequence` "
-            "gets called at a time the VM can't handle yet."
+            "gets called at a time the VM can't handle yet.\n\n"
+            "Usage: DM the bot → attach `.lua` → type `.obf`"
         )
