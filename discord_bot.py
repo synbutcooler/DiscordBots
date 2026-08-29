@@ -3,6 +3,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import asyncio
 import concurrent.futures
+import os
 import random
 import secrets
 import re
@@ -60,7 +61,7 @@ _renewal_pool = concurrent.futures.ThreadPoolExecutor(
 TARGET_CHANNEL_ID = 1389210900489044048
 AUTH_CHANNEL_ID = 1287714060716081183
 LOG_CHANNEL_ID = 1270314848764559494
-OWNER_ID = # 1144213765424947251
+OWNER_ID = 1144213765424947251
 DELAY_SECONDS = 1
 BOOST_TEST_CHANNEL_ID = 1270301984897110148
 
@@ -80,6 +81,26 @@ MONITORED_CHANNELS = {
 }
 
 URL_PATTERN = re.compile(r'https?://\S+|www\.\S+')
+
+# Words that mark a message as scam-spam even when it has a real caption.
+# Scam posts used to be attachments with no text; now they carry a caption like
+# "bro CYBERLEEK STREAMING", which trips the has_real_text exemption and slips
+# through. Matching is case-insensitive and word-boundary based, so "brother",
+# "broken" and "browse" do NOT match "bro".
+# Only consulted inside the flood branch (4+ links/attachments), so ordinary
+# chat containing these words is never touched.
+SCAM_KEYWORDS = [
+    k.strip().lower()
+    for k in os.environ.get("SCAM_KEYWORDS", "cyberleek,streaming,bro").split(",")
+    if k.strip()
+]
+
+
+def matched_scam_keywords(text: str):
+    """Return the list of scam keywords present in `text` (word-boundary match)."""
+    lowered = (text or "").lower()
+    return [k for k in SCAM_KEYWORDS
+            if re.search(r'(?<![\w])' + re.escape(k) + r'(?![\w])', lowered)]
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2399,10 +2420,13 @@ def build_antispam_embed(guild):
                "buttons to enable-all or disable."),
         inline=False,
     )
+    kw = ", ".join(f"`{k}`" for k in SCAM_KEYWORDS) or "none"
     embed.add_field(
         name="What it deletes",
         value=("Messages with **4+ links or 4+ attachments** that have no real text "
-               "(the fake MrBeast/Elon crypto scam posts). Captions with actual words are kept."),
+               "(the fake MrBeast/Elon crypto scam posts). Captions with actual "
+               f"words are kept — **unless** they contain {kw}, which are treated "
+               "as scam captions and deleted anyway."),
         inline=False,
     )
     return embed
@@ -2666,12 +2690,20 @@ async def on_message(message):
             stripped = re.sub(r'[\s\W_]+', '', stripped, flags=re.UNICODE)
             has_real_text = len(stripped) >= 3  # at least 3 word-chars
 
-            if has_real_text:
+            # A scam caption overrides the real-text exemption.
+            scam_words = matched_scam_keywords(message.content or "")
+
+            if has_real_text and not scam_words:
                 logger.info(
                     f"Keeping message {message.id} (has real caption text; "
                     f"links={link_count}, attachments={attachment_count})"
                 )
             else:
+                if scam_words:
+                    logger.info(
+                        f"Message {message.id} matched scam keywords {scam_words}; "
+                        f"deleting despite caption text"
+                    )
                 perms = message.channel.permissions_for(message.guild.me)
                 if not perms.manage_messages:
                     logger.warning(
