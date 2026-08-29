@@ -319,7 +319,7 @@ local KW = {
 local MULTI_OPS_3 = { ["..."] = true }
 local MULTI_OPS_2 = {
     ["=="]=true, ["~="]=true, ["<="]=true, [">="]=true,
-    [".."]=true, [">>"]=true, ["<<"]=true,
+    [".."]=true, [">>"]=true, ["<<"]=true, ["//"]=true,
 }
 
 function Lexer.new(source)
@@ -388,10 +388,55 @@ function Lexer:_read_short_string(q)
         if src:sub(self._pos, self._pos) == '\\' then
             self._pos = self._pos + 1
             local e = src:sub(self._pos, self._pos)
+            -- Only \n \t \r and a bare passthrough used to be handled, so
+            -- \xHH, \ddd, \z, \a, \b, \f, \v and \u{...} were silently
+            -- turned into their literal characters, corrupting the string.
             if     e == 'n'  then s[#s+1] = '\n'
             elseif e == 't'  then s[#s+1] = '\t'
             elseif e == 'r'  then s[#s+1] = '\r'
-            elseif e == '0'  then s[#s+1] = '\0'
+            elseif e == 'a'  then s[#s+1] = '\a'
+            elseif e == 'b'  then s[#s+1] = '\b'
+            elseif e == 'f'  then s[#s+1] = '\f'
+            elseif e == 'v'  then s[#s+1] = '\v'
+            elseif e == 'x' then
+                local n = tonumber(src:sub(self._pos + 1, self._pos + 2), 16)
+                if n then
+                    s[#s+1] = string.char(n)
+                    self._pos = self._pos + 2
+                else
+                    s[#s+1] = e
+                end
+            elseif e == 'u' and src:sub(self._pos + 1, self._pos + 1) == '{' then
+                local close = src:find('}', self._pos + 2, true)
+                local n = close and tonumber(src:sub(self._pos + 2, close - 1), 16)
+                if n then
+                    local ok, ch = pcall(utf8.char, n)
+                    s[#s+1] = ok and ch or e
+                    if ok then self._pos = close end
+                else
+                    s[#s+1] = e
+                end
+            elseif e == 'z' then
+                -- \z swallows the following run of whitespace
+                self._pos = self._pos + 1
+                while self._pos <= #src
+                      and src:sub(self._pos, self._pos):match('%s') do
+                    self._pos = self._pos + 1
+                end
+                self._pos = self._pos - 1
+            elseif e:match('%d') then
+                local digits = src:match('^%d%d%d', self._pos)
+                            or src:match('^%d%d', self._pos)
+                            or src:match('^%d', self._pos)
+                local n = tonumber(digits)
+                if n and n <= 255 then
+                    s[#s+1] = string.char(n)
+                    self._pos = self._pos + #digits - 1
+                else
+                    s[#s+1] = e
+                end
+            elseif e == '\n' then
+                s[#s+1] = '\n'
             else                  s[#s+1] = e
             end
         else
@@ -502,17 +547,27 @@ function Lexer:next()
     return t
 end
 
+function Lexer:line_of(tok)
+    if not tok then tok = self._tokens[self._ti] end
+    if not tok then tok = self._tokens[#self._tokens] end
+    if not tok then return 0 end
+    local _, n = self._src:sub(1, tok.start - 1):gsub("\n", "")
+    return n + 1
+end
+
 function Lexer:expect(typ, val)
     local t = self:next()
     if not t then
-        error("EOF: expected " .. typ .. (val and (" '"..val.."'") or ""))
+        error(("line %d: unexpected end of script, expected %s%s"):format(
+              self:line_of(), typ, val and (" '"..val.."'") or ""))
     end
     if t.type ~= typ then
-        error(("Expected %s got %s('%s') at token %d"):format(
-              typ, t.type, tostring(t.val), self._ti))
+        error(("line %d: expected %s but found %s '%s'"):format(
+              self:line_of(t), typ, t.type, tostring(t.val)))
     end
     if val and t.val ~= val then
-        error(("Expected '%s' got '%s'"):format(val, tostring(t.val)))
+        error(("line %d: expected '%s' but found '%s'"):format(
+              self:line_of(t), val, tostring(t.val)))
     end
     return t
 end
@@ -712,6 +767,85 @@ local function preprocess_source(source)
             return source:sub(from_pos, to_pos - 1)
         end
         return ""
+    end
+
+    -- Pass 0: funcname definitions -> assignment form.
+    -- The compiler below only accepts `function name(...)`. Lua/Luau also
+    -- allow dotted and method definitions, which are pure sugar:
+    --     function a.b.c(p) ... end  ==  a.b.c = function(p) ... end
+    --     function a:b(p)   ... end  ==  a.b   = function(self, p) ... end
+    -- Desugaring them here means the codegen never has to learn a new form,
+    -- and Pass 1/2 finish the job (both already skip funcnames).
+    do
+        local parts0 = {}
+        local last0 = 1
+        local i = 1
+        local changed = false
+        while i <= #toks do
+            local t = toks[i]
+            if t.type == "kw" and t.val == "function"
+               and is_id(i + 1) and (is_dot(i + 2) or is_colon(i + 2)) then
+                -- Walk  id ( . id | : id )*  and leave j pointing at the
+                -- token immediately AFTER the funcname (so it can be tested
+                -- for "(" below). Both exits must agree on that.
+                local segs = {}
+                local j = i + 1
+                local saw_colon = false
+                local done = false
+                while not done do
+                    segs[#segs + 1] = toks[j].val
+                    if is_dot(j + 1) and is_id(j + 2) then
+                        j = j + 2
+                    elseif is_colon(j + 1) and is_id(j + 2) then
+                        segs[#segs + 1] = toks[j + 2].val
+                        saw_colon = true
+                        j = j + 3
+                        done = true
+                    else
+                        j = j + 1
+                        done = true
+                    end
+                end
+                if is_lparen(j) then
+                    changed = true
+                    parts0[#parts0 + 1] = gap(last0, t.start)
+                    parts0[#parts0 + 1] = table.concat(segs, ".") .. " = function"
+                    if saw_colon then
+                        parts0[#parts0 + 1] = "(self"
+                        local nxt = toks[j + 1]
+                        if nxt and not (nxt.type == "op" and nxt.val == ")") then
+                            parts0[#parts0 + 1] = ","
+                        end
+                        last0 = toks[j].finish
+                        i = j + 1
+                    else
+                        last0 = toks[j - 1].finish
+                        i = j
+                    end
+                else
+                    parts0[#parts0 + 1] = gap(last0, t.start)
+                    parts0[#parts0 + 1] = source:sub(t.start, t.finish - 1)
+                    last0 = t.finish
+                    i = i + 1
+                end
+            else
+                parts0[#parts0 + 1] = gap(last0, toks[i].start)
+                parts0[#parts0 + 1] = source:sub(toks[i].start, toks[i].finish - 1)
+                last0 = toks[i].finish
+                i = i + 1
+            end
+        end
+        if changed then
+            parts0[#parts0 + 1] = source:sub(last0)
+            source = table.concat(parts0)
+            toks = {}
+            local lex0 = Lexer.new(source)
+            while true do
+                local tk = lex0:next()
+                if not tk then break end
+                toks[#toks + 1] = tk
+            end
+        end
     end
 
     -- Pass 1: colon method calls
@@ -971,7 +1105,7 @@ local function compile(source)
         ["=="]=3, ["~="]=3, ["<"]=3, ["<="]=3, [">"]=3, [">="]=3,
         [".."]=4,
         ["+"]=5, ["-"]=5,
-        ["*"]=6, ["/"]=6, ["%"]=6,
+        ["*"]=6, ["/"]=6, ["%"]=6, ["//"]=6,
         ["&"]=3, ["|"]=3, ["~"]=3, ["<<"]=3, [">>"]=3,
         ["^"]=8,
     }
@@ -1016,7 +1150,10 @@ local function compile(source)
                 local ks = to_reg(krk, key_r)
                 if ks ~= key_r then emit(3, key_r, ks) end
                 lex:expect("op", "]"); lex:expect("op", "=")
-                local vrk = parse_expr(0); cur().reg_top = save
+                -- Do NOT drop reg_top back to `save` here: key_r was allocated
+                -- at `save`, so the next alloc_reg() would hand back that same
+                -- register and the value would overwrite the key.
+                local vrk = parse_expr(0)
                 val_r = alloc_reg()
                 local vs = to_reg(vrk, val_r)
                 if vs ~= val_r then emit(3, val_r, vs) end
@@ -1038,11 +1175,14 @@ local function compile(source)
                 arr_idx = arr_idx + 1
                 key_r = alloc_reg()
                 emit(0, key_r, add_const(arr_idx))
-                local vrk = parse_expr(0); cur().reg_top = save
+                local key_r_saved = key_r
+                -- same reason as above: keep reg_top high so val_r is a
+                -- distinct register from key_r
+                local vrk = parse_expr(0)
                 val_r = alloc_reg()
                 local vs = to_reg(vrk, val_r)
                 if vs ~= val_r then emit(3, val_r, vs) end
-                emit(7, tbl_r, key_r, val_r)
+                emit(7, tbl_r, key_r_saved, val_r)
             end
 
             cur().reg_top = save + 1
@@ -1051,6 +1191,79 @@ local function compile(source)
 
         lex:expect("op", "}")
         return tbl_r
+    end
+
+    -- Walk the  [k] / .field / :method(args) / (args)  suffixes that can follow
+    -- a prefix expression. Shared by plain names and parenthesised expressions
+    -- so that  ("fmt"):format(x)  and  (f)()  work the same as  t:k(x).
+    local function parse_suffixes(base_r)
+        while true do
+            if lex:check("op", "[") then
+                lex:next()
+                local save  = cur().reg_top
+                local krk   = parse_expr(0); cur().reg_top = save
+                local key_r = to_reg(krk)
+                lex:expect("op", "]")
+                local dst = alloc_reg(); emit(6, dst, base_r, key_r)
+                base_r = dst
+
+            elseif lex:check("op", ".") then
+                lex:next()
+                local field = lex:expect("id").val
+                local key_r = alloc_reg()
+                emit(0, key_r, add_const(field))
+                local dst = alloc_reg(); emit(6, dst, base_r, key_r)
+                base_r = dst
+
+            elseif lex:check("op", ":") then
+                lex:next()
+                local method = lex:expect("id").val
+                local key_r  = alloc_reg(); emit(0, key_r, add_const(method))
+                local fn_r   = alloc_reg(); emit(6, fn_r, base_r, key_r)
+                lex:expect("op", "(")
+                local call_base = alloc_reg(); emit(3, call_base, fn_r)
+                local self_slot = alloc_reg(); emit(3, self_slot, base_r)
+                local extra = emit_args(self_slot + 1)
+                emit(35, call_base, extra + 2, 2)
+                cur().reg_top = call_base + 1
+                base_r = call_base
+
+            elseif lex:check("op", "(") then
+                lex:next()
+                local call_base = alloc_reg(); emit(3, call_base, base_r)
+                local argc = emit_args(call_base + 1)
+                emit(35, call_base, argc + 1, 2)
+                cur().reg_top = call_base + 1
+                base_r = call_base
+
+            elseif lex:check("string") then
+                -- f "text"  ==  f("text")
+                local tk = lex:next()
+                local call_base = alloc_reg(); emit(3, call_base, base_r)
+                local dst = call_base + 1
+                if cur().reg_top <= dst then cur().reg_top = dst + 1 end
+                local src = to_reg(Krk(add_const(tk.val)), dst)
+                if src ~= dst then emit(3, dst, src) end
+                emit(35, call_base, 2, 2)
+                cur().reg_top = call_base + 1
+                base_r = call_base
+
+            elseif lex:check("op", "{") then
+                -- f{1,2}  ==  f({1,2}); parse_table_constructor eats the "{"
+                local call_base = alloc_reg(); emit(3, call_base, base_r)
+                local dst = call_base + 1
+                if cur().reg_top <= dst then cur().reg_top = dst + 1 end
+                local tbl = parse_table_constructor()
+                if tbl ~= dst then emit(3, dst, tbl) end
+                emit(35, call_base, 2, 2)
+                cur().reg_top = call_base + 1
+                base_r = call_base
+
+            else
+                break
+            end
+        end
+        return base_r
     end
 
     local function compile_function_body(param_names, is_vararg)
@@ -1147,7 +1360,14 @@ local function compile(source)
             end
 
             if t.type == "op" and t.val == "(" then
-                lex:next(); local rk = parse_expr(0); lex:expect("op", ")"); return rk
+                lex:next(); local rk = parse_expr(0); lex:expect("op", ")")
+                -- ("fmt"):format(x), (f)(), (t).field are all legal; the old
+                -- code returned here and left the suffix to be misparsed.
+                if lex:check("op", "[") or lex:check("op", ".")
+                   or lex:check("op", ":") or lex:check("op", "(") then
+                    return Rrk(parse_suffixes(to_reg(rk)))
+                end
+                return rk
             end
 
             if t.type == "id" and t.val == "KRS_NOVIRTUALIZE" then
@@ -1184,8 +1404,12 @@ local function compile(source)
                 local body_finish = end_tok.finish
                 local body_src = source:sub(body_start, body_finish - 1)
                 local NOVIRTUALIZE_name = gen_id()
-                local decoder_name = "KRS_B64D"
-                local rewritten, had_str = encode_NOVIRTUALIZE_strings(body_src, decoder_name)
+                -- Must be the real randomised decoder name (module-level vB64D,
+                -- emitted later as `local function <vB64D>(s)`). The previous
+                -- literal "KRS_B64D" was never defined in the output, so any
+                -- KRS_NOVIRTUALIZE body touching a global died with
+                -- "attempt to call a nil value".
+                local rewritten, had_str = encode_NOVIRTUALIZE_strings(body_src, vB64D)
                 NOVIRTUALIZEs[#NOVIRTUALIZEs + 1] = {
                     name = NOVIRTUALIZE_name,
                     body = rewritten,
@@ -1241,49 +1465,7 @@ local function compile(source)
                     base_r = alloc_reg(); emit(4, base_r, add_const(name))
                 end
 
-                while true do
-                    if lex:check("op", "[") then
-                        lex:next()
-                        local save  = cur().reg_top
-                        local krk   = parse_expr(0); cur().reg_top = save
-                        local key_r = to_reg(krk)
-                        lex:expect("op", "]")
-                        local dst = alloc_reg(); emit(6, dst, base_r, key_r)
-                        base_r = dst
-
-                    elseif lex:check("op", ".") then
-                        lex:next()
-                        local field = lex:expect("id").val
-                        local key_r = alloc_reg()
-                        emit(0, key_r, add_const(field))
-                        local dst = alloc_reg(); emit(6, dst, base_r, key_r)
-                        base_r = dst
-
-                    elseif lex:check("op", ":") then
-                        lex:next()
-                        local method = lex:expect("id").val
-                        local key_r  = alloc_reg(); emit(0, key_r, add_const(method))
-                        local fn_r   = alloc_reg(); emit(6, fn_r, base_r, key_r)
-                        lex:expect("op", "(")
-                        local call_base = alloc_reg(); emit(3, call_base, fn_r)
-                        local self_slot = alloc_reg(); emit(3, self_slot, base_r)
-                        local extra = emit_args(self_slot + 1)
-                        emit(35, call_base, extra + 2, 2)
-                        cur().reg_top = call_base + 1
-                        base_r = call_base
-
-                    elseif lex:check("op", "(") then
-                        lex:next()
-                        local call_base = alloc_reg(); emit(3, call_base, base_r)
-                        local argc = emit_args(call_base + 1)
-                        emit(35, call_base, argc + 1, 2)
-                        cur().reg_top = call_base + 1
-                        base_r = call_base
-
-                    else
-                        break
-                    end
-                end
+                base_r = parse_suffixes(base_r)
                 return Rrk(base_r)
             end
 
@@ -1331,11 +1513,31 @@ local function compile(source)
                 if op == "^" then rhs = parse_expr(prec - 1)
                 else              rhs = parse_expr(prec)
                 end
-                local opcode = BINOP_OP[op]
-                if opcode then
+                if op == "//" then
+                    -- Floor division has no dedicated opcode in this VM.
+                    -- Lower it to math.floor(a / b): matches Lua/Luau `//` for
+                    -- both signs, and math.floor returns an integer, so the
+                    -- printed form is identical (7 // 2 -> 3, -7 // 2 -> -4).
                     local dst = alloc_reg()
-                    emit(opcode, dst, lhs, rhs)
-                    lhs = Rrk(dst)
+                    emit(12, dst, lhs, rhs)                       -- DIV
+                    local env_r = alloc_reg(); emit(4, env_r, add_const("math"))
+                    local key_r = alloc_reg(); emit(0, key_r, add_const("floor"))
+                    local fn_r  = alloc_reg(); emit(6, fn_r, env_r, key_r)
+                    local call_base = alloc_reg(); emit(3, call_base, fn_r)
+                    local arg_r = alloc_reg(); emit(3, arg_r, dst)
+                    emit(35, call_base, 2, 2)                     -- CALL fn(arg)
+                    cur().reg_top = call_base + 1
+                    lhs = Rrk(call_base)
+                else
+                    local opcode = BINOP_OP[op]
+                    if opcode then
+                        local dst = alloc_reg()
+                        emit(opcode, dst, lhs, rhs)
+                        lhs = Rrk(dst)
+                    else
+                        error(("line %d: unsupported operator '%s'"):format(
+                              lex:line_of(), op))
+                    end
                 end
             end
         end
@@ -1783,6 +1985,30 @@ local function compile(source)
                     base_r = call_base
                     was_call = true
 
+                elseif lex:check("string") or lex:check("op", "{") then
+                    -- f "text" / f{...} as a whole statement
+                    local is_str = lex:check("string")
+                    local tk = is_str and lex:next() or nil
+                    local fn_r = base_r
+                    for _, op in ipairs(chain) do
+                        local dst = alloc_reg(); emit(6, dst, fn_r, op.key_r); fn_r = dst
+                    end
+                    chain = {}
+                    local call_base = alloc_reg(); emit(3, call_base, fn_r)
+                    local dst = call_base + 1
+                    if cur().reg_top <= dst then cur().reg_top = dst + 1 end
+                    local src
+                    if is_str then
+                        src = to_reg(Krk(add_const(tk.val)), dst)
+                    else
+                        src = parse_table_constructor()   -- eats the "{"
+                    end
+                    if src ~= dst then emit(3, dst, src) end
+                    emit(35, call_base, 2, 2)
+                    cur().reg_top = call_base + 1
+                    base_r = call_base
+                    was_call = true
+
                 else
                     break
                 end
@@ -1844,10 +2070,15 @@ local function compile(source)
             if not was_call and lex:check("op", "=") then
                 lex:next()
                 local save  = cur().reg_top
-                local rk    = parse_expr(0); cur().reg_top = save
+                local rk    = parse_expr(0)
                 local val_r = to_reg(rk)
 
                 if #chain > 0 then
+                    -- reg_top must stay high until the SETTABLE is emitted.
+                    -- Dropping it back to `save` here makes the chain walk's
+                    -- alloc_reg() hand back the very register that val_r lives
+                    -- in, so `a.b.c = function() end` stored the intermediate
+                    -- table `a.b` instead of the closure.
                     local cur_r = base_r
                     for i = 1, #chain - 1 do
                         local dst = alloc_reg()
@@ -1855,7 +2086,9 @@ local function compile(source)
                         cur_r = dst
                     end
                     emit(7, cur_r, chain[#chain].key_r, val_r)
+                    cur().reg_top = save
                 else
+                    cur().reg_top = save
                     if kind == "local" then
                         if val_r ~= loc then emit(3, loc, val_r) end
                     elseif kind == "upval" then
@@ -1884,7 +2117,12 @@ local function compile(source)
             if not t then break end
             if t.type == "kw" and stop[t.val] then break end
 
-            if not parse_stat() then break end
+            if not parse_stat() then
+                -- Silently stopping here used to truncate the rest of the
+                -- script with no diagnostic at all.
+                error(("line %d: unexpected '%s' - a statement cannot start here"):format(
+                      lex:line_of(t), tostring(t.val or t.type)))
+            end
         end
     end
 
@@ -3157,7 +3395,12 @@ end]]):format(man_c,tbl_a,seps,seps,seps,tbl_a,man_r,_tostring,tbl_a,tbl_a,man_r
         wl("  end")
         wl("  return function(...)")
         wl(("    local %s={...}"):format(vINNER))
-        wl(("    return %s(%s.%s,%s,%s,%s,%s,%s,%s.%s or 0)"):format(
+        -- The executor hands back frm.RETVALS, a TABLE of return values, so it
+        -- has to be unpacked here: CALL does `{fn(...)}` and then reads RES[1],
+        -- RES[2]... Without the unpack, every call to an obfuscated function
+        -- yields the wrapper table instead of the values.
+        wl(("    return (%s[%s] or unpack)(%s(%s.%s,%s,%s,%s,%s,%s,%s.%s or 0))"):format(
+            _table,encodeString("unpack"),
             vEXEC,vPROTO,fINSTRUCTIONS,vCON2,vENV2,vPROTOS2,vINNER,vUVLIST,vPROTO,fPARAMS))
         wl("  end")
         wl("end")
@@ -3860,15 +4103,22 @@ end
 
 src=smth.."\n"..src
 
-local cgd = gen_id()
-
 local seed = os.time()
 if arg and arg[2] then
     local n = tonumber(arg[2])
     if n then seed = n end
 end
 
-local seed = os.time()
+-- Two things used to make runs irreproducible even with an explicit seed:
+--   * a second `local seed = os.time()` shadowed the arg[2] seed above, and
+--   * `cgd = gen_id()` ran before the seed was known, drawing from the
+--     os.clock()-based randomseed done at module load.
+-- engine.py passes a fresh random seed per request, so this does not change
+-- production behaviour - it just makes a fixed seed actually reproducible.
+math.randomseed(seed)
+
+local cgd = gen_id()
+
 local result = obf.obfuscate(src, seed)
 result = result:gsub("\n", " ")
 result = result:gsub("%s+", " ")
