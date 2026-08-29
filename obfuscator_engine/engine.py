@@ -6,14 +6,20 @@ This module carries everything needed to obfuscate: the Kryos v16.0 engine
 5.4.8 interpreter compressed & embedded. There is nothing else to deploy and
 nothing on the host to install.
 
-Secrecy:
-  The engine blob is encrypted with a key derived from the KRS_ENGINE_KEY
-  environment variable. Even if this repo leaks, the engine code is
-  unreadable without that key — keep it in Render's environment alongside
-  DISCORD_TOKEN, never in the repo.
+Where the engine source comes from:
+  1. `kyros.lua` sitting next to this file, if present. This is the normal
+     path — edit that file, commit, redeploy. No key, no re-encryption.
+  2. Otherwise, the encrypted blob embedded below, decrypted with a key
+     derived from KRS_ENGINE_KEY. Kept as a fallback for deployments that
+     ship without kyros.lua on disk.
+
+  Note: the embedded blob is NOT a secrecy boundary while kyros.lua is
+  committed to the repo in plaintext — anyone can read it on GitHub. It is
+  only useful if you stop shipping the .lua file.
 
 Env vars:
-  KRS_ENGINE_KEY       REQUIRED — hex key that decrypts the embedded engine.
+  KRS_ENGINE_KEY       only needed for the embedded-blob fallback.
+  KRS_PREFER_BLOB      set to 1 to ignore kyros.lua on disk and force the blob.
   KRS_LUA_BIN          optional — force a different Lua 5.3+ interpreter.
   OBF_ENGINE_TIMEOUT   optional — seconds before a run is killed (default 180).
 """
@@ -61,16 +67,31 @@ def _decrypt(payload: bytes, key: bytes) -> bytes:
     return bytes(out)
 
 
+# kyros.lua shipped next to this file. Preferred over the embedded blob so
+# that editing the engine is just an edit + commit + redeploy.
+_ENGINE_LUA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kyros.lua")
+
+
+def _prefers_blob() -> bool:
+    return os.environ.get("KRS_PREFER_BLOB", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _load_engine_source() -> str:
     global _engine_source
     if _engine_source is not None:
         return _engine_source
+
+    if os.path.isfile(_ENGINE_LUA) and not _prefers_blob():
+        with open(_ENGINE_LUA, "r", encoding="utf-8") as f:
+            _engine_source = f.read()
+        return _engine_source
+
     raw = os.environ.get(KEY_ENV, "").strip()
     if not raw:
         raise RuntimeError(
-            f"{KEY_ENV} is not set. Add it in the host's environment "
-            "(Render → Environment → KRS_ENGINE_KEY=<key from the setup chat>) "
-            "and redeploy/restart."
+            f"No engine source available: {_ENGINE_LUA} is missing and "
+            f"{KEY_ENV} is not set. Ship kyros.lua next to engine.py (the "
+            "normal setup), or set KRS_ENGINE_KEY to use the embedded blob."
         )
     key = _derive_key(raw)
     try:
