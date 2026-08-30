@@ -55,6 +55,10 @@ Handled (token-aware; strings & comments are never touched):
   3. Double unary signs: `- -5`, `+ +5`, `- - x` -> collapsed by parity
      (`a = - -5`  ==  `a = 5`; `return - -x` == `return x`).
      Only in unary context, so `a - -b` (binary minus) is left alone.
+  4. Lua/Luau method-call argument sugar unsupported by Kryos' parser:
+       object:method "value"  ->  object:method("value")
+       object:method {x = 1}  ->  object:method({x = 1})
+     This is a token-only wrapper; string/comment contents remain untouched.
 
 Type-annotation scanning respects nesting: ( ) [ ] { } < > are counted, so
 types like `{x: number}` or `(number) -> string` are skipped in one piece.
@@ -162,7 +166,9 @@ def _long_bracket(src, i):
 
 
 def _find_long_close(src, start, eq):
-    return src.find("]" + "=" * eq + "]", start)
+    marker = "]" + "=" * eq + "]"
+    pos = src.find(marker, start)
+    return None if pos < 0 else pos + len(marker)
 
 
 def _newline_after(src, pos):
@@ -421,6 +427,61 @@ def _strip_param_types(toks, idx, lparen_p, rparen_p, drop):
         k += 1
 
 
+def _parenthesize_method_call_sugar(src):
+    """Wrap bare string/table arguments used by ``object:method args``.
+
+    Lua permits a literal string or table constructor to replace the normal
+    parenthesized argument list.  Kryos handles that sugar for ordinary calls
+    but its method-call parser always expects ``(``.  Insert only the missing
+    parentheses, using token offsets so text inside strings and comments can
+    never be inspected or changed.
+    """
+    toks = list(_tokenize(src))
+    idx = [i for i, t in enumerate(toks) if t[0] not in ("ws", "comment")]
+    edits = []
+
+    for p in range(len(idx) - 2):
+        colon = toks[idx[p]]
+        name = toks[idx[p + 1]]
+        arg = toks[idx[p + 2]]
+        if not (colon[0] == "op" and colon[1] == ":" and name[0] == "id"):
+            continue
+
+        end_pos = None
+        if arg[0] == "str":
+            end_pos = arg[3]
+        elif arg[0] == "op" and arg[1] == "{":
+            # Braces occurring in strings/comments are single opaque tokens,
+            # so brace depth is sufficient to find this table constructor.
+            depth = 0
+            for q in range(p + 2, len(idx)):
+                token = toks[idx[q]]
+                if token[0] != "op":
+                    continue
+                if token[1] == "{":
+                    depth += 1
+                elif token[1] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = token[3]
+                        break
+
+        if end_pos is not None:
+            edits.append((arg[2], "("))
+            edits.append((end_pos, ")"))
+
+    if not edits:
+        return src
+
+    # Apply right-to-left so every position remains an offset into `src`.
+    # At an equal position a closing parenthesis belongs before an opening one;
+    # this order also keeps the helper deterministic for nested/chained calls.
+    for pos, text in sorted(edits, key=lambda item: (item[0], item[1] == "("),
+                                                    reverse=True):
+        src = src[:pos] + text + src[pos:]
+    return src
+
+
 def _collapse_double_unary(src):
     toks = list(_tokenize(src))
     idx = [i for i, t in enumerate(toks) if t[0] not in ("ws", "comment")]
@@ -461,6 +522,7 @@ def preprocess(source):
     if not source:
         return source
     src = _strip_annotations(source)
+    src = _parenthesize_method_call_sugar(src)
     src = _collapse_double_unary(src)
     return src
 
