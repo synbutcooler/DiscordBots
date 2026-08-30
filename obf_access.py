@@ -1,32 +1,33 @@
-"""Obfuscator access backed by the existing Vadrifts key-system flow.
+"""Obfuscator access through the existing Vadrifts key-system session flow.
 
-The bot does not run a second LootLabs gateway.  It creates a normal shared
-``guild_key_sessions`` record with ``purpose='obfuscator'`` and sends the user
-to the website's existing ``/ks/gateway/<token>`` page.  The website performs
-the same IP binding, timer, provider redirect, and completion checks used for keys;
-for this purpose the website also encrypts a one-session destination through
-LootLabs' official Redirect API. Discord grants the obfuscator window only
-after that shared session is complete and the original user presses Claim
-Access.
-
-Configure a dedicated ad-link script profile in the owner guild, set its
-LootLabs destination to the profile's normal ``/ks/done/...`` URL, then set
-``OBF_KS_PROFILE_ID`` (preferred) or ``OBF_KS_PROFILE_NAME`` on the bot service.
+The LootLabs locker is static and keeps its existing immutable destination:
+``https://vadriftzbots.onrender.com/obf/claim``. Discord creates a shared
+``guild_key_sessions`` record, sends the user through the existing Vadrifts
+``/ks/gateway`` UI, and Vadrifts starts the IP-bound timer before redirecting to
+``OBF_STATIC_LINK``. When LootLabs returns to the fixed bot callback, the bot
+marks the matching shared session complete. Access is granted only when the
+same Discord user subsequently presses Claim Access.
 """
 
 import hashlib
 import logging
 import os
 import time
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
 DB_NAME = "vadrifts_bots"
 UNLOCKS_COLLECTION = "obf_unlocks"
 DEFAULT_BYPASS_IDS = "1323980404411334738"  # feariosz0
-DEFAULT_PROFILE_NAME = "Obfuscator Access"
-_LOOTLABS_HOSTS = ("lootdest.org", "lootlabs.gg", "loot-link.com", "loot-links.com")
+OBF_SESSION_PROFILE_ID = "__obfuscator_static__"
+OBF_PROFILE_NAME = "Obfuscator Access"
+_LOOTLABS_HOSTS = (
+    "lootdest.org",
+    "lootlabs.gg",
+    "loot-link.com",
+    "loot-links.com",
+)
 
 
 class AccessError(RuntimeError):
@@ -91,6 +92,38 @@ def _minimum_seconds() -> int:
     return min(max(seconds, 10), 15 * 60)
 
 
+def _host_matches(host, domains):
+    host = (host or "").lower().rstrip(".")
+    return any(host == domain or host.endswith("." + domain) for domain in domains)
+
+
+def _static_link() -> str:
+    link = (os.environ.get("OBF_STATIC_LINK") or "").strip()
+    if not link:
+        raise AccessError(
+            "OBF_STATIC_LINK is not configured on the DiscordBots service."
+        )
+    if any(char in link for char in "\r\n"):
+        raise AccessError("OBF_STATIC_LINK is invalid.")
+    try:
+        parsed = urlsplit(link)
+    except ValueError as exc:
+        raise AccessError("OBF_STATIC_LINK is invalid.") from exc
+    if parsed.scheme != "https" or not _host_matches(parsed.hostname, _LOOTLABS_HOSTS):
+        raise AccessError("OBF_STATIC_LINK must be a genuine HTTPS LootLabs URL.")
+    return link
+
+
+def is_valid_lootlabs_referrer(referer) -> bool:
+    try:
+        parsed = urlsplit(referer or "")
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and _host_matches(
+        parsed.hostname, _LOOTLABS_HOSTS
+    )
+
+
 def bypass_ids() -> set:
     raw = os.environ.get("OBF_BYPASS_IDS", DEFAULT_BYPASS_IDS)
     return {int(part.strip()) for part in raw.split(",") if part.strip().isdigit()}
@@ -128,7 +161,7 @@ def grant(discord_id, hours=None, session_token="") -> float:
         {"$set": {
             "granted_at": now,
             "expires_at": expires_at,
-            "source": "vadrifts_key_system",
+            "source": "vadrifts_static_lootlabs",
             "verification_session_hash": hashlib.sha256(
                 str(session_token or "").encode("utf-8")
             ).hexdigest(),
@@ -144,96 +177,33 @@ def revoke(discord_id) -> None:
     _unlocks.delete_one({"_id": str(discord_id)})
 
 
-def _resolve_profile(guild_id):
-    from guild_key_system import (
-        get_profile_by_name,
-        get_script_profile,
-        update_script_profile,
-    )
-
-    explicit_id = (os.environ.get("OBF_KS_PROFILE_ID") or "").strip()
-    if explicit_id:
-        profile = get_script_profile(explicit_id)
-    else:
-        name = (os.environ.get("OBF_KS_PROFILE_NAME") or DEFAULT_PROFILE_NAME).strip()
-        profile = get_profile_by_name(guild_id, name)
-
-    if not profile:
-        selector = (
-            f"ID `{explicit_id}`" if explicit_id else
-            f"name `{os.environ.get('OBF_KS_PROFILE_NAME') or DEFAULT_PROFILE_NAME}`"
-        )
-        raise AccessError(
-            f"The obfuscator verification profile ({selector}) does not exist. "
-            "Create a dedicated Ad-Link profile with /ks setup, configure its "
-            "LootLabs URL, then set OBF_KS_PROFILE_ID on the bot."
-        )
-    if str(profile.get("guild_id")) != str(guild_id):
-        raise AccessError("OBF_KS_PROFILE_ID belongs to a different Discord server.")
-    if not profile.get("enabled", True):
-        raise AccessError("The obfuscator verification profile is disabled.")
-    if profile.get("key_type") != "adlink":
-        raise AccessError("The obfuscator verification profile must use Ad-Link mode.")
-    reserved_for = profile.get("system_purpose")
-    if reserved_for and reserved_for != "obfuscator":
-        raise AccessError("That profile is reserved for another internal flow.")
-    lootlabs_url = (profile.get("lootlabs_url") or "").strip()
-    if not lootlabs_url:
-        raise AccessError(
-            "The obfuscator verification profile has no LootLabs URL. Configure "
-            "one with /ks setlink first."
-        )
-    if any(char in lootlabs_url for char in "\r\n"):
-        raise AccessError("The configured LootLabs URL is invalid.")
-    try:
-        parsed = urlsplit(lootlabs_url)
-    except ValueError as exc:
-        raise AccessError("The configured LootLabs URL is invalid.") from exc
-    host = (parsed.hostname or "").lower().rstrip(".")
-    if parsed.scheme != "https" or not any(
-        host == domain or host.endswith("." + domain)
-        for domain in _LOOTLABS_HOSTS
-    ):
-        raise AccessError("The profile must contain a genuine HTTPS LootLabs URL.")
-    if any(key.lower() == "data"
-           for key, _value in parse_qsl(parsed.query, keep_blank_values=True)):
-        raise AccessError("Remove the existing data parameter from the LootLabs URL.")
-    if reserved_for != "obfuscator":
-        if not update_script_profile(
-            profile["profile_id"], {"system_purpose": "obfuscator"}
-        ):
-            raise AccessError("Could not reserve the obfuscator verification profile.")
-        profile["system_purpose"] = "obfuscator"
-    return profile
-
-
-def profile_destination(guild_id, profile_id) -> str:
-    from guild_key_system import get_destination_url
-    return get_destination_url(guild_id, profile_id)
-
-
 def create_verification_offer(discord_id, username, guild_id) -> dict:
-    """Create/reuse an obfuscator-purpose session in the shared key-system DB."""
+    """Create or resume a shared session for the immutable static locker."""
     from guild_key_system import (
         SERVER_BASE_URL,
         create_session,
         get_user_session,
+        update_session,
     )
 
-    profile = _resolve_profile(guild_id)
-    profile_id = profile["profile_id"]
+    static_link = _static_link()
 
-    # Prefer a completed unclaimed session, then an in-progress one. This is the
-    # same resume behavior as normal key claims and avoids invalidating a link
-    # whenever the user repeats .obf.
+    # Resume a completed unclaimed session first, then an in-progress session.
     session = get_user_session(
-        discord_id, guild_id, profile_id,
-        purpose="obfuscator", completed=True, claimed=False,
+        discord_id,
+        guild_id,
+        OBF_SESSION_PROFILE_ID,
+        purpose="obfuscator",
+        completed=True,
+        claimed=False,
     )
     if not session:
         session = get_user_session(
-            discord_id, guild_id, profile_id,
-            purpose="obfuscator", completed=False,
+            discord_id,
+            guild_id,
+            OBF_SESSION_PROFILE_ID,
+            purpose="obfuscator",
+            completed=False,
         )
 
     if session:
@@ -243,7 +213,7 @@ def create_verification_offer(discord_id, username, guild_id) -> dict:
             guild_id,
             discord_id,
             username,
-            profile_id,
+            OBF_SESSION_PROFILE_ID,
             purpose="obfuscator",
             allowed_providers=["lootlabs"],
             min_completion_seconds=_minimum_seconds(),
@@ -253,15 +223,73 @@ def create_verification_offer(discord_id, username, guild_id) -> dict:
             raise AccessError("The website could not create a verification session.")
         session = {"token": token, "completed": False, "key_claimed": False}
 
+    if not session.get("completed"):
+        if not update_session(token, {
+            "provider_url": static_link,
+            "static_callback": True,
+            "flow_name": OBF_PROFILE_NAME,
+        }):
+            raise AccessError("The static verification session could not be prepared.")
+
     return {
         "session_token": token,
         "gateway_url": f"{SERVER_BASE_URL}/ks/gateway/{token}",
         "completed": bool(session.get("completed")),
         "claimed": bool(session.get("key_claimed")),
-        "profile_id": profile_id,
-        "profile_name": profile.get("name", DEFAULT_PROFILE_NAME),
-        "destination_url": profile_destination(guild_id, profile_id),
+        "profile_id": OBF_SESSION_PROFILE_ID,
+        "profile_name": OBF_PROFILE_NAME,
     }
+
+
+def complete_static_callback(client_ip, referer) -> dict:
+    """Validate the fixed /obf/claim return and mark its shared session complete."""
+    from guild_key_system import (
+        complete_static_obfuscator_session,
+        get_static_obfuscator_session_by_ip,
+    )
+
+    if not client_ip:
+        raise AccessError("Your network could not be identified. Start again in Discord.")
+    if not is_valid_lootlabs_referrer(referer):
+        raise AccessError(
+            "Open the Vadrifts verification page and complete LootLabs first."
+        )
+
+    session = get_static_obfuscator_session_by_ip(client_ip)
+    if not session:
+        raise AccessError(
+            "No active verification was found for this browser/network. "
+            "Start again with .obfunlock in Discord."
+        )
+
+    timer_started = session.get("timer_started_at")
+    provider_started = session.get("provider_started_at")
+    try:
+        started_at = max(float(timer_started), float(provider_started))
+        required = int(
+            session.get("min_completion_seconds") or _minimum_seconds()
+        )
+    except (TypeError, ValueError):
+        raise AccessError("The verification timer is invalid. Start again in Discord.")
+    required = min(max(required, _minimum_seconds(), 10), 15 * 60)
+    elapsed = time.time() - started_at
+    if elapsed < required:
+        wait = int(required - elapsed) + 1
+        raise AccessError(
+            f"LootLabs returned too quickly. Complete the task and try again in {wait}s."
+        )
+
+    completed = complete_static_obfuscator_session(session["token"], client_ip)
+    if not completed:
+        raise AccessError("This verification was already used or changed. Start again.")
+
+    logger.info(
+        "static obfuscator verification completed: session=%s user=%s elapsed=%.1fs",
+        session["token"][:8],
+        session.get("discord_id"),
+        elapsed,
+    )
+    return completed
 
 
 def claim_verification(session_token, discord_id) -> float:
@@ -277,11 +305,13 @@ def claim_verification(session_token, discord_id) -> float:
         raise AccessError("This verification session expired. Run .obfunlock again.")
     if session.get("purpose", "key") != "obfuscator":
         raise AccessError("This is not an obfuscator verification session.")
+    if not session.get("static_callback"):
+        raise AccessError("This is not a current static LootLabs session.")
     if str(session.get("discord_id")) != str(discord_id):
         raise AccessError("This verification session belongs to another user.")
     if not session.get("completed"):
         raise AccessError(
-            "Verification is not complete yet. Open the website, finish LootLabs, "
+            "Verification is not complete yet. Open Vadrifts, finish LootLabs, "
             "then press Claim Access again."
         )
     if session.get("key_claimed"):
@@ -301,7 +331,14 @@ def claim_verification(session_token, discord_id) -> float:
     try:
         return grant(discord_id, session_token=session_token)
     except Exception:
-        # Let the user retry if the access DB had a transient failure after the
-        # shared session was atomically claimed.
+        # Let the user retry if access storage failed after the atomic claim.
         update_session(session_token, {"key_claimed": False})
         raise
+
+
+# Keeps an older obfuscator.py from crashing during a staggered deployment.
+def unlock_offer(discord_id, username="", guild_id=None):
+    if guild_id is None:
+        guild_id = os.environ.get("DISCORD_GUILD_ID", "1241797935100989594")
+    offer = create_verification_offer(discord_id, username, guild_id)
+    return offer["gateway_url"], None
