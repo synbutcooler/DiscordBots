@@ -271,40 +271,116 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
         hours, rem = divmod(int(seconds), 3600)
         return f"{hours}h {rem // 60}m" if hours else f"{rem // 60}m"
 
-    async def _unlock_prompt(user) -> str:
-        """Build the 'go do a checkpoint' message, creating the link on demand."""
-        loop = asyncio.get_running_loop()
-        try:
-            link, code = await loop.run_in_executor(
-                None, obf_access.unlock_offer, user.id, str(user))
-        except obf_access.AccessError as exc:
-            return f"⚠️ I couldn't create an unlock link right now: {exc}"
+    class ObfClaimView(discord.ui.View):
+        """Discord half of the existing website verification/claim flow."""
 
-        hours = obf_access._unlock_hours()
-        if code:
-            # Static-link mode: the destination can't carry a per-user token,
-            # so the landing page asks for this code.
-            steps = (
-                f"1. Open this link: {link}\n"
-                "2. Complete the checkpoint\n"
-                f"3. On the page you land on, enter this code: **`{code}`**\n"
-                f"4. You'll get **{hours} hours** of obfuscation, then it resets."
+        def __init__(self, offer, user_id):
+            super().__init__(timeout=1800)
+            self.session_token = offer["session_token"]
+            self.user_id = int(user_id)
+            self.add_item(discord.ui.Button(
+                label="🔗 Open Verification",
+                style=discord.ButtonStyle.link,
+                url=offer["gateway_url"],
+            ))
+
+        @discord.ui.button(
+            label="✅ Claim Access", style=discord.ButtonStyle.success
+        )
+        async def claim_access(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            if interaction.user.id != self.user_id:
+                await interaction.response.send_message(
+                    "❌ This isn't your verification session.", ephemeral=True
+                )
+                return
+            try:
+                expires_at = await asyncio.to_thread(
+                    obf_access.claim_verification,
+                    self.session_token,
+                    interaction.user.id,
+                )
+            except obf_access.AccessError as exc:
+                await interaction.response.send_message(f"⏳ {exc}", ephemeral=True)
+                return
+            except Exception:
+                await interaction.response.send_message(
+                    "⚠️ Couldn't activate access right now. Try again in a minute.",
+                    ephemeral=True,
+                )
+                return
+
+            expires_ts = int(expires_at)
+            embed = discord.Embed(
+                title="✅ Obfuscator Unlocked",
+                description=(
+                    "Your website verification was confirmed. You can now DM "
+                    "`.obf` with your `.lua` file."
+                ),
+                color=discord.Color.green(),
+            )
+            embed.add_field(
+                name="Access Expires", value=f"<t:{expires_ts}:R>", inline=True
+            )
+            embed.set_footer(text="A failed obfuscation does not consume the unlock.")
+            for item in self.children:
+                if isinstance(item, discord.ui.Button) and not item.url:
+                    item.disabled = True
+            button.label = "✅ Access Claimed"
+            await interaction.response.edit_message(
+                content=None, embed=embed, view=self
+            )
+            self.stop()
+
+    async def _unlock_prompt(user):
+        """Create/resume the normal Vadrifts key-system gateway session."""
+        try:
+            offer = await asyncio.to_thread(
+                obf_access.create_verification_offer,
+                user.id,
+                str(user),
+                guild_id,
+            )
+        except obf_access.AccessError as exc:
+            return f"⚠️ I couldn't create a verification session: {exc}"
+
+        view = ObfClaimView(offer, user.id)
+        if offer.get("completed"):
+            embed = discord.Embed(
+                title="✅ Verification Already Complete",
+                description=(
+                    "The website already confirmed your LootLabs task. "
+                    "Click **Claim Access** below."
+                ),
+                color=discord.Color.green(),
             )
         else:
-            steps = (
-                f"1. Open this link: {link}\n"
-                "2. Complete the checkpoint\n"
-                f"3. You'll get **{hours} hours** of obfuscation, then it resets."
+            embed = discord.Embed(
+                title="🔒 Obfuscator Verification",
+                description=(
+                    f"**Unlocking: {offer['profile_name']}**\n\n"
+                    "1️⃣ Click **Open Verification** below\n"
+                    "2️⃣ On Vadrifts, click **LootLabs** and complete the task\n"
+                    "3️⃣ Return here and click **Claim Access**\n\n"
+                    "⏱️ The website session expires in **30 minutes**"
+                ),
+                color=discord.Color.blurple(),
             )
-        return (
-            "🔒 **The obfuscator needs a one-time checkpoint.**\n\n"
-            f"{steps}\n\n"
-            "Come back here and send `.obf` with your `.lua` attached. "
-            "Nothing is charged per script — a failed obfuscation costs you nothing."
+        embed.set_footer(
+            text=f"One verification unlocks {obf_access._unlock_hours()} hours."
         )
+        return embed, view
+
+    async def _send_access_denial(ctx, payload):
+        if isinstance(payload, tuple):
+            embed, view = payload
+            await ctx.send(embed=embed, view=view)
+        else:
+            await ctx.send(payload)
 
     async def _check_obf_access(user):
-        """Gate for .obf: bypass IDs always pass, everyone else needs a window."""
+        """Gate for .obf: bypass IDs pass; others use the shared /ks flow."""
         if (obf_access.gate_disabled()
                 or user.id == owner_id
                 or user.id in obf_access.bypass_ids()):
@@ -336,7 +412,7 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
 
         ok, why = await _check_obf_access(ctx.author)
         if not ok:
-            await ctx.send(why)
+            await _send_access_denial(ctx, why)
             return
 
         source = None
@@ -423,7 +499,7 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
                 await ctx.send(f"✅ Already unlocked — **{_fmt_left(left)}** left. "
                                "DM me `.obf` with your `.lua` attached.")
                 return
-            await ctx.send(await _unlock_prompt(ctx.author))
+            await _send_access_denial(ctx, await _unlock_prompt(ctx.author))
         except obf_access.AccessError as exc:
             await ctx.send(f"⚠️ {exc}")
 
