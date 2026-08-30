@@ -1,3 +1,4 @@
+import html
 import os
 import time
 import logging
@@ -6,6 +7,7 @@ import requests
 from flask import Flask, request, jsonify
 from config import DISCORD_TOKEN, DISCORD_KEY_API_SECRET
 from key_store import get_key, delete_key, lock_hwid, GUILD_ID
+import obf_access
 from discord_bot import start_bot
 from stickied_message_bot import start_stickied_bot
 
@@ -17,6 +19,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+
+def get_client_ip():
+    """Render puts the real client first in X-Forwarded-For."""
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    if client_ip and "," in client_ip:
+        client_ip = client_ip.split(",", 1)[0].strip()
+    return client_ip
 
 
 SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://vadriftzbots.onrender.com")
@@ -39,28 +49,67 @@ def health():
 def index():
     return jsonify({"status": "Bot server running"}), 200
 
-_RETIRED_OBF_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+_OBF_RESULT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Verification link retired</title><style>
-body{font-family:system-ui;background:#1e1f22;color:#dbdee1;display:grid;place-items:center;
-min-height:100vh;margin:0;padding:24px}.card{max-width:480px;background:#2b2d31;border-radius:12px;
-padding:30px;text-align:center}h1{font-size:21px;color:#ed4245}code{background:#1e1f22;padding:3px 6px;border-radius:5px}
-</style></head><body><div class="card"><h1>Old verification link retired</h1>
-<p>Obfuscator verification now uses the protected Vadrifts key-system gateway.</p>
-<p>Return to Discord and DM the bot <code>.obfunlock</code> for a fresh link.</p>
+<title>{title}</title><style>
+body{{font-family:system-ui;background:#1e1f22;color:#dbdee1;display:grid;place-items:center;
+min-height:100vh;margin:0;padding:24px}}.card{{max-width:500px;background:#2b2d31;border-radius:12px;
+padding:30px;text-align:center;box-shadow:0 8px 24px #0006}}h1{{font-size:22px;color:{color}}}
+p{{line-height:1.55}}code{{background:#1e1f22;padding:3px 6px;border-radius:5px}}
+</style></head><body><div class="card"><h1>{title}</h1><p>{message}</p>
 </div></body></html>"""
 
 
-@app.route('/obf/claim', methods=['GET', 'POST'])
-def obf_claim_retired():
-    # The old code-entry path relied on Referer/timing and must never grant.
-    return _RETIRED_OBF_PAGE, 410
+def _obf_result(title, message, success=False):
+    return _OBF_RESULT_PAGE.format(
+        title=html.escape(title),
+        message=html.escape(message),
+        color="#57f287" if success else "#ed4245",
+    )
+
+
+@app.route('/obf/claim', methods=['GET'])
+def obf_claim_callback():
+    """Immutable destination of OBF_STATIC_LINK; confirms but never grants."""
+    try:
+        session = obf_access.complete_static_callback(
+            get_client_ip(), request.headers.get("Referer", "")
+        )
+    except obf_access.AccessError as exc:
+        logger.warning("Static obfuscator callback rejected: %s", exc)
+        return _obf_result("Verification rejected", str(exc)), 403
+    except Exception:
+        logger.exception("Static obfuscator callback failed")
+        return _obf_result(
+            "Verification unavailable",
+            "The verification could not be saved. Return to Discord and try again.",
+        ), 503
+
+    logger.info(
+        "Static obfuscator callback confirmed session=%s",
+        session["token"][:8],
+    )
+    return _obf_result(
+        "Verification complete",
+        "Return to Discord and press Claim Access. This page does not grant access by itself.",
+        success=True,
+    ), 200
+
+
+@app.route('/obf/claim', methods=['POST'])
+def obf_claim_legacy_post():
+    return _obf_result(
+        "Old code form retired",
+        "Return to Discord, run .obfunlock, and use the Vadrifts verification page.",
+    ), 410
 
 
 @app.route('/obf/unlock/<token>')
 def obf_unlock_retired(token):
-    # Dynamic links issued by the old bot flow are intentionally fail-closed.
-    return _RETIRED_OBF_PAGE, 410
+    return _obf_result(
+        "Old verification link retired",
+        "Return to Discord and run .obfunlock for a current verification session.",
+    ), 410
 
 
 @app.route('/api/validate-discord-key', methods=['POST'])
