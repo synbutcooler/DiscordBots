@@ -1,91 +1,54 @@
-"""24-hour obfuscator access, unlocked by a LootLabs checkpoint.
+"""Obfuscator access backed by the existing Vadrifts key-system flow.
 
-Flow
-----
-1. User DMs `.obf` with no active access. The bot creates a one-task LootLabs
-   locker whose destination is `{SELF_URL}/obf/unlock/{token}` and DMs the link.
-2. User completes the checkpoint. LootLabs redirects them to that URL.
-3. The Flask route in main.py calls `redeem(token)`, which marks the token used
-   and grants that Discord ID `OBF_UNLOCK_HOURS` (default 24) of access.
-4. `.obf` checks `has_access()` before running the engine.
+The bot does not run a second LootLabs gateway.  It creates a normal shared
+``guild_key_sessions`` record with ``purpose='obfuscator'`` and sends the user
+to the website's existing ``/ks/gateway/<token>`` page.  The website performs
+the same IP binding, timer, provider redirect, and completion checks used for keys;
+for this purpose the website also encrypts a one-session destination through
+LootLabs' official Redirect API. Discord grants the obfuscator window only
+after that shared session is complete and the original user presses Claim
+Access.
 
-Nothing is "charged" per obfuscation — one checkpoint buys a 24h window, so a
-failed obfuscation never costs the user anything.
-
-Two modes
----------
-**Static link** (no API needed). Set `OBF_STATIC_LINK` to a link you made in the
-LootLabs dashboard. Its destination must be `{SELF_URL}/obf/claim`. Because that
-destination is fixed, it can't carry a per-user token, so the bot hands the user
-a short claim code and the landing page asks for it.
-
-**API link** (needs `LOOTLABS_API_TOKEN`). The bot creates a fresh locker per
-user whose destination already embeds a one-time token — no code to type, and
-nobody can claim without actually completing the checkpoint. Strictly better,
-use it if you can get the API working.
-
-`OBF_STATIC_LINK` wins if both are set.
-
-Env vars
---------
-  OBF_STATIC_LINK       a LootLabs link from the dashboard. Enables static mode.
-  LOOTLABS_API_TOKEN    needed for API mode (same token as the website).
-  LOOTLABS_OBF_TIER_ID  optional, 1-3 (default 3).
-  LOOTLABS_OBF_THEME    optional, 1-5 (default 5).
-  OBF_BYPASS_IDS        comma-separated Discord IDs that skip the checkpoint.
-                        Defaults to feariosz0; the bot owner is always bypassed.
-  OBF_UNLOCK_HOURS      optional, length of the access window (default 24).
-  OBF_GATE_DISABLED     set to 1 to disable the gate entirely (emergency only).
-  RENDER_EXTERNAL_URL   public base URL of this service.
+Configure a dedicated ad-link script profile in the owner guild, set its
+LootLabs destination to the profile's normal ``/ks/done/...`` URL, then set
+``OBF_KS_PROFILE_ID`` (preferred) or ``OBF_KS_PROFILE_NAME`` on the bot service.
 """
 
+import hashlib
 import logging
 import os
-import secrets
 import time
-
-import requests
+from urllib.parse import parse_qsl, urlsplit
 
 logger = logging.getLogger(__name__)
 
-LOOTLABS_API_URL = "https://creators.lootlabs.gg/api/public/content_locker"
-
 DB_NAME = "vadrifts_bots"
 UNLOCKS_COLLECTION = "obf_unlocks"
-TOKENS_COLLECTION = "obf_unlock_tokens"
-CLAIMS_COLLECTION = "obf_claim_codes"
-
-# A pending link the user never completes shouldn't sit around forever.
-TOKEN_TTL_SECONDS = 6 * 60 * 60
-
 DEFAULT_BYPASS_IDS = "1323980404411334738"  # feariosz0
+DEFAULT_PROFILE_NAME = "Obfuscator Access"
+_LOOTLABS_HOSTS = ("lootdest.org", "lootlabs.gg", "loot-link.com", "loot-links.com")
 
 
 class AccessError(RuntimeError):
-    """Something is misconfigured or LootLabs refused."""
+    pass
 
 
-# ---------------------------------------------------------------------------
-# Mongo
-# ---------------------------------------------------------------------------
-_db = None
 _unlocks = None
-_tokens = None
-_claims = None
 
 
 def _init_db():
-    global _db, _unlocks, _tokens, _claims
+    global _unlocks
     try:
         from config import MONGODB_URI
     except Exception:
         MONGODB_URI = os.environ.get("MONGODB_URI")
 
     if not MONGODB_URI:
-        logger.error("MONGODB_URI is not set — obfuscator access gate is off-line.")
+        logger.error("MONGODB_URI is not set — obfuscator access is off-line.")
         return False
     try:
         from pymongo import MongoClient
+
         client = MongoClient(
             MONGODB_URI,
             serverSelectionTimeoutMS=5000,
@@ -93,17 +56,12 @@ def _init_db():
             socketTimeoutMS=10000,
         )
         client.admin.command("ping")
-        _db = client[DB_NAME]
-        _unlocks = _db[UNLOCKS_COLLECTION]
-        _tokens = _db[TOKENS_COLLECTION]
-        _claims = _db[CLAIMS_COLLECTION]
-        _tokens.create_index("expires_at")
-        _claims.create_index("expires_at")
+        _unlocks = client[DB_NAME][UNLOCKS_COLLECTION]
         logger.info("obf_access connected to MongoDB (%s)", DB_NAME)
         return True
     except Exception as exc:
         logger.error("obf_access MongoDB connection failed: %s", exc)
-        _db = _unlocks = _tokens = _claims = None
+        _unlocks = None
         return False
 
 
@@ -111,24 +69,10 @@ _init_db()
 
 
 def _require_db():
-    if _unlocks is None or _tokens is None or _claims is None:
+    if _unlocks is None:
         raise AccessError(
-            "The access database is unavailable right now — try again in a "
-            "minute. If this keeps happening, tell the bot owner."
+            "The access database is unavailable right now. Try again in a minute."
         )
-
-
-# ---------------------------------------------------------------------------
-# Settings
-# ---------------------------------------------------------------------------
-def _self_url() -> str:
-    base = (os.environ.get("RENDER_EXTERNAL_URL")
-            or "https://vadriftzbots.onrender.com").strip().rstrip("/")
-    if base.startswith("http://"):
-        base = "https://" + base[len("http://"):]
-    if not base.startswith("https://"):
-        base = "https://" + base.lstrip("/")
-    return base
 
 
 def _unlock_hours() -> int:
@@ -136,46 +80,29 @@ def _unlock_hours() -> int:
         hours = int(os.environ.get("OBF_UNLOCK_HOURS", "24"))
     except ValueError:
         hours = 24
-    return max(1, hours)
+    return min(max(hours, 1), 24 * 30)
+
+
+def _minimum_seconds() -> int:
+    try:
+        seconds = int(os.environ.get("OBF_MIN_COMPLETION_SECONDS", "25"))
+    except ValueError:
+        seconds = 25
+    return min(max(seconds, 10), 15 * 60)
 
 
 def bypass_ids() -> set:
     raw = os.environ.get("OBF_BYPASS_IDS", DEFAULT_BYPASS_IDS)
-    ids = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if part.isdigit():
-            ids.add(int(part))
-    return ids
+    return {int(part.strip()) for part in raw.split(",") if part.strip().isdigit()}
 
 
 def gate_disabled() -> bool:
-    return os.environ.get("OBF_GATE_DISABLED", "").strip() in ("1", "true", "yes", "on")
+    return os.environ.get("OBF_GATE_DISABLED", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
 
 
-def _lootlabs_settings():
-    token = (os.environ.get("LOOTLABS_API_TOKEN") or "").strip()
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
-    if not token:
-        raise AccessError(
-            "LOOTLABS_API_TOKEN is not set, so checkpoint links can't be "
-            "created. Add it in Render → Environment."
-        )
-    try:
-        tier_id = int(os.environ.get("LOOTLABS_OBF_TIER_ID", "3"))
-        theme = int(os.environ.get("LOOTLABS_OBF_THEME", "5"))
-    except ValueError:
-        raise AccessError("LOOTLABS_OBF_TIER_ID / LOOTLABS_OBF_THEME must be numbers.")
-    # LootLabs docs: tiers 1-3, themes 1-5.
-    return token, min(max(tier_id, 1), 3), min(max(theme, 1), 5)
-
-
-# ---------------------------------------------------------------------------
-# Access window
-# ---------------------------------------------------------------------------
 def has_access(discord_id) -> bool:
-    """True if this user has an unexpired obfuscator window."""
     if gate_disabled():
         return True
     _require_db()
@@ -191,17 +118,24 @@ def seconds_left(discord_id) -> int:
     return max(0, int(doc.get("expires_at", 0) - time.time()))
 
 
-def grant(discord_id, hours: int = None) -> float:
-    """Open (or refresh) an access window. Returns the expiry timestamp."""
+def grant(discord_id, hours=None, session_token="") -> float:
     _require_db()
-    hours = _unlock_hours() if hours is None else hours
-    expires_at = time.time() + hours * 3600
+    hours = _unlock_hours() if hours is None else max(1, int(hours))
+    now = time.time()
+    expires_at = now + hours * 3600
     _unlocks.update_one(
         {"_id": str(discord_id)},
-        {"$set": {"granted_at": time.time(), "expires_at": expires_at}},
+        {"$set": {
+            "granted_at": now,
+            "expires_at": expires_at,
+            "source": "vadrifts_key_system",
+            "verification_session_hash": hashlib.sha256(
+                str(session_token or "").encode("utf-8")
+            ).hexdigest(),
+        }},
         upsert=True,
     )
-    logger.info("obf access granted to %s until %s", discord_id, expires_at)
+    logger.info("obfuscator access granted to discord_id=%s", discord_id)
     return expires_at
 
 
@@ -210,332 +144,164 @@ def revoke(discord_id) -> None:
     _unlocks.delete_one({"_id": str(discord_id)})
 
 
-# ---------------------------------------------------------------------------
-# LootLabs
-# ---------------------------------------------------------------------------
-def _extract_loot_url(data):
-    """Pull a locker URL out of the several shapes LootLabs returns."""
-    if data is None:
-        return None
-    if isinstance(data, str):
-        text = data.strip()
-        if text.startswith(("http://", "https://")):
-            return text
-        if text and " " not in text and 2 < len(text) < 80:
-            return f"https://loot-link.com/s?{text}"
-        return None
-    if not isinstance(data, dict):
-        return None
-    for key in ("loot_url", "lootUrl", "locker_url", "short_url"):
-        value = data.get(key)
-        if isinstance(value, str) and value.startswith(("http://", "https://")):
-            return value
-    short = data.get("short") or data.get("slug")
-    if isinstance(short, str) and short.strip():
-        short = short.strip()
-        if short.startswith(("http://", "https://")):
-            return short
-        return f"https://loot-link.com/s?{short}"
-    for key in ("message", "data", "result"):
-        nested = data.get(key)
-        if nested is not None and nested is not data:
-            found = _extract_loot_url(nested)
-            if found:
-                return found
-    return None
-
-
-def _parse(response):
-    body_text = (response.text or "")[:800]
-    try:
-        data = response.json()
-    except ValueError:
-        data = None
-    loot_url = _extract_loot_url(data)
-    ok = (
-        response.status_code < 400
-        and bool(loot_url)
-        and not (isinstance(data, dict) and data.get("type") == "error")
+def _resolve_profile(guild_id):
+    from guild_key_system import (
+        get_profile_by_name,
+        get_script_profile,
+        update_script_profile,
     )
-    return ok, loot_url, data, body_text
 
+    explicit_id = (os.environ.get("OBF_KS_PROFILE_ID") or "").strip()
+    if explicit_id:
+        profile = get_script_profile(explicit_id)
+    else:
+        name = (os.environ.get("OBF_KS_PROFILE_NAME") or DEFAULT_PROFILE_NAME).strip()
+        profile = get_profile_by_name(guild_id, name)
 
-def _error_text(data, status_code, body_text=""):
-    if isinstance(data, dict):
-        for key in ("message", "error", "detail", "reason"):
-            value = data.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-            if isinstance(value, dict):
-                nested = _error_text(value, status_code)
-                if nested:
-                    return nested
-    return (body_text or "").strip() or f"HTTP {status_code}"
-
-
-def _raise_failure(status_code, data, fallback):
-    if status_code == 401:
-        raise AccessError(
-            "LootLabs rejected the API token. Check LOOTLABS_API_TOKEN."
+    if not profile:
+        selector = (
+            f"ID `{explicit_id}`" if explicit_id else
+            f"name `{os.environ.get('OBF_KS_PROFILE_NAME') or DEFAULT_PROFILE_NAME}`"
         )
-    if status_code == 429:
-        raise AccessError("LootLabs rate-limited the request. Wait a minute and retry.")
-    hint = _error_text(data, status_code, fallback) or fallback
-    lowered = str(hint).lower()
-    if "creator" in lowered or ("mandatory" in lowered and "detail" in lowered):
         raise AccessError(
-            "LootLabs needs your creator profile filled in (name + avatar image) "
-            "before it can create links."
+            f"The obfuscator verification profile ({selector}) does not exist. "
+            "Create a dedicated Ad-Link profile with /ks setup, configure its "
+            "LootLabs URL, then set OBF_KS_PROFILE_ID on the bot."
         )
-    raise AccessError(f"LootLabs could not create the checkpoint link. {hint}")
-
-
-def _create_lootlabs_link(api_token, payload):
-    """Create a locker link via POST, falling back to GET (mirrors the website)."""
-    last_error = "No response from LootLabs."
+    if str(profile.get("guild_id")) != str(guild_id):
+        raise AccessError("OBF_KS_PROFILE_ID belongs to a different Discord server.")
+    if not profile.get("enabled", True):
+        raise AccessError("The obfuscator verification profile is disabled.")
+    if profile.get("key_type") != "adlink":
+        raise AccessError("The obfuscator verification profile must use Ad-Link mode.")
+    reserved_for = profile.get("system_purpose")
+    if reserved_for and reserved_for != "obfuscator":
+        raise AccessError("That profile is reserved for another internal flow.")
+    lootlabs_url = (profile.get("lootlabs_url") or "").strip()
+    if not lootlabs_url:
+        raise AccessError(
+            "The obfuscator verification profile has no LootLabs URL. Configure "
+            "one with /ks setlink first."
+        )
+    if any(char in lootlabs_url for char in "\r\n"):
+        raise AccessError("The configured LootLabs URL is invalid.")
     try:
-        response = requests.post(
-            LOOTLABS_API_URL,
-            headers={
-                "Authorization": f"Bearer {api_token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=25,
-        )
-        ok, loot_url, data, body_text = _parse(response)
-        logger.info("LootLabs POST status=%s body=%s", response.status_code, body_text)
-        if ok:
-            return loot_url
-        last_error = _error_text(data, response.status_code, body_text)
-        _raise_failure(response.status_code, data, last_error or body_text)
-    except AccessError:
-        raise
-    except requests.RequestException as exc:
-        last_error = f"{type(exc).__name__}: {exc}"
-        logger.error("LootLabs POST failed: %s", last_error)
-
-    params = {
-        "api_token": api_token,
-        "title": payload["title"],
-        "url": payload["url"],
-        "tier_id": payload["tier_id"],
-        "number_of_tasks": payload["number_of_tasks"],
-        "theme": payload.get("theme", 1),
-    }
-    try:
-        response = requests.get(LOOTLABS_API_URL, params=params, timeout=25)
-        ok, loot_url, data, body_text = _parse(response)
-        logger.info("LootLabs GET status=%s body=%s", response.status_code, body_text)
-        if ok:
-            return loot_url
-        _raise_failure(response.status_code, data, last_error)
-    except AccessError:
-        raise
-    except requests.RequestException as exc:
-        raise AccessError(
-            f"LootLabs could not create the checkpoint link. "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
+        parsed = urlsplit(lootlabs_url)
+    except ValueError as exc:
+        raise AccessError("The configured LootLabs URL is invalid.") from exc
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme != "https" or not any(
+        host == domain or host.endswith("." + domain)
+        for domain in _LOOTLABS_HOSTS
+    ):
+        raise AccessError("The profile must contain a genuine HTTPS LootLabs URL.")
+    if any(key.lower() == "data"
+           for key, _value in parse_qsl(parsed.query, keep_blank_values=True)):
+        raise AccessError("Remove the existing data parameter from the LootLabs URL.")
+    if reserved_for != "obfuscator":
+        if not update_script_profile(
+            profile["profile_id"], {"system_purpose": "obfuscator"}
+        ):
+            raise AccessError("Could not reserve the obfuscator verification profile.")
+        profile["system_purpose"] = "obfuscator"
+    return profile
 
 
-def create_checkpoint_link(discord_id, username: str = "") -> str:
-    """Create a fresh one-task checkpoint link bound to this Discord user.
+def profile_destination(guild_id, profile_id) -> str:
+    from guild_key_system import get_destination_url
+    return get_destination_url(guild_id, profile_id)
 
-    Stores a single-use token so the redirect can be tied back to them.
-    Returns the loot-link URL to send the user.
-    """
-    _require_db()
 
-    # Reuse a still-valid pending link if we already made one for this user,
-    # so repeatedly typing .obf doesn't hammer the LootLabs API (it 429s).
-    existing = _tokens.find_one({
-        "discord_id": str(discord_id),
-        "used": False,
-        "expires_at": {"$gt": time.time()},
-        "loot_url": {"$exists": True},
-    })
-    if existing and existing.get("loot_url"):
-        return existing["loot_url"]
-
-    api_token, tier_id, theme = _lootlabs_settings()
-
-    token = secrets.token_urlsafe(24)
-    destination = f"{_self_url()}/obf/unlock/{token}"
-
-    payload = {
-        "title": "Unlock the Lua obfuscator"[:30],
-        "url": destination,
-        "tier_id": tier_id,
-        "number_of_tasks": 1,
-        "theme": theme,
-    }
-    loot_url = _create_lootlabs_link(api_token, payload)
-
-    _tokens.update_one(
-        {"_id": token},
-        {"$set": {
-            "discord_id": str(discord_id),
-            "username": username or "",
-            "created_at": time.time(),
-            "expires_at": time.time() + TOKEN_TTL_SECONDS,
-            "used": False,
-            "loot_url": loot_url,
-        }},
-        upsert=True,
+def create_verification_offer(discord_id, username, guild_id) -> dict:
+    """Create/reuse an obfuscator-purpose session in the shared key-system DB."""
+    from guild_key_system import (
+        SERVER_BASE_URL,
+        create_session,
+        get_user_session,
     )
-    # Opportunistic cleanup; ignore failures.
+
+    profile = _resolve_profile(guild_id)
+    profile_id = profile["profile_id"]
+
+    # Prefer a completed unclaimed session, then an in-progress one. This is the
+    # same resume behavior as normal key claims and avoids invalidating a link
+    # whenever the user repeats .obf.
+    session = get_user_session(
+        discord_id, guild_id, profile_id,
+        purpose="obfuscator", completed=True, claimed=False,
+    )
+    if not session:
+        session = get_user_session(
+            discord_id, guild_id, profile_id,
+            purpose="obfuscator", completed=False,
+        )
+
+    if session:
+        token = session["token"]
+    else:
+        token = create_session(
+            guild_id,
+            discord_id,
+            username,
+            profile_id,
+            purpose="obfuscator",
+            allowed_providers=["lootlabs"],
+            min_completion_seconds=_minimum_seconds(),
+            require_referrer=True,
+        )
+        if not token:
+            raise AccessError("The website could not create a verification session.")
+        session = {"token": token, "completed": False, "key_claimed": False}
+
+    return {
+        "session_token": token,
+        "gateway_url": f"{SERVER_BASE_URL}/ks/gateway/{token}",
+        "completed": bool(session.get("completed")),
+        "claimed": bool(session.get("key_claimed")),
+        "profile_id": profile_id,
+        "profile_name": profile.get("name", DEFAULT_PROFILE_NAME),
+        "destination_url": profile_destination(guild_id, profile_id),
+    }
+
+
+def claim_verification(session_token, discord_id) -> float:
+    """Claim a completed shared session and grant the obfuscator window."""
+    from guild_key_system import (
+        claim_completed_session,
+        get_session,
+        update_session,
+    )
+
+    session = get_session(session_token)
+    if not session:
+        raise AccessError("This verification session expired. Run .obfunlock again.")
+    if session.get("purpose", "key") != "obfuscator":
+        raise AccessError("This is not an obfuscator verification session.")
+    if str(session.get("discord_id")) != str(discord_id):
+        raise AccessError("This verification session belongs to another user.")
+    if not session.get("completed"):
+        raise AccessError(
+            "Verification is not complete yet. Open the website, finish LootLabs, "
+            "then press Claim Access again."
+        )
+    if session.get("key_claimed"):
+        if has_access(discord_id):
+            return time.time() + seconds_left(discord_id)
+        raise AccessError("This verification session was already claimed.")
+
+    claimed = claim_completed_session(
+        session_token, discord_id, purpose="obfuscator"
+    )
+    if not claimed:
+        current = get_session(session_token)
+        if current and current.get("key_claimed") and has_access(discord_id):
+            return time.time() + seconds_left(discord_id)
+        raise AccessError("This verification session was already claimed or changed.")
+
     try:
-        _tokens.delete_many({"expires_at": {"$lt": time.time() - 86400}})
+        return grant(discord_id, session_token=session_token)
     except Exception:
-        pass
-
-    logger.info("obf checkpoint link created for %s", discord_id)
-    return loot_url
-
-
-def redeem(token: str):
-    """Consume a redirect token. Returns (discord_id, expires_at) or (None, None).
-
-    Single-use: a second visit with the same token gets nothing.
-    """
-    _require_db()
-    now = time.time()
-    result = _tokens.find_one_and_update(
-        {"_id": token, "used": False, "expires_at": {"$gt": now}},
-        {"$set": {"used": True, "used_at": now}},
-    )
-    if not result:
-        return None, None
-    discord_id = result.get("discord_id")
-    expires_at = grant(discord_id)
-    return discord_id, expires_at
-
-
-# ---------------------------------------------------------------------------
-# Static-link mode (no LootLabs API token required)
-# ---------------------------------------------------------------------------
-# No 0/O, 1/I/L — users type this by hand off a phone screen.
-_CLAIM_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-CLAIM_CODE_LEN = 6
-CLAIM_TTL_SECONDS = 2 * 60 * 60
-
-# Anti-bypass, ported from the website repo's /complete-unlock handler.
-# A claim only counts if the browser actually arrived from a link-locker page.
-DEFAULT_ALLOWED_REFERRERS = (
-    "work.ink,www.work.ink,"
-    "lootdest.org,lootlabs.gg,www.lootlabs.gg,links.lootlabs.gg,"
-    "linkvertise.com,www.linkvertise.com,"
-    "link-to.net,direct-link.net,linkvertise.net,"
-    "link-hub.net,link-center.net,up-to-down.net"
-)
-
-# Mirrors the website's MIN_CHECKPOINT_SECONDS. Stops someone scripting
-# "ask the bot for a code, instantly POST it".
-MIN_CLAIM_SECONDS = 20
-
-
-def allowed_referrers():
-    raw = os.environ.get("OBF_ALLOWED_REFERRERS") or DEFAULT_ALLOWED_REFERRERS
-    return [d.strip().lower() for d in raw.split(",") if d.strip()]
-
-
-def is_valid_referrer(referer: str) -> bool:
-    """True if the request came from a link-locker page (same rule as the website)."""
-    referer = (referer or "").lower()
-    if not referer:
-        return False
-    return any(domain in referer for domain in allowed_referrers())
-
-
-def claim_code_age(code: str):
-    """Seconds since this code was issued, or None if unknown."""
-    _require_db()
-    if not code:
-        return None
-    doc = _claims.find_one({"_id": code.strip().upper()})
-    if not doc:
-        return None
-    return time.time() - doc.get("created_at", time.time())
-
-
-def min_claim_seconds() -> int:
-    try:
-        return max(0, int(os.environ.get("OBF_MIN_CLAIM_SECONDS", MIN_CLAIM_SECONDS)))
-    except ValueError:
-        return MIN_CLAIM_SECONDS
-
-
-def static_link() -> str:
-    return (os.environ.get("OBF_STATIC_LINK") or "").strip()
-
-
-def mode() -> str:
-    """'static' if a dashboard link is configured, else 'api'."""
-    return "static" if static_link() else "api"
-
-
-def create_claim_code(discord_id) -> str:
-    """Hand out a short single-use code for the static-link landing page."""
-    _require_db()
-
-    # Reuse an unused, unexpired code so re-running .obf doesn't churn codes.
-    existing = _claims.find_one({
-        "discord_id": str(discord_id),
-        "used": False,
-        "expires_at": {"$gt": time.time()},
-    })
-    if existing:
-        return existing["_id"]
-
-    for _ in range(10):
-        code = "".join(secrets.choice(_CLAIM_ALPHABET) for _ in range(CLAIM_CODE_LEN))
-        if _claims.find_one({"_id": code}):
-            continue
-        _claims.update_one(
-            {"_id": code},
-            {"$set": {
-                "discord_id": str(discord_id),
-                "created_at": time.time(),
-                "expires_at": time.time() + CLAIM_TTL_SECONDS,
-                "used": False,
-            }},
-            upsert=True,
-        )
-        logger.info("obf claim code issued for %s", discord_id)
-        return code
-    raise AccessError("Could not allocate a claim code. Try again in a minute.")
-
-
-def redeem_claim_code(code: str):
-    """Consume a claim code. Returns (discord_id, expires_at) or (None, None)."""
-    _require_db()
-    if not code:
-        return None, None
-    code = code.strip().upper()
-    now = time.time()
-    result = _claims.find_one_and_update(
-        {"_id": code, "used": False, "expires_at": {"$gt": now}},
-        {"$set": {"used": True, "used_at": now}},
-    )
-    if not result:
-        return None, None
-    discord_id = result.get("discord_id")
-    return discord_id, grant(discord_id)
-
-
-def claim_page_url() -> str:
-    """The URL to set as the destination of the static LootLabs link."""
-    return f"{_self_url()}/obf/claim"
-
-
-def unlock_offer(discord_id, username: str = ""):
-    """Return (link, claim_code_or_None) for whichever mode is configured.
-
-    Static mode returns a claim code; API mode returns None because the
-    destination URL already carries the one-time token.
-    """
-    if static_link():
-        return static_link(), create_claim_code(discord_id)
-    return create_checkpoint_link(discord_id, username), None
+        # Let the user retry if the access DB had a transient failure after the
+        # shared session was atomically claimed.
+        update_session(session_token, {"key_claimed": False})
+        raise
