@@ -787,13 +787,22 @@ __krs_bundle_env["__KRS_FUNCTION_BUNDLE"]=__krs_bundle
     return bootstrap + main_output
 
 
-def _inline_remote_function_bundle(main_output: str, bundle_url: str) -> str:
-    """Prefix a one-file output with a one-time backend bundle fetch."""
+def _inline_remote_function_bundle(
+    main_output: str,
+    bundle_url: str,
+    rpc_url: str | None = None,
+) -> str:
+    """Prefix a one-file output with bundle fetch and optional RPC support."""
     if not isinstance(bundle_url, str) or not bundle_url.strip():
         raise ValueError("invalid runtime bundle URL")
+    if rpc_url is None:
+        rpc_url = bundle_url.replace("/api/runtime-bundle/", "/api/runtime-rpc/")
+    if not isinstance(rpc_url, str) or not rpc_url.strip():
+        raise ValueError("invalid runtime RPC URL")
     # Only the artifact URL/token is shipped to the client. The bundle itself
     # remains in the backend's MongoDB collection until this request.
     bootstrap = f'''local __krs_bundle_url={json.dumps(bundle_url)}
+local __krs_rpc_url={json.dumps(rpc_url)}
 local __krs_bundle_env=(getfenv and getfenv()) or _ENV
 local __krs_bundle_http_get
 if game and game.HttpGet then
@@ -830,6 +839,23 @@ else
 end
 local __krs_bundle=__krs_bundle_chunk()
 __krs_bundle_env["__KRS_FUNCTION_BUNDLE"]=__krs_bundle
+local __krs_rpc_batch=function(__krs_operations)
+    if not request then
+        error("Kryos runtime RPC transport is unavailable")
+    end
+    if not game or not game.GetService then
+        error("Kryos runtime RPC requires HttpService")
+    end
+    local __krs_http=game:GetService("HttpService")
+    local __krs_body=__krs_http:JSONEncode({{operations=__krs_operations}})
+    local __krs_response=request({{Url=__krs_rpc_url,Method="POST",Headers={{["Content-Type"]="application/json"}},Body=__krs_body}})
+    local __krs_response_body=__krs_response.Body or __krs_response.body
+    if not __krs_response_body then
+        error("Kryos runtime RPC returned no response body")
+    end
+    return __krs_http:JSONDecode(__krs_response_body)
+end
+__krs_bundle_env["__KRS_RPC_BATCH"]=__krs_rpc_batch
 '''
     return bootstrap + main_output
 
@@ -931,6 +957,10 @@ def obfuscate_with_bundle(source: str, *, inline: bool = True):
     return _obfuscate_impl(source, with_bundle=True, inline_bundle=inline)
 
 
-def build_remote_bundle_output(main_output: str, bundle_url: str) -> str:
-    """Build the one-file output whose bundle is fetched once at startup."""
-    return _inline_remote_function_bundle(main_output, bundle_url)
+def build_remote_bundle_output(
+    main_output: str,
+    bundle_url: str,
+    rpc_url: str | None = None,
+) -> str:
+    """Build one-file output with startup fetch and optional batch RPC support."""
+    return _inline_remote_function_bundle(main_output, bundle_url, rpc_url)
