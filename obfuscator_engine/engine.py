@@ -786,7 +786,55 @@ __krs_bundle_env["__KRS_FUNCTION_BUNDLE"]=__krs_bundle
 '''
     return bootstrap + main_output
 
-def _obfuscate_impl(source: str, *, with_bundle: bool):
+
+def _inline_remote_function_bundle(main_output: str, bundle_url: str) -> str:
+    """Prefix a one-file output with a one-time backend bundle fetch."""
+    if not isinstance(bundle_url, str) or not bundle_url.strip():
+        raise ValueError("invalid runtime bundle URL")
+    # Only the artifact URL/token is shipped to the client. The bundle itself
+    # remains in the backend's MongoDB collection until this request.
+    bootstrap = f'''local __krs_bundle_url={json.dumps(bundle_url)}
+local __krs_bundle_env=(getfenv and getfenv()) or _ENV
+local __krs_bundle_http_get
+if game and game.HttpGet then
+    __krs_bundle_http_get=function(__krs_url)
+        return game:HttpGet(__krs_url)
+    end
+elseif request then
+    __krs_bundle_http_get=function(__krs_url)
+        local __krs_response=request({{Url=__krs_url,Method="GET"}})
+        return __krs_response.Body or __krs_response.body
+    end
+else
+    error("Kryos runtime bundle transport is unavailable")
+end
+local __krs_bundle_source=assert(__krs_bundle_http_get(__krs_bundle_url))
+if type(__krs_bundle_source)~="string" or #__krs_bundle_source>15000000 or not __krs_bundle_source:match("^%s*return%s*{{") then
+    error("Kryos runtime bundle validation failed")
+end
+local __krs_bundle_chunk
+if loadstring and setfenv then
+    __krs_bundle_chunk=assert(loadstring(__krs_bundle_source))
+    -- Bind the ordinary bundle chunk to the exact environment used by the
+    -- custom VM, so extracted functions can see VM-created globals.
+    setfenv(__krs_bundle_chunk,__krs_bundle_env)
+elseif load then
+    local __krs_load_ok,__krs_load_result=pcall(load,__krs_bundle_source,nil,"t",__krs_bundle_env)
+    if __krs_load_ok and type(__krs_load_result)=="function" then
+        __krs_bundle_chunk=__krs_load_result
+    else
+        __krs_bundle_chunk=assert(loadstring(__krs_bundle_source))
+    end
+else
+    __krs_bundle_chunk=assert(loadstring(__krs_bundle_source))
+end
+local __krs_bundle=__krs_bundle_chunk()
+__krs_bundle_env["__KRS_FUNCTION_BUNDLE"]=__krs_bundle
+'''
+    return bootstrap + main_output
+
+
+def _obfuscate_impl(source: str, *, with_bundle: bool, inline_bundle: bool = True):
     from obfuscator import ObfuscationError, EngineNotConfigured  # avoid cycles
 
     if not isinstance(source, str) or not source.strip():
@@ -854,7 +902,9 @@ def _obfuscate_impl(source: str, *, with_bundle: bool):
                 raise ObfuscationError(
                     "Kryos produced an invalid function bundle."
                 )
-            return _inline_function_bundle(result, bundle), bundle
+            if inline_bundle:
+                return _inline_function_bundle(result, bundle), bundle
+            return result, bundle
     except ObfuscationError:
         raise
     except Exception as exc:
@@ -871,6 +921,16 @@ def obfuscate(source: str) -> str:
     return _obfuscate_impl(source, with_bundle=False)
 
 
-def obfuscate_with_bundle(source: str):
-    """Return ``(main_output, function_bundle)`` from one compiler run."""
-    return _obfuscate_impl(source, with_bundle=True)
+def obfuscate_with_bundle(source: str, *, inline: bool = True):
+    """Return ``(output, function_bundle)`` from one compiler run.
+
+    ``inline=True`` preserves the original one-file/base64 bundle behavior.
+    ``inline=False`` returns the VM payload and bundle separately so a host
+    can deliver the bundle from a protected backend at runtime.
+    """
+    return _obfuscate_impl(source, with_bundle=True, inline_bundle=inline)
+
+
+def build_remote_bundle_output(main_output: str, bundle_url: str) -> str:
+    """Build the one-file output whose bundle is fetched once at startup."""
+    return _inline_remote_function_bundle(main_output, bundle_url)
