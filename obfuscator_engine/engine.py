@@ -2,8 +2,7 @@
 Kryos obfuscation engine — SELF-CONTAINED single file.
 
 This module carries everything needed to obfuscate: the Kryos v16.2 engine
-(kryos.lua, by feariosz0 — GOTO opcode + control-flow flattening,
-plus the project's parser/executor fixes) encrypted & embedded, and a statically-linked Lua
+(kryos.lua, by feariosz0) encrypted & embedded, and a statically-linked Lua
 5.4.8 interpreter compressed & embedded. There is nothing else to deploy and
 nothing on the host to install.
 
@@ -12,6 +11,9 @@ Secrecy:
   environment variable. Even if this repo leaks, the engine code is
   unreadable without that key — keep it in Render's environment alongside
   DISCORD_TOKEN, never in the repo.
+  tools/update_obfuscator.py replaces the blob locally using the SAME key,
+  pins the new Lua source to optimization level 3, and uses a fresh nonce.
+  The Lua source and key must not be committed to the public repository.
 
 Env vars:
   KRS_ENGINE_KEY       REQUIRED — hex key that decrypts the embedded engine.
@@ -52,7 +54,8 @@ Handled (token-aware; strings & comments are never touched):
        function f(a: number, b: string): boolean  ->  function f(a, b)
        local function f<T>(x: T): T               ->  local function f(x)
        function t:foo(): number                   ->  function t:foo()
-     (method/dotted def sugar is desugared by Kryos itself afterwards)
+     Method/dotted definition sugar is desugared by this preprocessor too;
+     the replacement Lua engine does not parse it itself.
   2. `for i: T = 1, 10 do`  ->  `for i = 1, 10 do`
      `for k: T, v: U in pairs(t) do`  ->  `for k, v in pairs(t) do`
   3. Double unary signs: `- -5`, `+ +5`, `- - x` -> collapsed by parity
@@ -581,11 +584,55 @@ def _parenthesize_parenless(src):
     return src
 
 
+def _desugar_function_definitions(src):
+    """Lower named table functions without touching comments or literals.
+
+    function a.b(x)    -> a.b = function(x)
+    function a:b(x)    -> a.b = function(self,x)
+
+    The new Lua engine accepts assignments of anonymous functions, but not
+    dotted/colon function definitions. Plain and local functions stay intact.
+    Run after annotation stripping so typed method signatures work too.
+    """
+    toks = [t for t in _tokenize(src) if t[0] not in ("ws", "comment")]
+    edits = []
+    for i, tok in enumerate(toks):
+        if tok[:2] != ("id", "function"):
+            continue
+        if i and toks[i - 1][:2] == ("id", "local"):
+            continue
+        j = i + 1
+        if j >= len(toks) or toks[j][0] != "id":
+            continue
+        j += 1
+        separators = []
+        while (j + 1 < len(toks) and toks[j][0] == "op"
+               and toks[j][1] in (".", ":") and toks[j + 1][0] == "id"):
+            separators.append(toks[j])
+            j += 2
+        if not separators or j >= len(toks) or toks[j][:2] != ("op", "("):
+            continue
+        # A colon is only valid before the final name in the path.
+        if any(t[1] == ":" for t in separators[:-1]):
+            continue
+        edits.append((tok[2], tok[3], ""))
+        edits.append((toks[j][2], toks[j][2], "= function"))
+        if separators[-1][1] == ":":
+            colon = separators[-1]
+            edits.append((colon[2], colon[3], "."))
+            no_params = j + 1 < len(toks) and toks[j + 1][:2] == ("op", ")")
+            edits.append((toks[j][3], toks[j][3], "self" if no_params else "self,"))
+    for start, end, replacement in sorted(edits, reverse=True):
+        src = src[:start] + replacement + src[end:]
+    return src
+
+
 def preprocess(source):
     """Apply all Kryos-compatibility fixes. Returns the adjusted source."""
     if not source:
         return source
     src = _strip_annotations(source)
+    src = _desugar_function_definitions(src)
     src = _collapse_double_unary(src)
     src = _parenthesize_parenless(src)
     return src
@@ -600,22 +647,52 @@ def _derive_key(raw_key: str) -> bytes:
     return hashlib.sha256(b"kryos-engine-v1|" + raw_key.encode("utf-8")).digest()
 
 
+_BLOB_MAGIC = b"KRS2\x00"
+_NONCE_BYTES = 16
+
+
+def _xor_stream(data: bytes, key: bytes) -> bytes:
+    out = bytearray(len(data))
+    for counter, off in enumerate(range(0, len(data), 32)):
+        ks = hashlib.sha256(key + counter.to_bytes(4, "little")).digest()
+        for i, value in enumerate(data[off:off + 32]):
+            out[off + i] = value ^ ks[i]
+    return bytes(out)
+
+
+def _payload_key(key: bytes, nonce: bytes) -> bytes:
+    return hmac.new(key, b"kryos-engine-v2|" + nonce, hashlib.sha256).digest()
+
+
+def _encrypt(payload: bytes, key: bytes) -> bytes:
+    """Used by the local updater, never by the Discord command.
+
+    A fresh nonce avoids reusing the old blob's XOR keystream when the
+    owner keeps the same KRS_ENGINE_KEY across public engine updates.
+    """
+    nonce = os.urandom(_NONCE_BYTES)
+    key = _payload_key(key, nonce)
+    body = _xor_stream(payload, key)
+    return _BLOB_MAGIC + nonce + body + hmac.new(key, body, hashlib.sha256).digest()
+
+
 def _decrypt(payload: bytes, key: bytes) -> bytes:
-    """XOR-stream decrypt (SHA-256 keystream) with HMAC-SHA256 integrity tag."""
+    """Authenticate/decrypt new nonced blobs and legacy embedded blobs."""
+    if payload.startswith(_BLOB_MAGIC):
+        header_len = len(_BLOB_MAGIC) + _NONCE_BYTES
+        if len(payload) < header_len + 32:
+            raise ValueError("truncated engine blob")
+        nonce = payload[len(_BLOB_MAGIC):header_len]
+        key = _payload_key(key, nonce)
+        payload = payload[header_len:]
+    if len(payload) < 32:
+        raise ValueError("truncated engine blob")
     body, tag = payload[:-32], payload[-32:]
     if not hmac.compare_digest(
         hmac.new(key, body, hashlib.sha256).digest(), tag
     ):
         raise ValueError("integrity check failed (wrong key or tampered blob)")
-    out = bytearray(len(body))
-    counter = 0
-    for off in range(0, len(body), 32):
-        ks = hashlib.sha256(key + counter.to_bytes(4, "little")).digest()
-        chunk = body[off:off + 32]
-        for i in range(len(chunk)):
-            out[off + i] = chunk[i] ^ ks[i]
-        counter += 1
-    return bytes(out)
+    return _xor_stream(body, key)
 
 
 def _load_engine_source() -> str:
@@ -672,7 +749,6 @@ def obfuscate(source: str) -> str:
 
     timeout = int(os.environ.get("OBF_ENGINE_TIMEOUT", "180") or 180)
     seed = str(int.from_bytes(os.urandom(6), "big") % 2 ** 31)
-    source = preprocess(source)
     source = preprocess(source)
 
     try:
