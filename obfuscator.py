@@ -41,6 +41,8 @@ import sys
 import time
 from pathlib import Path
 
+from obf_artifacts import record_obfuscation
+
 __all__ = ["ObfuscationError", "EngineNotConfigured", "run_engine",
            "register_obf_commands", "check_authorized", "check_cooldown"]
 
@@ -216,7 +218,7 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
         return (f"Obfuscated **{src_len:,}** -> **{out_len:,}** chars "
                 f"in {seconds:.1f}s. **Kryos v16.2 · level 3**.")
 
-    async def _run_and_reply(send, source, source_label):
+    async def _run_and_reply(send, source, source_label, user_id):
         loop = asyncio.get_running_loop()
         started = time.monotonic()
         try:
@@ -228,6 +230,20 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
             await send(f"❌ Obfuscation failed: {exc}", file=None)
             return
         elapsed = time.monotonic() - started
+
+        # Optional server-side persistence is isolated from the user-facing
+        # response. A MongoDB write must never delay or break delivery of an
+        # otherwise successful obfuscation.
+        loop.run_in_executor(
+            None,
+            lambda: record_obfuscation(
+                source,
+                out,
+                user_id=user_id,
+                source_label=source_label,
+                elapsed_seconds=elapsed,
+            ),
+        )
 
         buf = io.BytesIO(out.encode("utf-8"))
         file = discord.File(buf, filename="obfuscated.lua")
@@ -444,7 +460,7 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
                 else:
                     await ctx.send(content=content)
 
-            await _run_and_reply(send, source, label)
+            await _run_and_reply(send, source, label, ctx.author.id)
 
     # --- /obf (owner guild, informational — deliberately does NOT obfuscate) --
     # Obfuscation only ever happens in DMs via .obf, so nothing lands in a
