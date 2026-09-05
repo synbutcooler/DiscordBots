@@ -99,11 +99,16 @@ def _get_collection():
 def store_runtime_bundle(
     bundle: str,
     *,
+    capability: str | None = None,
     user_id=None,
     source_label: str | None = None,
     engine_version: str = "Kryos v16.2",
 ):
-    """Store one bundle and return its public locator, or ``None`` on failure."""
+    """Store one bundle and return its locator, or ``None`` on failure.
+
+    ``capability`` is supplied by the VM-hidden capability mode. The legacy
+    remote mode generates its own access token when this is omitted.
+    """
     if not isinstance(bundle, str) or not bundle.strip().startswith("return {"):
         logger.warning("Refusing to store an invalid runtime bundle")
         return None
@@ -118,23 +123,28 @@ def store_runtime_bundle(
         return None
 
     artifact_id = secrets.token_urlsafe(18)
-    access_token = secrets.token_urlsafe(32)
+    access_token = capability or secrets.token_urlsafe(32)
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=_runtime_ttl_seconds())
     document = {
         "_id": artifact_id,
         "kind": "kryos_runtime_bundle",
-        "token_sha256": _sha256_text(access_token),
+        "capability_sha256": _sha256_text(access_token),
         "bundle": bundle,
         "bundle_sha256": _sha256_text(bundle),
         "bundle_bytes": bundle_bytes,
         "created_at": now,
         "expires_at": expires_at,
-        "user_id": str(user_id) if user_id is not None else None,
-        "source_label": (source_label or "")[:255],
-        "engine_version": engine_version,
-        "access_count": 0,
     }
+    if capability is None:
+        # Legacy token-URL mode keeps its optional observability metadata.
+        document.update({
+            "token_sha256": _sha256_text(access_token),
+            "user_id": str(user_id) if user_id is not None else None,
+            "source_label": (source_label or "")[:255],
+            "engine_version": engine_version,
+            "access_count": 0,
+        })
 
     try:
         collection.insert_one(document)
@@ -151,6 +161,7 @@ def store_runtime_bundle(
     return {
         "artifact_id": artifact_id,
         "access_token": access_token,
+        "capability": access_token,
         "expires_at": expires_at,
         "bundle_sha256": document["bundle_sha256"],
     }
