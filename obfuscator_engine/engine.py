@@ -2,10 +2,10 @@
 PRIVATE-REPOSITORY BUNDLE — Kryos v16.2, fixed to optimization level 3.
 
 The author's Lua source AND a Linux x86_64 Lua 5.4.8 interpreter are bundled.
-The source includes the bundle-aware compiler path; the bot returns the main
-script and one ordinary-function sidecar. Deploy this engine.py and
-obfuscator.py; no local updater, Secret File, key copying, or new Render
-engine setting is needed.
+The source includes the bundle-aware compiler path; the bot returns one main
+script with a one-time native function-bundle bootstrap. Deploy this
+engine.py and obfuscator.py; no local updater, Secret File, key copying, or
+new Render engine setting is needed.
 
 IMPORTANT: the Lua source is compressed/base64-encoded, NOT encrypted.
 Anyone with this file or its Git history can recover the full source. Make
@@ -22,6 +22,7 @@ Optional env vars:
 
 import base64
 import hashlib
+import json
 import logging
 import os
 import stat
@@ -722,6 +723,48 @@ def _resolve_lua_bin(tmpdir: str) -> str:
     return _write_lua_bin(tmpdir)
 
 
+
+def _inline_function_bundle(main_output: str, bundle: str) -> str:
+    """Prefix a single output file with a one-time native bundle bootstrap."""
+    if not isinstance(bundle, str) or not bundle.strip().startswith("return {"):
+        raise ValueError("invalid function bundle")
+    encoded = base64.b64encode(bundle.encode("utf-8")).decode("ascii")
+    # The bundle source is transported as base64 rather than visible ordinary
+    # Lua. It is decoded and compiled once by the host runtime before the
+    # custom VM starts. This preserves the one-file Discord UX while keeping
+    # the extracted function bodies out of the VM prototype payload.
+    bootstrap = f'''local __krs_bundle_b64={json.dumps(encoded)}
+local __krs_bundle_alpha="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local __krs_bundle_rev={{}}
+for __krs_i=1,#__krs_bundle_alpha do
+    __krs_bundle_rev[#__krs_bundle_rev+1]=__krs_bundle_alpha:sub(__krs_i,__krs_i)
+end
+local __krs_bundle_decode=function(__krs_s)
+    local __krs_out={{}}
+    local __krs_acc=0
+    local __krs_bits=0
+    for __krs_i=1,#__krs_s do
+        local __krs_c=__krs_s:sub(__krs_i,__krs_i)
+        local __krs_v=__krs_bundle_alpha:find(__krs_c,1,true)
+        if __krs_v then
+            __krs_acc=__krs_acc*64+__krs_v-1
+            __krs_bits=__krs_bits+6
+            while __krs_bits>=8 do
+                __krs_bits=__krs_bits-8
+                __krs_out[#__krs_out+1]=string.char(math.floor(__krs_acc/2^__krs_bits)%256)
+                __krs_acc=__krs_acc%2^__krs_bits
+            end
+        end
+    end
+    return table.concat(__krs_out)
+end
+local __krs_bundle_loader=loadstring or load
+local __krs_bundle=assert(__krs_bundle_loader(__krs_bundle_decode(__krs_bundle_b64)))()
+local __krs_bundle_env=(getfenv and getfenv()) or _ENV
+__krs_bundle_env["__KRS_FUNCTION_BUNDLE"]=__krs_bundle
+'''
+    return bootstrap + main_output
+
 def _obfuscate_impl(source: str, *, with_bundle: bool):
     from obfuscator import ObfuscationError, EngineNotConfigured  # avoid cycles
 
@@ -790,7 +833,7 @@ def _obfuscate_impl(source: str, *, with_bundle: bool):
                 raise ObfuscationError(
                     "Kryos produced an invalid function bundle."
                 )
-            return result, bundle
+            return _inline_function_bundle(result, bundle), bundle
     except ObfuscationError:
         raise
     except Exception as exc:
