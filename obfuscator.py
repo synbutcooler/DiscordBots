@@ -26,9 +26,11 @@ owner guild: you must be a member there, then the usual permission/role rules
 apply. Everyone else gets a plain "nope".
 
 ENGINE — already wired:
-    obfuscator_engine/engine.py is SELF-CONTAINED: the Kryos v16.0 engine is
+    obfuscator_engine/engine.py is SELF-CONTAINED: the Kryos v16.2 engine is
     embedded (encrypted; needs the KRS_ENGINE_KEY env var) and a static
-    Lua 5.4.8 interpreter is embedded too. Nothing to install, nothing else
+    Lua 5.4.8 interpreter is embedded too. Use tools/update_obfuscator.py
+    with your existing key to package the new source at level 3 only.
+    Nothing to install, nothing else
     to deploy. Optionally override with OBF_ENGINE_CMD (stdin -> stdout CLI)
     or KRS_LUA_BIN (different Lua 5.3+ binary).
 """
@@ -72,7 +74,8 @@ class EngineNotConfigured(ObfuscationError):
 # Shared blurb for /obf and .obfhelp. The obfuscator is feariosz0's Kryos
 # engine; obfuscation itself only happens in DMs through .obf.
 OBF_INFO = (
-    "🔐 **Lua obfuscator — Kryos v16.0, made by feariosz0**\n\n"
+    "🔐 **Lua obfuscator — Kryos v16.2, made by feariosz0**\n\n"
+    "The bundled engine uses **level 3 only** — no level argument needed.\n\n"
     "This command doesn't obfuscate anything itself. To obfuscate a script:\n"
     "1. **DM this bot**\n"
     "2. Attach your `.lua` file\n"
@@ -471,8 +474,7 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
     @bot.tree.command(
         name="obf",
         description=(
-            "Lua obfuscator by feariosz0 (Kryos v16.0) — DM this bot and use "
-            ".obf to obfuscate a script."
+            "Kryos v16.2 by feariosz0 — level 3 only. DM this bot and use .obf."
         ),
         guild=discord.Object(id=guild_id),
     )
@@ -525,6 +527,6 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
             "so it's not run through the VM. Use it when a function misbehaves, "
             "is performance-critical, or when something like `ColorSequence` "
             "gets called at a time the VM can't handle yet.\n\n"
-            "Obfuscator by **feariosz0** (Kryos v16.0).\n"
+            "Obfuscator by **feariosz0** (Kryos v16.2, **level 3 only**).\n"
             "Usage: DM the bot → attach `.lua` → type `.obf`"
         )
