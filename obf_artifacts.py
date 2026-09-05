@@ -25,7 +25,11 @@ import secrets
 import threading
 from datetime import datetime, timezone
 
-from pymongo import ASCENDING, MongoClient
+try:
+    from pymongo import ASCENDING, MongoClient
+except ImportError:  # Keep local/compiler-only use independent of Mongo extras.
+    ASCENDING = 1
+    MongoClient = None
 
 logger = logging.getLogger(__name__)
 
