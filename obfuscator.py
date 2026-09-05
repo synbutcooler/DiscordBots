@@ -74,6 +74,10 @@ OBF_RUNTIME_BUNDLE_URL = os.environ.get(
     "OBF_RUNTIME_BUNDLE_URL",
     "https://vadrifts.onrender.com/api/runtime-bundle",
 ).strip().rstrip("/")
+OBF_RUNTIME_RPC_URL = os.environ.get(
+    "OBF_RUNTIME_RPC_URL",
+    OBF_RUNTIME_BUNDLE_URL.replace("/api/runtime-bundle", "/api/runtime-rpc"),
+).strip().rstrip("/")
 
 
 class ObfuscationError(RuntimeError):
@@ -292,8 +296,15 @@ def run_engine_bundle(
         bundle_url = (
             f"{OBF_RUNTIME_BUNDLE_URL}/{artifact_id}?token={access_token}"
         )
+        rpc_url = (
+            f"{OBF_RUNTIME_RPC_URL}/{artifact_id}?token={access_token}"
+        )
         try:
-            main_output = engine.build_remote_bundle_output(main_output, bundle_url)
+            main_output = engine.build_remote_bundle_output(
+                main_output,
+                bundle_url,
+                rpc_url,
+            )
         except Exception as exc:
             raise ObfuscationError(
                 f"Could not build the remote bundle bootstrap: {exc}"
