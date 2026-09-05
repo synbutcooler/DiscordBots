@@ -25,21 +25,19 @@ Because DMs carry no server context, non-owner access is checked against the
 owner guild: you must be a member there, then the usual permission/role rules
 apply. Everyone else gets a plain "nope".
 
-ENGINE — already wired:
-    obfuscator_engine/engine.py is SELF-CONTAINED: the Kryos v16.2 engine is
-    embedded (encrypted; needs the KRS_ENGINE_KEY env var) and a static
-    Lua 5.4.8 interpreter is embedded too. Use tools/update_obfuscator.py
-    with your existing key to package the new source at level 3 only.
-    Nothing to install, nothing else
-    to deploy. Optionally override with OBF_ENGINE_CMD (stdin -> stdout CLI)
-    or KRS_LUA_BIN (different Lua 5.3+ binary).
+ENGINE — Render-only setup:
+    Upload this file and obfuscator_engine/engine.py to GitHub. In Render,
+    add a Secret File named newlua.txt containing the new Kryos v16.2 Lua
+    source. The runner reads /etc/secrets/newlua.txt and fixes its level to 3.
+    The static Lua 5.4.8 interpreter is embedded; no local updater or extra
+    runtime install is required. KRS_ENGINE_KEY may remain unchanged but is
+    not used by the Secret File loader. KRS_LUA_BIN may override the runtime.
+    OBF_ENGINE_CMD must be unset so it cannot bypass the updated engine.
 """
 
 import asyncio
 import io
 import os
-import shlex
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -140,23 +138,6 @@ def check_cooldown(user_id: int, seconds: int = None):
 
 
 # Engine runner ----------------------------------------------------------------
-def _run_cli_engine(cmd, source: str, timeout: int):
-    proc = subprocess.run(
-        shlex.split(cmd),
-        input=source.encode("utf-8"),
-        capture_output=True,
-        timeout=timeout,
-    )
-    if proc.returncode != 0:
-        stderr = proc.stderr.decode("utf-8", "replace").strip()
-        raise ObfuscationError(f"Engine (OBF_ENGINE_CMD) exited with code "
-                               f"{proc.returncode}: {stderr[-2000:] or 'no stderr'}")
-    out = proc.stdout.decode("utf-8", "replace")
-    if not out.strip():
-        raise ObfuscationError("Engine (OBF_ENGINE_CMD) produced no output.")
-    return out
-
-
 def run_engine(source: str, timeout: int = None, options: dict = None):
     """
     Run the obfuscator synchronously. Blocks — call via asyncio.to_thread().
@@ -176,9 +157,12 @@ def run_engine(source: str, timeout: int = None, options: dict = None):
 
     cli_cmd = os.environ.get("OBF_ENGINE_CMD", "").strip()
     if cli_cmd:
-        return _run_cli_engine(cli_cmd, source, timeout)
+        raise EngineNotConfigured(
+            "Remove OBF_ENGINE_CMD from Render's Environment and redeploy. "
+            "That legacy override bypasses the new level-3 engine."
+        )
 
-    # obfuscator_engine/engine.py is the self-contained Kryos runner.
+    # The bundled interpreter reads the private Lua source from Render.
     engine_path = ENGINE_DIR / "engine.py"
     if not engine_path.is_file():
         raise EngineNotConfigured(
@@ -236,7 +220,7 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
 
     def _brief(src_len, out_len, seconds):
         return (f"Obfuscated **{src_len:,}** -> **{out_len:,}** chars "
-                f"in {seconds:.1f}s.")
+                f"in {seconds:.1f}s. **Kryos v16.2 · level 3**.")
 
     async def _run_and_reply(send, source, source_label):
         loop = asyncio.get_running_loop()
