@@ -4,9 +4,8 @@ OBF command support — bridges the Discord bot to the Kryos Lua obfuscator.
 Commands added by register_obf_commands():
     .obf / !obf  (DMs only)
         DM the bot, attach a .lua file (or paste code after the command),
-        get the obfuscated main script and its optional function bundle as
-        attachments. Nothing is ever posted in a server channel, so nothing
-        leaks.
+        get one obfuscated script with a one-time function-bundle bootstrap.
+        Nothing is ever posted in a server channel, so nothing leaks.
     /obf  (owner guild, ephemeral)
         Informational only — it does NOT obfuscate. Points people at the
         bot's DMs and credits feariosz0, who wrote the Kryos engine.
@@ -305,17 +304,12 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
         )
 
         main_buf = io.BytesIO(out.encode("utf-8"))
-        bundle_buf = io.BytesIO(bundle.encode("utf-8"))
-        files = [
-            discord.File(main_buf, filename="obfuscated.lua"),
-            discord.File(bundle_buf, filename="obfuscated.bundle.lua"),
-        ]
+        file = discord.File(main_buf, filename="obfuscated.lua")
         await send(
             f"✅ {_brief(len(source), len(out), elapsed)}\n"
             f"Source: {source_label}\n"
-            "The second attachment is the function bundle; preload it before "
-            "running the main script.",
-            files=files,
+            "The function bundle is bootstrapped once inside this file.",
+            file=file,
         )
 
     async def _authorize_from_dm(user):
