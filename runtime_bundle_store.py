@@ -154,3 +154,18 @@ def store_runtime_bundle(
         "expires_at": expires_at,
         "bundle_sha256": document["bundle_sha256"],
     }
+
+
+def revoke_runtime_bundle(artifact_id: str) -> bool | None:
+    """Delete one artifact; return None when storage is unavailable."""
+    if not artifact_id or len(str(artifact_id)) > 128:
+        return False
+    collection = _get_collection()
+    if collection is None:
+        return None
+    try:
+        result = collection.delete_one({"_id": str(artifact_id)})
+        return bool(getattr(result, "deleted_count", 0))
+    except Exception as exc:
+        logger.warning("Failed to revoke runtime bundle %s: %s", str(artifact_id)[:12], exc)
+        return None
