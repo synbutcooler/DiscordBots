@@ -772,9 +772,4 @@ def obfuscate(source: str) -> str:
             "Kryos output is missing its banner — the engine did not produce "
             "a valid obfuscated script."
         )
-    # Metadata only: comments do not alter the generated program. They make
-    # the actual level/source verifiable instead of inferring it from timing.
-    checksum = hashlib.sha256(engine_src.encode("utf-8")).hexdigest()
-    marker = f"-- Bot engine: optimization_level=3 source_sha256={checksum}\n"
-    first, newline, rest = result.partition("\n")
-    return first + "\n" + marker + rest if newline else marker + result
+    return result
