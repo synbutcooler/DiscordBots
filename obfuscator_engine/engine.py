@@ -861,6 +861,61 @@ __krs_bundle_env["__KRS_RPC_BATCH"]=__krs_rpc_batch
     return bootstrap + main_output
 
 
+def _inline_capability_function_bundle(main_output: str, endpoint_url: str) -> str:
+    """Install a loader whose capability is supplied later by the VM."""
+    if not isinstance(endpoint_url, str) or not endpoint_url.strip():
+        raise ValueError("invalid runtime bundle claim URL")
+    bootstrap = f'''local __krs_bundle_claim_endpoint={json.dumps(endpoint_url)}
+local __krs_bundle_env=(getfenv and getfenv()) or _ENV
+local __krs_bundle_http_get
+if game and game.HttpGet then
+    __krs_bundle_http_get=function(__krs_url)
+        return game:HttpGet(__krs_url)
+    end
+elseif request then
+    __krs_bundle_http_get=function(__krs_url)
+        local __krs_response=request({{Url=__krs_url,Method="GET"}})
+        return __krs_response.Body or __krs_response.body
+    end
+else
+    error("Kryos runtime bundle transport is unavailable")
+end
+local __krs_bundle_loader=function(__krs_capability)
+    if type(__krs_capability)~="string" or #__krs_capability<32 or #__krs_capability>256 then
+        error("Kryos runtime capability is invalid")
+    end
+    local __krs_capability_url=__krs_capability
+    if game and game.GetService then
+        local __krs_http_service=game:GetService("HttpService")
+        if __krs_http_service and __krs_http_service.UrlEncode then
+            __krs_capability_url=__krs_http_service:UrlEncode(__krs_capability)
+        end
+    end
+    local __krs_bundle_source=assert(__krs_bundle_http_get(__krs_bundle_claim_endpoint.."?c="..__krs_capability_url))
+    if type(__krs_bundle_source)~="string" or #__krs_bundle_source>15000000 or not __krs_bundle_source:match("^%s*return%s*{{") then
+        error("Kryos runtime bundle validation failed")
+    end
+    local __krs_bundle_chunk
+    if loadstring and setfenv then
+        __krs_bundle_chunk=assert(loadstring(__krs_bundle_source))
+        setfenv(__krs_bundle_chunk,__krs_bundle_env)
+    elseif load then
+        local __krs_load_ok,__krs_load_result=pcall(load,__krs_bundle_source,nil,"t",__krs_bundle_env)
+        if __krs_load_ok and type(__krs_load_result)=="function" then
+            __krs_bundle_chunk=__krs_load_result
+        else
+            __krs_bundle_chunk=assert(loadstring(__krs_bundle_source))
+        end
+    else
+        __krs_bundle_chunk=assert(loadstring(__krs_bundle_source))
+    end
+    return __krs_bundle_chunk()
+end
+__krs_bundle_env["__KRS_FUNCTION_BUNDLE_LOADER"]=__krs_bundle_loader
+'''
+    return bootstrap + main_output
+
+
 def _obfuscate_impl(source: str, *, with_bundle: bool, inline_bundle: bool = True):
     from obfuscator import ObfuscationError, EngineNotConfigured  # avoid cycles
 
@@ -969,3 +1024,8 @@ def build_remote_bundle_output(
 ) -> str:
     """Build one-file output with startup fetch and optional batch RPC support."""
     return _inline_remote_function_bundle(main_output, bundle_url, rpc_url)
+
+
+def build_capability_bundle_output(main_output: str, endpoint_url: str) -> str:
+    """Build one-file output whose VM supplies the hidden fetch capability."""
+    return _inline_capability_function_bundle(main_output, endpoint_url)
