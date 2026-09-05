@@ -4,8 +4,9 @@ OBF command support — bridges the Discord bot to the Kryos Lua obfuscator.
 Commands added by register_obf_commands():
     .obf / !obf  (DMs only)
         DM the bot, attach a .lua file (or paste code after the command),
-        get the obfuscated script back as an attachment. Nothing is ever
-        posted in a server channel, so nothing leaks.
+        get the obfuscated main script and its optional function bundle as
+        attachments. Nothing is ever posted in a server channel, so nothing
+        leaks.
     /obf  (owner guild, ephemeral)
         Informational only — it does NOT obfuscate. Points people at the
         bot's DMs and credits feariosz0, who wrote the Kryos engine.
@@ -44,7 +45,8 @@ from pathlib import Path
 from obf_artifacts import record_obfuscation
 
 __all__ = ["ObfuscationError", "EngineNotConfigured", "run_engine",
-           "register_obf_commands", "check_authorized", "check_cooldown"]
+           "run_engine_bundle", "register_obf_commands", "check_authorized",
+           "check_cooldown"]
 
 ENGINE_DIR = Path(__file__).resolve().parent / "obfuscator_engine"
 
@@ -193,6 +195,62 @@ def run_engine(source: str, timeout: int = None, options: dict = None):
     return result
 
 
+def run_engine_bundle(source: str, timeout: int = None, options: dict = None):
+    """Run the bundle-aware engine and return ``(main, function_bundle)``."""
+    timeout = timeout or OBF_TIMEOUT
+    if not isinstance(source, str) or not source.strip():
+        raise ObfuscationError("Empty script — nothing to obfuscate.")
+    if len(source.encode("utf-8")) > OBF_MAX_BYTES:
+        limit_mb = OBF_MAX_BYTES / 1_000_000
+        limit_str = f"{limit_mb:g} MB" if limit_mb >= 1 else f"{OBF_MAX_BYTES:,} bytes"
+        raise ObfuscationError(
+            f"Script is too large (max {limit_str}). "
+            "The obfuscator runs on the bot's server, mind the size."
+        )
+
+    engine_path = ENGINE_DIR / "engine.py"
+    if not engine_path.is_file():
+        raise EngineNotConfigured(
+            f"No engine at {engine_path} — obfuscator_engine/engine.py was not "
+            "deployed. Upload it and redeploy."
+        )
+    if str(ENGINE_DIR) not in sys.path:
+        sys.path.insert(0, str(ENGINE_DIR))
+    try:
+        engine = __import__("engine", fromlist=["obfuscate_with_bundle"])
+        fn = engine.obfuscate_with_bundle
+    except Exception as exc:
+        raise EngineNotConfigured(
+            f"Bundle-aware engine module failed to import: {exc}"
+        ) from exc
+
+    try:
+        result = fn(source)
+    except ObfuscationError:
+        raise
+    except Exception as exc:
+        raise ObfuscationError(str(exc)) from exc
+
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise ObfuscationError(
+            "Engine did not return the main output and function bundle."
+        )
+    main_output, bundle = result
+    if not isinstance(main_output, str) or not main_output.strip():
+        raise ObfuscationError("Engine returned an empty main result.")
+    if not isinstance(bundle, str) or not bundle.strip():
+        raise ObfuscationError("Engine returned an empty function bundle.")
+
+    main_len = len(main_output.encode("utf-8"))
+    bundle_len = len(bundle.encode("utf-8"))
+    if main_len > OBF_MAX_OUTPUT or bundle_len > OBF_MAX_OUTPUT:
+        raise ObfuscationError(
+            "Obfuscated output or function bundle is too large for a Discord "
+            "attachment. Split the script into smaller pieces."
+        )
+    return main_output, bundle
+
+
 # Discord commands -------------------------------------------------------------
 def register_obf_commands(bot, owner_id: int, guild_id: int):
     """Attach the /obf, .obf, .obfunlock and .obfhelp commands to the bot."""
@@ -222,7 +280,7 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
         loop = asyncio.get_running_loop()
         started = time.monotonic()
         try:
-            out = await loop.run_in_executor(None, run_engine, source)
+            out, bundle = await loop.run_in_executor(None, run_engine_bundle, source)
         except EngineNotConfigured as exc:
             await send(f"⚠️ {exc}", file=None)
             return
@@ -239,18 +297,25 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
             lambda: record_obfuscation(
                 source,
                 out,
+                bundle=bundle,
                 user_id=user_id,
                 source_label=source_label,
                 elapsed_seconds=elapsed,
             ),
         )
 
-        buf = io.BytesIO(out.encode("utf-8"))
-        file = discord.File(buf, filename="obfuscated.lua")
+        main_buf = io.BytesIO(out.encode("utf-8"))
+        bundle_buf = io.BytesIO(bundle.encode("utf-8"))
+        files = [
+            discord.File(main_buf, filename="obfuscated.lua"),
+            discord.File(bundle_buf, filename="obfuscated.bundle.lua"),
+        ]
         await send(
             f"✅ {_brief(len(source), len(out), elapsed)}\n"
-            f"Source: {source_label}",
-            file=file,
+            f"Source: {source_label}\n"
+            "The second attachment is the function bundle; preload it before "
+            "running the main script.",
+            files=files,
         )
 
     async def _authorize_from_dm(user):
@@ -454,8 +519,10 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
             return
 
         async with ctx.typing():
-            async def send(content, file=None):
-                if file is not None:
+            async def send(content, file=None, files=None):
+                if files is not None:
+                    await ctx.send(content=content, files=files)
+                elif file is not None:
                     await ctx.send(content=content, file=file)
                 else:
                     await ctx.send(content=content)
