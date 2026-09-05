@@ -25,14 +25,13 @@ Because DMs carry no server context, non-owner access is checked against the
 owner guild: you must be a member there, then the usual permission/role rules
 apply. Everyone else gets a plain "nope".
 
-ENGINE — Render-only setup:
-    Upload this file and obfuscator_engine/engine.py to GitHub. In Render,
-    add a Secret File named newlua.txt containing the new Kryos v16.2 Lua
-    source. The runner reads /etc/secrets/newlua.txt and fixes its level to 3.
-    The static Lua 5.4.8 interpreter is embedded; no local updater or extra
-    runtime install is required. KRS_ENGINE_KEY may remain unchanged but is
-    not used by the Secret File loader. KRS_LUA_BIN may override the runtime.
-    OBF_ENGINE_CMD must be unset so it cannot bypass the updated engine.
+ENGINE — private-repository, self-contained setup:
+    Deploy this file and obfuscator_engine/engine.py. The new Kryos v16.2 Lua
+    source is already bundled and fixed to level 3, along with a static Lua
+    5.4.8 interpreter. No Secret File, local updater, or key change is needed.
+    The bundled source is compressed, NOT encrypted: keep the repo private.
+    Legacy KRS_ENGINE_KEY, KRS_ENGINE_SOURCE_FILE, and OBF_ENGINE_CMD settings
+    are not used and may remain unchanged. KRS_LUA_BIN may override the runtime.
 """
 
 import asyncio
@@ -155,14 +154,9 @@ def run_engine(source: str, timeout: int = None, options: dict = None):
             "The obfuscator runs on the bot's server, mind the size."
         )
 
-    cli_cmd = os.environ.get("OBF_ENGINE_CMD", "").strip()
-    if cli_cmd:
-        raise EngineNotConfigured(
-            "Remove OBF_ENGINE_CMD from Render's Environment and redeploy. "
-            "That legacy override bypasses the new level-3 engine."
-        )
-
-    # The bundled interpreter reads the private Lua source from Render.
+    # Always select this bundle. Legacy CLI/source-file overrides are ignored
+    # so existing Render values cannot silently select the old engine.
+    # Both the new source and the interpreter are inside engine.py.
     engine_path = ENGINE_DIR / "engine.py"
     if not engine_path.is_file():
         raise EngineNotConfigured(
