@@ -36,7 +36,9 @@ ENGINE — private-repository, self-contained setup:
 
 import asyncio
 import io
+import json
 import os
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -70,6 +72,7 @@ OBF_COOLDOWN = _env_int("OBF_COOLDOWN_SECONDS", 30)       # seconds per user
 OBF_MAX_BYTES = _env_int("OBF_MAX_SOURCE_BYTES", 2_000_000)     # ~2 MB source cap
 OBF_MAX_OUTPUT = _env_int("OBF_MAX_OUTPUT_BYTES", 8_000_000)     # ~8 MB output cap
 OBF_REMOTE_BUNDLE_ENABLED = _env_bool("OBF_REMOTE_BUNDLE_ENABLED", False)
+OBF_CAPABILITY_BUNDLE_ENABLED = _env_bool("OBF_CAPABILITY_BUNDLE_ENABLED", False)
 OBF_HARDENED_VM_ONLY = _env_bool("OBF_HARDENED_VM_ONLY", False)
 OBF_RUNTIME_BUNDLE_URL = os.environ.get(
     "OBF_RUNTIME_BUNDLE_URL",
@@ -78,6 +81,10 @@ OBF_RUNTIME_BUNDLE_URL = os.environ.get(
 OBF_RUNTIME_RPC_URL = os.environ.get(
     "OBF_RUNTIME_RPC_URL",
     OBF_RUNTIME_BUNDLE_URL.replace("/api/runtime-bundle", "/api/runtime-rpc"),
+).strip().rstrip("/")
+OBF_RUNTIME_BUNDLE_CLAIM_URL = os.environ.get(
+    "OBF_RUNTIME_BUNDLE_CLAIM_URL",
+    OBF_RUNTIME_BUNDLE_URL.rsplit("/", 1)[0] + "/runtime-bundle/claim",
 ).strip().rstrip("/")
 
 
@@ -254,8 +261,12 @@ def run_engine_bundle(
         ) from exc
 
     remote_bundle = OBF_REMOTE_BUNDLE_ENABLED
-    if isinstance(options, dict) and "remote_bundle" in options:
-        remote_bundle = bool(options["remote_bundle"])
+    capability_bundle = OBF_CAPABILITY_BUNDLE_ENABLED
+    if isinstance(options, dict):
+        if "remote_bundle" in options:
+            remote_bundle = bool(options["remote_bundle"])
+        if "capability_bundle" in options:
+            capability_bundle = bool(options["capability_bundle"])
 
     # Hardened mode deliberately skips native function extraction. The engine
     # keeps all user functions inside the custom VM, so there is no ordinary
@@ -277,8 +288,26 @@ def run_engine_bundle(
             )
         return result, None
 
+    capability = None
+    engine_source = source
+    if capability_bundle:
+        if not OBF_RUNTIME_BUNDLE_CLAIM_URL:
+            raise ObfuscationError(
+                "Capability bundle delivery is enabled but OBF_RUNTIME_BUNDLE_CLAIM_URL is empty."
+            )
+        if remote_bundle:
+            # The hidden-capability path replaces the old plain URL/token
+            # bootstrap; never emit both forms into one output.
+            remote_bundle = False
+        capability = secrets.token_urlsafe(32)
+        engine_source = (
+            "local __krs_runtime_capability=" + json.dumps(capability) + "\n"
+            "__KRS_FUNCTION_BUNDLE=__KRS_FUNCTION_BUNDLE_LOADER(__krs_runtime_capability)\n"
+            + source
+        )
+
     try:
-        result = fn(source, inline=not remote_bundle)
+        result = fn(engine_source, inline=not remote_bundle and not capability_bundle)
     except ObfuscationError:
         raise
     except Exception as exc:
@@ -294,7 +323,28 @@ def run_engine_bundle(
     if not isinstance(bundle, str) or not bundle.strip():
         raise ObfuscationError("Engine returned an empty function bundle.")
 
-    if remote_bundle:
+    if capability_bundle:
+        artifact = store_runtime_bundle(
+            bundle,
+            capability=capability,
+            user_id=user_id,
+            source_label=source_label,
+        )
+        if not artifact:
+            raise ObfuscationError(
+                "Capability bundle storage is unavailable. Check MONGODB_URI "
+                "and the bot's MongoDB access before retrying."
+            )
+        try:
+            main_output = engine.build_capability_bundle_output(
+                main_output,
+                OBF_RUNTIME_BUNDLE_CLAIM_URL,
+            )
+        except Exception as exc:
+            raise ObfuscationError(
+                f"Could not build the capability bundle loader: {exc}"
+            ) from exc
+    elif remote_bundle:
         if not OBF_RUNTIME_BUNDLE_URL:
             raise ObfuscationError(
                 "Remote bundle delivery is enabled but OBF_RUNTIME_BUNDLE_URL is empty."
@@ -410,9 +460,13 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
                 "All functions stay inside the hardened VM; no native bundle is shipped."
                 if OBF_HARDENED_VM_ONLY
                 else (
-                    "The function bundle is fetched once at startup and then kept in memory."
-                    if OBF_REMOTE_BUNDLE_ENABLED
-                    else "The function bundle is bootstrapped once inside this file."
+                    "The function bundle is fetched once through the VM-hidden capability loader."
+                    if OBF_CAPABILITY_BUNDLE_ENABLED
+                    else (
+                        "The function bundle is fetched once at startup and then kept in memory."
+                        if OBF_REMOTE_BUNDLE_ENABLED
+                        else "The function bundle is bootstrapped once inside this file."
+                    )
                 )
             ),
             file=file,
