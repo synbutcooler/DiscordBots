@@ -867,15 +867,39 @@ def _inline_capability_function_bundle(main_output: str, endpoint_url: str) -> s
         raise ValueError("invalid runtime bundle claim URL")
     bootstrap = f'''local __krs_bundle_claim_endpoint={json.dumps(endpoint_url)}
 local __krs_bundle_env=(getfenv and getfenv()) or _ENV
-local __krs_bundle_http_get
-if game and game.HttpGet then
-    __krs_bundle_http_get=function(__krs_url)
-        return game:HttpGet(__krs_url)
-    end
-elseif request then
-    __krs_bundle_http_get=function(__krs_url)
-        local __krs_response=request({{Url=__krs_url,Method="GET"}})
+-- Prefer executor request APIs so the bearer capability is sent in a POST
+-- body instead of a URL query string that proxies/access logs commonly keep.
+local __krs_bundle_request=request or http_request
+if not __krs_bundle_request and syn then
+    __krs_bundle_request=syn.request
+end
+local __krs_bundle_fetch
+if __krs_bundle_request then
+    __krs_bundle_fetch=function(__krs_url,__krs_capability)
+        local __krs_response=__krs_bundle_request({{
+            Url=__krs_url,
+            Method="POST",
+            Headers={{["Content-Type"]="text/plain"}},
+            Body=__krs_capability,
+        }})
+        local __krs_status=__krs_response.StatusCode or __krs_response.Status or __krs_response.status_code
+        if __krs_status and tonumber(__krs_status)>=400 then
+            error("Kryos runtime bundle claim failed")
+        end
         return __krs_response.Body or __krs_response.body
+    end
+elseif game and game.HttpGet then
+    -- Compatibility fallback for environments exposing only HttpGet. This
+    -- fallback necessarily places the capability in the query string.
+    __krs_bundle_fetch=function(__krs_url,__krs_capability)
+        local __krs_capability_url=__krs_capability
+        if game.GetService then
+            local __krs_http_service=game:GetService("HttpService")
+            if __krs_http_service and __krs_http_service.UrlEncode then
+                __krs_capability_url=__krs_http_service:UrlEncode(__krs_capability)
+            end
+        end
+        return game:HttpGet(__krs_url.."?c="..__krs_capability_url)
     end
 else
     error("Kryos runtime bundle transport is unavailable")
@@ -884,14 +908,7 @@ local __krs_bundle_loader=function(__krs_capability)
     if type(__krs_capability)~="string" or #__krs_capability<32 or #__krs_capability>256 then
         error("Kryos runtime capability is invalid")
     end
-    local __krs_capability_url=__krs_capability
-    if game and game.GetService then
-        local __krs_http_service=game:GetService("HttpService")
-        if __krs_http_service and __krs_http_service.UrlEncode then
-            __krs_capability_url=__krs_http_service:UrlEncode(__krs_capability)
-        end
-    end
-    local __krs_bundle_source=assert(__krs_bundle_http_get(__krs_bundle_claim_endpoint.."?c="..__krs_capability_url))
+    local __krs_bundle_source=assert(__krs_bundle_fetch(__krs_bundle_claim_endpoint,__krs_capability))
     if type(__krs_bundle_source)~="string" or #__krs_bundle_source>15000000 or not __krs_bundle_source:match("^%s*return%s*{{") then
         error("Kryos runtime bundle validation failed")
     end
