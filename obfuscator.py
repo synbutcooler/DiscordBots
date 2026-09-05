@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 
 from obf_artifacts import record_obfuscation
+from runtime_bundle_store import store_runtime_bundle
 
 __all__ = ["ObfuscationError", "EngineNotConfigured", "run_engine",
            "run_engine_bundle", "register_obf_commands", "check_authorized",
@@ -57,10 +58,22 @@ def _env_int(name, default):
         return default
 
 
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 OBF_TIMEOUT = _env_int("OBF_ENGINE_TIMEOUT", 180)         # seconds
 OBF_COOLDOWN = _env_int("OBF_COOLDOWN_SECONDS", 30)       # seconds per user
 OBF_MAX_BYTES = _env_int("OBF_MAX_SOURCE_BYTES", 2_000_000)     # ~2 MB source cap
 OBF_MAX_OUTPUT = _env_int("OBF_MAX_OUTPUT_BYTES", 8_000_000)     # ~8 MB output cap
+OBF_REMOTE_BUNDLE_ENABLED = _env_bool("OBF_REMOTE_BUNDLE_ENABLED", False)
+OBF_RUNTIME_BUNDLE_URL = os.environ.get(
+    "OBF_RUNTIME_BUNDLE_URL",
+    "https://vadrifts.onrender.com/api/runtime-bundle",
+).strip().rstrip("/")
 
 
 class ObfuscationError(RuntimeError):
@@ -194,8 +207,20 @@ def run_engine(source: str, timeout: int = None, options: dict = None):
     return result
 
 
-def run_engine_bundle(source: str, timeout: int = None, options: dict = None):
-    """Run the bundle-aware engine and return ``(main, function_bundle)``."""
+def run_engine_bundle(
+    source: str,
+    timeout: int = None,
+    options: dict = None,
+    *,
+    user_id=None,
+    source_label: str = None,
+):
+    """Run the bundle-aware engine and return ``(output, function_bundle)``.
+
+    In remote mode the bundle is inserted into MongoDB before the output is
+    returned. The attachment then contains only the VM payload plus a
+    per-artifact URL/token; the bundle is fetched once by the Lua bootstrap.
+    """
     timeout = timeout or OBF_TIMEOUT
     if not isinstance(source, str) or not source.strip():
         raise ObfuscationError("Empty script — nothing to obfuscate.")
@@ -223,8 +248,12 @@ def run_engine_bundle(source: str, timeout: int = None, options: dict = None):
             f"Bundle-aware engine module failed to import: {exc}"
         ) from exc
 
+    remote_bundle = OBF_REMOTE_BUNDLE_ENABLED
+    if isinstance(options, dict) and "remote_bundle" in options:
+        remote_bundle = bool(options["remote_bundle"])
+
     try:
-        result = fn(source)
+        result = fn(source, inline=not remote_bundle)
     except ObfuscationError:
         raise
     except Exception as exc:
@@ -239,6 +268,36 @@ def run_engine_bundle(source: str, timeout: int = None, options: dict = None):
         raise ObfuscationError("Engine returned an empty main result.")
     if not isinstance(bundle, str) or not bundle.strip():
         raise ObfuscationError("Engine returned an empty function bundle.")
+
+    if remote_bundle:
+        if not OBF_RUNTIME_BUNDLE_URL:
+            raise ObfuscationError(
+                "Remote bundle delivery is enabled but OBF_RUNTIME_BUNDLE_URL is empty."
+            )
+        artifact = store_runtime_bundle(
+            bundle,
+            user_id=user_id,
+            source_label=source_label,
+        )
+        if not artifact:
+            raise ObfuscationError(
+                "Remote bundle storage is unavailable. Check MONGODB_URI and "
+                "the bot's MongoDB access before retrying."
+            )
+        # Artifact IDs and tokens are URL-safe; keep quote() here anyway so a
+        # future token format cannot turn into a query-string injection.
+        from urllib.parse import quote
+        artifact_id = quote(artifact["artifact_id"], safe="")
+        access_token = quote(artifact["access_token"], safe="")
+        bundle_url = (
+            f"{OBF_RUNTIME_BUNDLE_URL}/{artifact_id}?token={access_token}"
+        )
+        try:
+            main_output = engine.build_remote_bundle_output(main_output, bundle_url)
+        except Exception as exc:
+            raise ObfuscationError(
+                f"Could not build the remote bundle bootstrap: {exc}"
+            ) from exc
 
     main_len = len(main_output.encode("utf-8"))
     bundle_len = len(bundle.encode("utf-8"))
@@ -279,7 +338,14 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
         loop = asyncio.get_running_loop()
         started = time.monotonic()
         try:
-            out, bundle = await loop.run_in_executor(None, run_engine_bundle, source)
+            out, bundle = await loop.run_in_executor(
+                None,
+                lambda: run_engine_bundle(
+                    source,
+                    user_id=user_id,
+                    source_label=source_label,
+                ),
+            )
         except EngineNotConfigured as exc:
             await send(f"⚠️ {exc}", file=None)
             return
@@ -308,7 +374,11 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
         await send(
             f"✅ {_brief(len(source), len(out), elapsed)}\n"
             f"Source: {source_label}\n"
-            "The function bundle is bootstrapped once inside this file.",
+            + (
+                "The function bundle is fetched once at startup and then kept in memory."
+                if OBF_REMOTE_BUNDLE_ENABLED
+                else "The function bundle is bootstrapped once inside this file."
+            ),
             file=file,
         )
 
