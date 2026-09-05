@@ -70,6 +70,7 @@ OBF_COOLDOWN = _env_int("OBF_COOLDOWN_SECONDS", 30)       # seconds per user
 OBF_MAX_BYTES = _env_int("OBF_MAX_SOURCE_BYTES", 2_000_000)     # ~2 MB source cap
 OBF_MAX_OUTPUT = _env_int("OBF_MAX_OUTPUT_BYTES", 8_000_000)     # ~8 MB output cap
 OBF_REMOTE_BUNDLE_ENABLED = _env_bool("OBF_REMOTE_BUNDLE_ENABLED", False)
+OBF_HARDENED_VM_ONLY = _env_bool("OBF_HARDENED_VM_ONLY", False)
 OBF_RUNTIME_BUNDLE_URL = os.environ.get(
     "OBF_RUNTIME_BUNDLE_URL",
     "https://vadrifts.onrender.com/api/runtime-bundle",
@@ -256,6 +257,26 @@ def run_engine_bundle(
     if isinstance(options, dict) and "remote_bundle" in options:
         remote_bundle = bool(options["remote_bundle"])
 
+    # Hardened mode deliberately skips native function extraction. The engine
+    # keeps all user functions inside the custom VM, so there is no ordinary
+    # function bundle to embed or fetch. It is slower than the optimized path,
+    # but it is the better default for source-concealment testing.
+    if OBF_HARDENED_VM_ONLY:
+        try:
+            result = engine.obfuscate(source)
+        except ObfuscationError:
+            raise
+        except Exception as exc:
+            raise ObfuscationError(str(exc)) from exc
+        if not isinstance(result, str) or not result.strip():
+            raise ObfuscationError("Engine returned an empty hardened result.")
+        main_len = len(result.encode("utf-8"))
+        if main_len > OBF_MAX_OUTPUT:
+            raise ObfuscationError(
+                "Hardened obfuscated output is too large for a Discord attachment."
+            )
+        return result, None
+
     try:
         result = fn(source, inline=not remote_bundle)
     except ObfuscationError:
@@ -311,7 +332,7 @@ def run_engine_bundle(
             ) from exc
 
     main_len = len(main_output.encode("utf-8"))
-    bundle_len = len(bundle.encode("utf-8"))
+    bundle_len = len(bundle.encode("utf-8")) if bundle else 0
     if main_len > OBF_MAX_OUTPUT or bundle_len > OBF_MAX_OUTPUT:
         raise ObfuscationError(
             "Obfuscated output or function bundle is too large for a Discord "
@@ -386,9 +407,13 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
             f"✅ {_brief(len(source), len(out), elapsed)}\n"
             f"Source: {source_label}\n"
             + (
-                "The function bundle is fetched once at startup and then kept in memory."
-                if OBF_REMOTE_BUNDLE_ENABLED
-                else "The function bundle is bootstrapped once inside this file."
+                "All functions stay inside the hardened VM; no native bundle is shipped."
+                if OBF_HARDENED_VM_ONLY
+                else (
+                    "The function bundle is fetched once at startup and then kept in memory."
+                    if OBF_REMOTE_BUNDLE_ENABLED
+                    else "The function bundle is bootstrapped once inside this file."
+                )
             ),
             file=file,
         )
