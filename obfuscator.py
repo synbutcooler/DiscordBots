@@ -301,6 +301,7 @@ def run_engine_bundle(
             remote_bundle = False
         capability = secrets.token_urlsafe(32)
         engine_source = (
+            "-- KRS_CAPABILITY_BUNDLE\n"
             "local __krs_runtime_capability=" + json.dumps(capability) + "\n"
             "__KRS_FUNCTION_BUNDLE=__KRS_FUNCTION_BUNDLE_LOADER(__krs_runtime_capability)\n"
             + source
