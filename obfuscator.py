@@ -36,7 +36,6 @@ ENGINE — private-repository, self-contained setup:
 
 import asyncio
 import io
-import logging
 import os
 import sys
 import time
@@ -48,7 +47,6 @@ __all__ = ["ObfuscationError", "EngineNotConfigured", "run_engine",
            "register_obf_commands", "check_authorized", "check_cooldown"]
 
 ENGINE_DIR = Path(__file__).resolve().parent / "obfuscator_engine"
-logger = logging.getLogger(__name__)
 
 # Environment knobs -----------------------------------------------------------
 def _env_int(name, default):
@@ -236,36 +234,16 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
         # Optional server-side persistence is isolated from the user-facing
         # response. A MongoDB write must never delay or break delivery of an
         # otherwise successful obfuscation.
-        def _persist_artifact():
-            enabled_value = os.environ.get("OBF_ARTIFACTS_ENABLED", "").strip().lower()
-            logger.info(
-                "OBF artifact persistence task started enabled=%s",
-                enabled_value in {"1", "true", "yes", "on"},
-            )
-            try:
-                artifact_id = record_obfuscation(
-                    source,
-                    out,
-                    user_id=user_id,
-                    source_label=source_label,
-                    elapsed_seconds=elapsed,
-                )
-                if artifact_id:
-                    logger.info(
-                        "OBF artifact persistence stored artifact id=%s",
-                        artifact_id,
-                    )
-                elif os.environ.get("OBF_ARTIFACTS_ENABLED", "").strip().lower() \
-                        in {"1", "true", "yes", "on"}:
-                    logger.warning(
-                        "OBF artifact persistence was enabled but stored no artifact"
-                    )
-            except Exception:
-                # This is a second safety net around the storage module: an
-                # unexpected logging/storage error must never affect delivery.
-                logger.exception("OBF artifact persistence task failed")
-
-        loop.run_in_executor(None, _persist_artifact)
+        loop.run_in_executor(
+            None,
+            lambda: record_obfuscation(
+                source,
+                out,
+                user_id=user_id,
+                source_label=source_label,
+                elapsed_seconds=elapsed,
+            ),
+        )
 
         buf = io.BytesIO(out.encode("utf-8"))
         file = discord.File(buf, filename="obfuscated.lua")
