@@ -33,6 +33,9 @@ _DB_NAME = (os.environ.get("OBF_ARTIFACTS_DB") or "vadrifts_bots").strip()
 _COLLECTION_NAME = (
     os.environ.get("OBF_ARTIFACTS_COLLECTION") or "obf_artifacts"
 ).strip()
+# Leave headroom below MongoDB's 16 MiB BSON document limit when full content
+# retention is enabled and a bundle is present.
+_CONTENT_LIMIT_BYTES = 15_000_000
 
 _client = None
 _collection = None
@@ -115,6 +118,7 @@ def record_obfuscation(
     source: str,
     output: str,
     *,
+    bundle: str | None = None,
     user_id=None,
     source_label: str | None = None,
     elapsed_seconds: float | None = None,
@@ -133,6 +137,7 @@ def record_obfuscation(
 
     source = source if isinstance(source, str) else str(source)
     output = output if isinstance(output, str) else str(output)
+    bundle = bundle if isinstance(bundle, str) else (str(bundle) if bundle is not None else "")
     artifact_id = secrets.token_urlsafe(18)
 
     document = {
@@ -144,24 +149,43 @@ def record_obfuscation(
         "source_label": (source_label or "")[:255],
         "source_bytes": len(source.encode("utf-8")),
         "output_bytes": len(output.encode("utf-8")),
+        "bundle_bytes": len(bundle.encode("utf-8")) if bundle else 0,
         "source_sha256": _sha256_text(source),
         "output_sha256": _sha256_text(output),
+        "bundle_sha256": _sha256_text(bundle) if bundle else None,
     }
     if elapsed_seconds is not None:
         document["elapsed_ms"] = round(float(elapsed_seconds) * 1000, 3)
 
-    if store_content_enabled():
+    content_requested = store_content_enabled()
+    content_bytes = (
+        len(source.encode("utf-8"))
+        + len(output.encode("utf-8"))
+        + len(bundle.encode("utf-8"))
+    )
+    document["content_stored"] = False
+    if content_requested and content_bytes <= _CONTENT_LIMIT_BYTES:
         document["source"] = source
         document["output"] = output
+        if bundle:
+            document["bundle"] = bundle
+        document["content_stored"] = True
+    elif content_requested:
+        logger.warning(
+            "Full obfuscation artifact content skipped because it is too large "
+            "(%s bytes)",
+            content_bytes,
+        )
 
     try:
         collection.insert_one(document)
         logger.info(
-            "Stored obfuscation artifact id=%s source_bytes=%s output_bytes=%s content=%s",
+            "Stored obfuscation artifact id=%s source_bytes=%s output_bytes=%s bundle_bytes=%s content=%s",
             artifact_id,
             document["source_bytes"],
             document["output_bytes"],
-            store_content_enabled(),
+            document["bundle_bytes"],
+            document["content_stored"],
         )
         return artifact_id
     except Exception as exc:
