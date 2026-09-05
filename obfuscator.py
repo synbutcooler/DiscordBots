@@ -42,7 +42,7 @@ import time
 from pathlib import Path
 
 from obf_artifacts import record_obfuscation
-from runtime_bundle_store import store_runtime_bundle
+from runtime_bundle_store import revoke_runtime_bundle, store_runtime_bundle
 
 __all__ = ["ObfuscationError", "EngineNotConfigured", "run_engine",
            "run_engine_bundle", "register_obf_commands", "check_authorized",
@@ -605,6 +605,28 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
     )
     async def obf_slash(interaction: discord.Interaction):
         await interaction.response.send_message(OBF_INFO, ephemeral=True)
+
+    # --- .obfrevoke (owner-only Mongo-backed artifact revocation) ------------
+    @bot.command(name="obfrevoke")
+    async def obfrevoke(ctx, artifact_id: str = ""):
+        if ctx.author.id != owner_id:
+            await ctx.send("This command is owner-only.")
+            return
+        if ctx.guild is not None:
+            await ctx.send("🤫 DM me `.obfrevoke <artifact_id>` so the ID stays private.")
+            return
+        artifact_id = artifact_id.strip()
+        if not artifact_id:
+            await ctx.send("Usage: `.obfrevoke <artifact_id>`")
+            return
+
+        revoked = await asyncio.to_thread(revoke_runtime_bundle, artifact_id)
+        if revoked is True:
+            await ctx.send(f"✅ Revoked runtime bundle `{artifact_id}`.")
+        elif revoked is False:
+            await ctx.send(f"ℹ️ No active runtime bundle found for `{artifact_id}`.")
+        else:
+            await ctx.send("⚠️ MongoDB storage is unavailable; the artifact was not revoked.")
 
     # --- .obfunlock (get/refresh a checkpoint link, show remaining time) ------
     @bot.command(name="obfunlock", aliases=["obfkey"])
