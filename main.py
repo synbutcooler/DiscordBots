@@ -169,12 +169,29 @@ if __name__ == '__main__':
 
     def start_bots_delayed():
         time.sleep(5)
+        main_present = bool((DISCORD_TOKEN or "").strip())
+        sticky_present = bool((os.environ.get("STICKIED_TOKEN") or "").strip())
+        same_token = main_present and sticky_present and DISCORD_TOKEN == os.environ.get("STICKIED_TOKEN")
+        logger.info(
+            "Discord bot token check: main=%s stickied=%s distinct=%s",
+            "set" if main_present else "MISSING",
+            "set" if sticky_present else "MISSING",
+            "no" if same_token else "yes",
+        )
+        if same_token:
+            logger.error(
+                "DISCORD_TOKEN and STICKIED_TOKEN are identical. They must be two different Discord bot tokens."
+            )
         logger.info("Starting main bot...")
-        bot_thread = threading.Thread(target=start_bot, daemon=True)
+        bot_thread = threading.Thread(target=start_bot, daemon=True, name="main-discord-bot")
         bot_thread.start()
         time.sleep(10)
         logger.info("Starting stickied message bot...")
-        stickied_bot_thread = threading.Thread(target=start_stickied_bot, daemon=True)
+        stickied_bot_thread = threading.Thread(
+            target=start_stickied_bot,
+            daemon=True,
+            name="stickied-discord-bot",
+        )
         stickied_bot_thread.start()
 
     bots_thread = threading.Thread(target=start_bots_delayed, daemon=True)
