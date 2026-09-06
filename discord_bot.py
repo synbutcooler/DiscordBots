@@ -2871,6 +2871,11 @@ async def before_renewal_email_reminder_loop():
 
 
 @bot.event
+async def on_disconnect():
+    logger.warning("Main bot disconnected from the Discord gateway")
+
+
+@bot.event
 async def on_ready():
     print(f'Main bot logged in as {bot.user}')
     if not renewal_email_reminder_loop.is_running():
@@ -2923,10 +2928,13 @@ async def on_ready():
 
 
 def start_bot():
+    if not isinstance(DISCORD_TOKEN, str) or not DISCORD_TOKEN.strip():
+        logger.error("Main bot cannot start: DISCORD_TOKEN is missing")
+        return
     try:
         bot.run(DISCORD_TOKEN)
-    except Exception as e:
-        print(f"Main bot error: {e}")
+    except Exception:
+        logger.exception("Main bot stopped during startup or reconnect")
 
 
 if __name__ == "__main__":
