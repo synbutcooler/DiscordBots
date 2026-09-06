@@ -73,6 +73,7 @@ OBF_MAX_BYTES = _env_int("OBF_MAX_SOURCE_BYTES", 2_000_000)     # ~2 MB source c
 OBF_MAX_OUTPUT = _env_int("OBF_MAX_OUTPUT_BYTES", 8_000_000)     # ~8 MB output cap
 OBF_REMOTE_BUNDLE_ENABLED = _env_bool("OBF_REMOTE_BUNDLE_ENABLED", False)
 OBF_CAPABILITY_BUNDLE_ENABLED = _env_bool("OBF_CAPABILITY_BUNDLE_ENABLED", False)
+OBF_CHALLENGE_BUNDLE_ENABLED = _env_bool("OBF_CHALLENGE_BUNDLE_ENABLED", False)
 OBF_HARDENED_VM_ONLY = _env_bool("OBF_HARDENED_VM_ONLY", False)
 OBF_RUNTIME_BUNDLE_URL = os.environ.get(
     "OBF_RUNTIME_BUNDLE_URL",
@@ -85,6 +86,10 @@ OBF_RUNTIME_RPC_URL = os.environ.get(
 OBF_RUNTIME_BUNDLE_CLAIM_URL = os.environ.get(
     "OBF_RUNTIME_BUNDLE_CLAIM_URL",
     OBF_RUNTIME_BUNDLE_URL.rsplit("/", 1)[0] + "/runtime-bundle/claim",
+).strip().rstrip("/")
+OBF_RUNTIME_BUNDLE_CHALLENGE_URL = os.environ.get(
+    "OBF_RUNTIME_BUNDLE_CHALLENGE_URL",
+    OBF_RUNTIME_BUNDLE_CLAIM_URL.rsplit("/", 1)[0] + "/challenge",
 ).strip().rstrip("/")
 
 
@@ -262,11 +267,14 @@ def run_engine_bundle(
 
     remote_bundle = OBF_REMOTE_BUNDLE_ENABLED
     capability_bundle = OBF_CAPABILITY_BUNDLE_ENABLED
+    challenge_bundle = OBF_CHALLENGE_BUNDLE_ENABLED
     if isinstance(options, dict):
         if "remote_bundle" in options:
             remote_bundle = bool(options["remote_bundle"])
         if "capability_bundle" in options:
             capability_bundle = bool(options["capability_bundle"])
+        if "challenge_bundle" in options:
+            challenge_bundle = bool(options["challenge_bundle"])
 
     # Hardened mode deliberately skips native function extraction. The engine
     # keeps all user functions inside the custom VM, so there is no ordinary
@@ -289,8 +297,28 @@ def run_engine_bundle(
         return result, None
 
     capability = None
+    challenge_artifact_id = None
     engine_source = source
-    if capability_bundle:
+    if challenge_bundle:
+        if not OBF_RUNTIME_BUNDLE_CHALLENGE_URL or not OBF_RUNTIME_BUNDLE_CLAIM_URL:
+            raise ObfuscationError(
+                "Challenge bundle delivery requires both challenge and claim URLs."
+            )
+        # Challenge mode replaces the reusable capability claim. The artifact
+        # ID is only an internal lookup label; both values are compiled into
+        # the protected VM prelude rather than emitted as bootstrap strings.
+        remote_bundle = False
+        capability_bundle = False
+        challenge_artifact_id = secrets.token_urlsafe(18)
+        capability = secrets.token_urlsafe(32)
+        engine_source = (
+            "-- KRS_CAPABILITY_BUNDLE\n"
+            "local __krs_runtime_artifact=" + json.dumps(challenge_artifact_id) + "\n"
+            "local __krs_runtime_capability=" + json.dumps(capability) + "\n"
+            "__KRS_FUNCTION_BUNDLE=__KRS_FUNCTION_BUNDLE_LOADER(__krs_runtime_artifact,__krs_runtime_capability)\n"
+            + source
+        )
+    elif capability_bundle:
         if not OBF_RUNTIME_BUNDLE_CLAIM_URL:
             raise ObfuscationError(
                 "Capability bundle delivery is enabled but OBF_RUNTIME_BUNDLE_CLAIM_URL is empty."
@@ -308,7 +336,7 @@ def run_engine_bundle(
         )
 
     try:
-        result = fn(engine_source, inline=not remote_bundle and not capability_bundle)
+        result = fn(engine_source, inline=not remote_bundle and not capability_bundle and not challenge_bundle)
     except ObfuscationError:
         raise
     except Exception as exc:
@@ -324,7 +352,31 @@ def run_engine_bundle(
     if not isinstance(bundle, str) or not bundle.strip():
         raise ObfuscationError("Engine returned an empty function bundle.")
 
-    if capability_bundle:
+    if challenge_bundle:
+        artifact = store_runtime_bundle(
+            bundle,
+            capability=capability,
+            challenge_secret=capability,
+            artifact_id=challenge_artifact_id,
+            user_id=user_id,
+            source_label=source_label,
+        )
+        if not artifact:
+            raise ObfuscationError(
+                "Challenge bundle storage is unavailable. Check MONGODB_URI "
+                "and the bot's MongoDB access before retrying."
+            )
+        try:
+            main_output = engine.build_challenge_bundle_output(
+                main_output,
+                OBF_RUNTIME_BUNDLE_CHALLENGE_URL,
+                OBF_RUNTIME_BUNDLE_CLAIM_URL,
+            )
+        except Exception as exc:
+            raise ObfuscationError(
+                f"Could not build the challenge bundle loader: {exc}"
+            ) from exc
+    elif capability_bundle:
         artifact = store_runtime_bundle(
             bundle,
             capability=capability,
@@ -461,12 +513,16 @@ def register_obf_commands(bot, owner_id: int, guild_id: int):
                 "All functions stay inside the hardened VM; no native bundle is shipped."
                 if OBF_HARDENED_VM_ONLY
                 else (
-                    "The function bundle is fetched once through the VM-hidden capability loader."
-                    if OBF_CAPABILITY_BUNDLE_ENABLED
+                    "The function bundle is fetched through a one-time VM challenge."
+                    if OBF_CHALLENGE_BUNDLE_ENABLED
                     else (
-                        "The function bundle is fetched once at startup and then kept in memory."
-                        if OBF_REMOTE_BUNDLE_ENABLED
-                        else "The function bundle is bootstrapped once inside this file."
+                        "The function bundle is fetched once through the VM-hidden capability loader."
+                        if OBF_CAPABILITY_BUNDLE_ENABLED
+                        else (
+                            "The function bundle is fetched once at startup and then kept in memory."
+                            if OBF_REMOTE_BUNDLE_ENABLED
+                            else "The function bundle is bootstrapped once inside this file."
+                        )
                     )
                 )
             ),
