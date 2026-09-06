@@ -100,14 +100,18 @@ def store_runtime_bundle(
     bundle: str,
     *,
     capability: str | None = None,
+    challenge_secret: str | None = None,
+    artifact_id: str | None = None,
     user_id=None,
     source_label: str | None = None,
     engine_version: str = "Kryos v16.2",
 ):
     """Store one bundle and return its locator, or ``None`` on failure.
 
-    ``capability`` is supplied by the VM-hidden capability mode. The legacy
-    remote mode generates its own access token when this is omitted.
+    ``capability`` is supplied by the VM-hidden capability mode. The optional
+    ``challenge_secret`` is used only by the experimental nonce/HMAC mode and
+    remains server-side. The legacy remote mode generates its own access token
+    when this is omitted.
     """
     if not isinstance(bundle, str) or not bundle.strip().startswith("return {"):
         logger.warning("Refusing to store an invalid runtime bundle")
@@ -122,7 +126,14 @@ def store_runtime_bundle(
     if collection is None:
         return None
 
-    artifact_id = secrets.token_urlsafe(18)
+    if challenge_secret is not None:
+        if not isinstance(challenge_secret, str) or not 32 <= len(challenge_secret) <= 256:
+            logger.warning("Refusing an invalid challenge secret")
+            return None
+        if capability is None:
+            capability = challenge_secret
+
+    artifact_id = artifact_id or secrets.token_urlsafe(18)
     access_token = capability or secrets.token_urlsafe(32)
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=_runtime_ttl_seconds())
@@ -136,7 +147,11 @@ def store_runtime_bundle(
         "created_at": now,
         "expires_at": expires_at,
     }
-    if capability is None:
+    if challenge_secret is not None:
+        # Experimental challenge mode keeps the verifier secret server-side.
+        # It is never returned to the website client or placed in the output.
+        document["challenge_secret"] = challenge_secret
+    elif capability is None:
         # Legacy token-URL mode keeps its optional observability metadata.
         document.update({
             "token_sha256": _sha256_text(access_token),
