@@ -933,6 +933,120 @@ __krs_bundle_env["__KRS_FUNCTION_BUNDLE_LOADER"]=__krs_bundle_loader
     return bootstrap + main_output
 
 
+def _inline_challenge_bundle(main_output: str, challenge_url: str, claim_url: str) -> str:
+    """Build a nonce/HMAC bundle loader with no reusable capability request."""
+    if not isinstance(challenge_url, str) or not challenge_url.strip():
+        raise ValueError("invalid runtime bundle challenge URL")
+    if not isinstance(claim_url, str) or not claim_url.strip():
+        raise ValueError("invalid runtime bundle claim URL")
+
+    bootstrap = (
+        "local __krs_challenge_endpoint=" + json.dumps(challenge_url) + "\n"
+        "local __krs_claim_endpoint=" + json.dumps(claim_url) + "\n"
+        "local __krs_bundle_env=(getfenv and getfenv()) or _ENV\n"
+        "local __krs_request=request or http_request\n"
+        "if not __krs_request and syn then __krs_request=syn.request end\n"
+        "if not __krs_request then error(\"Kryos challenge mode requires request API\") end\n"
+        "local __krs_band=bit32.band\n"
+        "local __krs_bor=bit32.bor\n"
+        "local __krs_bxor=bit32.bxor\n"
+        "local __krs_bnot=bit32.bnot\n"
+        "local __krs_lshift=bit32.lshift\n"
+        "local __krs_rshift=bit32.rshift\n"
+        "local function __krs_ror(__krs_x,__krs_n)\n"
+        "    return __krs_bor(__krs_rshift(__krs_x,__krs_n),__krs_lshift(__krs_x,32-__krs_n))\n"
+        "end\n"
+        "local __krs_sha256_k={\n"
+        "0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,\n"
+        "0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,\n"
+        "0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,\n"
+        "0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,\n"
+        "0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,\n"
+        "0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,\n"
+        "0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,\n"
+        "0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2}\n"
+        "local function __krs_sha256(__krs_msg)\n"
+        "    local __krs_bit_len=#__krs_msg*8\n"
+        "    __krs_msg=__krs_msg..string.char(128)\n"
+        "    while (#__krs_msg%64)~=56 do __krs_msg=__krs_msg..string.char(0) end\n"
+        "    local __krs_hi=math.floor(__krs_bit_len/4294967296)\n"
+        "    local __krs_lo=__krs_bit_len%4294967296\n"
+        "    local __krs_pad={}\n"
+        "    for __krs_shift=24,0,-8 do __krs_pad[#__krs_pad+1]=string.char(math.floor(__krs_hi/2^__krs_shift)%256) end\n"
+        "    for __krs_shift=24,0,-8 do __krs_pad[#__krs_pad+1]=string.char(math.floor(__krs_lo/2^__krs_shift)%256) end\n"
+        "    __krs_msg=__krs_msg..table.concat(__krs_pad)\n"
+        "    local __krs_h={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19}\n"
+        "    for __krs_off=1,#__krs_msg,64 do\n"
+        "        local __krs_w={}\n"
+        "        for __krs_i=1,16 do\n"
+        "            local __krs_j=__krs_off+(__krs_i-1)*4\n"
+        "            __krs_w[__krs_i]=__krs_bor(__krs_lshift(string.byte(__krs_msg,__krs_j),24),__krs_lshift(string.byte(__krs_msg,__krs_j+1),16),__krs_lshift(string.byte(__krs_msg,__krs_j+2),8),string.byte(__krs_msg,__krs_j+3))\n"
+        "        end\n"
+        "        for __krs_i=17,64 do\n"
+        "            local __krs_x=__krs_w[__krs_i-15]\n"
+        "            local __krs_y=__krs_w[__krs_i-2]\n"
+        "            local __krs_s0=__krs_bxor(__krs_ror(__krs_x,7),__krs_ror(__krs_x,18),__krs_rshift(__krs_x,3))\n"
+        "            local __krs_s1=__krs_bxor(__krs_ror(__krs_y,17),__krs_ror(__krs_y,19),__krs_rshift(__krs_y,10))\n"
+        "            __krs_w[__krs_i]=(__krs_w[__krs_i-16]+__krs_s0+__krs_w[__krs_i-7]+__krs_s1)%4294967296\n"
+        "        end\n"
+        "        local __krs_a,__krs_b,__krs_c,__krs_d=__krs_h[1],__krs_h[2],__krs_h[3],__krs_h[4]\n"
+        "        local __krs_e,__krs_f,__krs_g,__krs_hh=__krs_h[5],__krs_h[6],__krs_h[7],__krs_h[8]\n"
+        "        for __krs_i=1,64 do\n"
+        "            local __krs_s1=__krs_bxor(__krs_ror(__krs_e,6),__krs_ror(__krs_e,11),__krs_ror(__krs_e,25))\n"
+        "            local __krs_ch=__krs_bxor(__krs_band(__krs_e,__krs_f),__krs_band(__krs_bnot(__krs_e),__krs_g))\n"
+        "            local __krs_t1=(__krs_hh+__krs_s1+__krs_ch+__krs_sha256_k[__krs_i]+__krs_w[__krs_i])%4294967296\n"
+        "            local __krs_s0=__krs_bxor(__krs_ror(__krs_a,2),__krs_ror(__krs_a,13),__krs_ror(__krs_a,22))\n"
+        "            local __krs_maj=__krs_bxor(__krs_band(__krs_a,__krs_b),__krs_band(__krs_a,__krs_c),__krs_band(__krs_b,__krs_c))\n"
+        "            local __krs_t2=(__krs_s0+__krs_maj)%4294967296\n"
+        "            __krs_hh=__krs_g;__krs_g=__krs_f;__krs_f=__krs_e;__krs_e=(__krs_d+__krs_t1)%4294967296\n"
+        "            __krs_d=__krs_c;__krs_c=__krs_b;__krs_b=__krs_a;__krs_a=(__krs_t1+__krs_t2)%4294967296\n"
+        "        end\n"
+        "        __krs_h[1]=(__krs_h[1]+__krs_a)%4294967296;__krs_h[2]=(__krs_h[2]+__krs_b)%4294967296\n"
+        "        __krs_h[3]=(__krs_h[3]+__krs_c)%4294967296;__krs_h[4]=(__krs_h[4]+__krs_d)%4294967296\n"
+        "        __krs_h[5]=(__krs_h[5]+__krs_e)%4294967296;__krs_h[6]=(__krs_h[6]+__krs_f)%4294967296\n"
+        "        __krs_h[7]=(__krs_h[7]+__krs_g)%4294967296;__krs_h[8]=(__krs_h[8]+__krs_hh)%4294967296\n"
+        "    end\n"
+        "    local __krs_out={}\n"
+        "    for __krs_i=1,8 do local __krs_v=__krs_h[__krs_i];__krs_out[#__krs_out+1]=string.char(math.floor(__krs_v/16777216)%256,math.floor(__krs_v/65536)%256,math.floor(__krs_v/256)%256,__krs_v%256) end\n"
+        "    return table.concat(__krs_out)\n"
+        "end\n"
+        "local function __krs_hmac(__krs_key,__krs_msg)\n"
+        "    if #__krs_key>64 then __krs_key=__krs_sha256(__krs_key) end\n"
+        "    __krs_key=__krs_key..string.rep(string.char(0),64-#__krs_key)\n"
+        "    local __krs_i,__krs_o={} ,{}\n"
+        "    for __krs_n=1,64 do local __krs_v=string.byte(__krs_key,__krs_n);__krs_i[__krs_n]=string.char(__krs_bxor(__krs_v,0x36));__krs_o[__krs_n]=string.char(__krs_bxor(__krs_v,0x5c)) end\n"
+        "    return __krs_sha256(table.concat(__krs_o)..__krs_sha256(table.concat(__krs_i)..__krs_msg))\n"
+        "end\n"
+        "local function __krs_hex(__krs_raw)\n"
+        "    local __krs_out={}\n"
+        "    for __krs_i=1,#__krs_raw do __krs_out[#__krs_out+1]=string.format(\"%02x\",string.byte(__krs_raw,__krs_i)) end\n"
+        "    return table.concat(__krs_out)\n"
+        "end\n"
+        "local function __krs_post(__krs_url,__krs_body)\n"
+        "    local __krs_response=__krs_request({Url=__krs_url,Method=\"POST\",Headers={[\"Content-Type\"]=\"text/plain\"},Body=__krs_body})\n"
+        "    local __krs_status=__krs_response.StatusCode or __krs_response.Status or __krs_response.status_code\n"
+        "    if __krs_status and tonumber(__krs_status)>=400 then error(\"Kryos challenge request failed\") end\n"
+        "    return __krs_response.Body or __krs_response.body or __krs_response\n"
+        "end\n"
+        "local __krs_bundle_loader=function(__krs_artifact_id,__krs_secret)\n"
+        "    if type(__krs_artifact_id)~=\"string\" or type(__krs_secret)~=\"string\" then error(\"Kryos challenge identity is invalid\") end\n"
+        "    local __krs_nonce=assert(__krs_post(__krs_challenge_endpoint,__krs_artifact_id))\n"
+        "    __krs_nonce=string.match(__krs_nonce,\"^%s*(.-)%s*$\")\n"
+        "    if not __krs_nonce or #__krs_nonce<16 then error(\"Kryos challenge nonce is invalid\") end\n"
+        "    local __krs_mac=__krs_hex(__krs_hmac(__krs_secret,__krs_nonce))\n"
+        "    local __krs_source=assert(__krs_post(__krs_claim_endpoint,__krs_artifact_id..\"\\n\"..__krs_nonce..\"\\n\"..__krs_mac))\n"
+        "    if type(__krs_source)~=\"string\" or #__krs_source>15000000 or not __krs_source:match(\"^%s*return%s*{\") then error(\"Kryos challenge bundle validation failed\") end\n"
+        "    local __krs_chunk\n"
+        "    if loadstring and setfenv then __krs_chunk=assert(loadstring(__krs_source));setfenv(__krs_chunk,__krs_bundle_env)\n"
+        "    elseif load then local __krs_ok,__krs_result=pcall(load,__krs_source,nil,\"t\",__krs_bundle_env);if __krs_ok and type(__krs_result)==\"function\" then __krs_chunk=__krs_result else __krs_chunk=assert(loadstring(__krs_source)) end\n"
+        "    else __krs_chunk=assert(loadstring(__krs_source)) end\n"
+        "    return __krs_chunk()\n"
+        "end\n"
+        "__krs_bundle_env[\"__KRS_FUNCTION_BUNDLE_LOADER\"]=__krs_bundle_loader\n"
+    )
+    return bootstrap + main_output
+
+
 def _obfuscate_impl(source: str, *, with_bundle: bool, inline_bundle: bool = True):
     from obfuscator import ObfuscationError, EngineNotConfigured  # avoid cycles
 
@@ -1046,3 +1160,12 @@ def build_remote_bundle_output(
 def build_capability_bundle_output(main_output: str, endpoint_url: str) -> str:
     """Build one-file output whose VM supplies the hidden fetch capability."""
     return _inline_capability_function_bundle(main_output, endpoint_url)
+
+
+def build_challenge_bundle_output(
+    main_output: str,
+    challenge_url: str,
+    claim_url: str,
+) -> str:
+    """Build output using a one-time nonce and HMAC challenge claim."""
+    return _inline_challenge_bundle(main_output, challenge_url, claim_url)
