@@ -71,6 +71,11 @@ def load_data():
         stickied_messages = {}
 
 @bot.event
+async def on_disconnect():
+    logger.warning("Stickied bot disconnected from the Discord gateway")
+
+
+@bot.event
 async def on_ready():
     load_data()
     print(f'Stickied bot logged in as {bot.user}')
@@ -540,13 +545,13 @@ async def on_message(message):
             print(f"Error sending stickied message: {e}")
 
 def start_stickied_bot():
-    if not STICKIED_TOKEN:
-        print("ERROR: STICKIED_TOKEN environment variable not set!")
+    if not isinstance(STICKIED_TOKEN, str) or not STICKIED_TOKEN.strip():
+        logger.error("Stickied bot cannot start: STICKIED_TOKEN is missing")
         return
     try:
         bot.run(STICKIED_TOKEN)
-    except Exception as e:
-        print(f"Stickied bot error: {e}")
+    except Exception:
+        logger.exception("Stickied bot stopped during startup or reconnect")
 
 if __name__ == "__main__":
     start_stickied_bot()
