@@ -774,13 +774,7 @@ class KeyClaimView(discord.ui.View):
         duration = profile.get('key_duration_hours', 24) if profile else 24
 
         key = await asyncio.to_thread(
-            create_guild_key(
-            self.guild_id,
-            interaction.user.id,
-            interaction.user.name,
-            duration,
-            self.profile_id
-            )
+            create_guild_key, self.guild_id, interaction.user.id, interaction.user.name, duration, self.profile_id,
         )
 
         if not key:
@@ -851,13 +845,7 @@ class ProfileSelectForKey(discord.ui.Select):
             duration = profile.get('key_duration_hours', 24)
 
             key = await asyncio.to_thread(
-                create_guild_key(
-                self.guild_id,
-                interaction.user.id,
-                interaction.user.name,
-                duration,
-                profile_id
-                )
+                create_guild_key, self.guild_id, interaction.user.id, interaction.user.name, duration, profile_id,
             )
 
             if not key:
@@ -873,7 +861,7 @@ class ProfileSelectForKey(discord.ui.Select):
             embed.add_field(name="HWID Lock", value="Locks on first use", inline=True)
             embed.set_footer(text="Do not share your key. Leave the server = key revoked.")
 
-            await interaction.followup.edit_message(interaction.message.id, embed=embed, view=None)
+            await interaction.edit_original_response(embed=embed, view=None)
 
         elif profile['key_type'] == 'adlink':
             has_providers = any([
@@ -891,9 +879,10 @@ class ProfileSelectForKey(discord.ui.Select):
             )
             if pending:
                 gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{pending['token']}"
+                tut = await asyncio.to_thread(resolve_tutorial, profile)
                 view = KeyClaimView(
                     pending['token'], gateway_url, str(self.guild_id), profile_id,
-                    tutorial=resolve_tutorial(profile),
+                    tutorial=tut,
                 )
 
                 embed = discord.Embed(
@@ -901,16 +890,11 @@ class ProfileSelectForKey(discord.ui.Select):
                     description=f"You already completed verification for **{profile['name']}**. Click **Claim Key** below.",
                     color=discord.Color.green()
                 )
-                await interaction.followup.edit_message(interaction.message.id, embed=embed, view=view)
+                await interaction.edit_original_response(embed=embed, view=view)
                 return
 
             token = await asyncio.to_thread(
-                create_session(
-                self.guild_id,
-                interaction.user.id,
-                interaction.user.name,
-                profile_id
-                )
+                create_session, self.guild_id, interaction.user.id, interaction.user.name, profile_id,
             )
 
             if not token:
@@ -918,9 +902,10 @@ class ProfileSelectForKey(discord.ui.Select):
                 return
 
             gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{token}"
+            tut = await asyncio.to_thread(resolve_tutorial, profile)
             view = KeyClaimView(
                 token, gateway_url, str(self.guild_id), profile_id,
-                tutorial=resolve_tutorial(profile),
+                tutorial=tut,
             )
 
             embed = discord.Embed(title="🔑 Key Verification", color=discord.Color.blurple())
@@ -933,7 +918,7 @@ class ProfileSelectForKey(discord.ui.Select):
             )
             embed.set_footer(text="Do not share verification links.")
 
-            await interaction.followup.edit_message(interaction.message.id, embed=embed, view=view)
+            await interaction.edit_original_response(embed=embed, view=view)
 
 
 class ProfileSelectView(discord.ui.View):
@@ -1164,8 +1149,7 @@ class AddScriptModal(discord.ui.Modal):
             get_guild_config, interaction.guild.id,
         ):
             config = await asyncio.to_thread(
-                init_guild_config(
-                interaction.guild.id, interaction.guild.name, interaction.user.id)
+                init_guild_config, interaction.guild.id, interaction.guild.name, interaction.user.id,
             )
             if not config:
                 await interaction.followup.send(
@@ -1173,8 +1157,7 @@ class AddScriptModal(discord.ui.Modal):
                 return
 
         profile = await asyncio.to_thread(
-            create_script_profile(
-            interaction.guild.id, name, self.key_type, duration, role_id)
+            create_script_profile, interaction.guild.id, name, self.key_type, duration, role_id,
         )
         if not profile:
             await interaction.followup.send("❌ Failed to create profile.", ephemeral=True)
@@ -1345,7 +1328,7 @@ class ManagementView(KsPanelView):
                 links.append("Linkvertise")
             links_str = ", ".join(links) if links else "None"
             secret = (p.get("api_secret") or "")[:18]
-            tut = resolve_tutorial(p)
+            tut = await asyncio.to_thread(resolve_tutorial, p)
             tut_line = tut if tut else "None"
             embed.add_field(
                 name=f"{type_label} — {p.get('name', 'unnamed')}",
@@ -2191,13 +2174,7 @@ async def ks_getkey(interaction: discord.Interaction):
             duration = profile.get('key_duration_hours', 24)
 
             key = await asyncio.to_thread(
-                create_guild_key(
-                interaction.guild.id,
-                interaction.user.id,
-                interaction.user.name,
-                duration,
-                profile['profile_id']
-                )
+                create_guild_key, interaction.guild.id, interaction.user.id, interaction.user.name, duration, profile['profile_id'],
             )
 
             if not key:
@@ -2246,12 +2223,7 @@ async def ks_getkey(interaction: discord.Interaction):
                 return
 
             token = await asyncio.to_thread(
-                create_session(
-                interaction.guild.id,
-                interaction.user.id,
-                interaction.user.name,
-                profile['profile_id']
-                )
+                create_session, interaction.guild.id, interaction.user.id, interaction.user.name, profile['profile_id'],
             )
 
             if not token:
@@ -2437,10 +2409,7 @@ class AntiSpamChannelSelect(discord.ui.ChannelSelect):
         await interaction.response.defer(ephemeral=True)
         channels = [str(c.id) for c in self.values]
         await asyncio.to_thread(
-            update_settings(interaction.guild.id, {
-            "antispam_enabled": True,
-            "antispam_channels": channels,
-            })
+            update_settings, interaction.guild.id, {'antispam_enabled': True, 'antispam_channels': channels},
         )
         view = AntiSpamView()
         if channels:
@@ -2448,8 +2417,7 @@ class AntiSpamChannelSelect(discord.ui.ChannelSelect):
                    f"{len(channels)} selected channel(s). Pick again to change.")
         else:
             msg = "🛡️ **Applied instantly.** Protection is now ON for **every channel**."
-        await interaction.followup.edit_message(
-            interaction.message.id,
+        await interaction.edit_original_response(
             content=msg, embed=build_antispam_embed(interaction.guild), view=view)
 
 
@@ -2465,12 +2433,10 @@ class AntiSpamView(discord.ui.View):
             return
         await interaction.response.defer(ephemeral=True)
         await asyncio.to_thread(
-            update_settings(interaction.guild.id, {
-            "antispam_enabled": True, "antispam_channels": []})
+            update_settings, interaction.guild.id, {'antispam_enabled': True, 'antispam_channels': []},
         )
         view = AntiSpamView()
-        await interaction.followup.edit_message(
-            interaction.message.id,
+        await interaction.edit_original_response(
             content="🛡️ Anti-scam **enabled server-wide**.",
             embed=build_antispam_embed(interaction.guild), view=view)
 
@@ -2484,8 +2450,7 @@ class AntiSpamView(discord.ui.View):
             update_settings, interaction.guild.id, {'antispam_enabled': False},
         )
         view = AntiSpamView()
-        await interaction.followup.edit_message(
-            interaction.message.id,
+        await interaction.edit_original_response(
             content="🛑 Anti-scam **disabled**.",
             embed=build_antispam_embed(interaction.guild), view=view)
 
