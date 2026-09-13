@@ -3,6 +3,8 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import asyncio
 import concurrent.futures
+import hashlib
+import json
 import os
 import random
 import secrets
@@ -12,7 +14,8 @@ import logging
 import requests
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from config import DISCORD_TOKEN, GEMINI_API_KEY, GEMINI_MODEL
+from config import DISCORD_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, MONGODB_URI
+from pymongo import MongoClient
 from key_store import (
     create_key_for_user,
     delete_keys_by_discord_id,
@@ -56,6 +59,22 @@ logger = logging.getLogger(__name__)
 _renewal_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=2, thread_name_prefix="ks-renew"
 )
+
+# Stores the command-schema digest so we only re-sync slash commands when they
+# actually change. Timeouts are mandatory: without socketTimeoutMS a stalled read
+# blocks forever, which stops the gateway heartbeat and puts the bot offline.
+_meta_collection = None
+try:
+    if MONGODB_URI:
+        _meta_client = MongoClient(
+            MONGODB_URI,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=10000,
+        )
+        _meta_collection = _meta_client["vadrifts_bots"]["bot_meta"]
+except Exception:
+    logger.exception("Could not open bot_meta collection; command sync will run every boot")
 
 TARGET_CHANNEL_ID = 1389210900489044048
 AUTH_CHANNEL_ID = 1287714060716081183
@@ -104,9 +123,15 @@ def matched_scam_keywords(text: str):
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.presences = True
+# NOTE: intents.presences is intentionally NOT enabled. Nothing in this bot reads
+# presence data (no on_presence_update, no .activities, no member.status), and it
+# costs both a privileged intent grant and a large, constantly-churning cache.
+# On a 512MB instance that cache is what pushes the process toward an OOM kill.
 
-bot = commands.Bot(command_prefix=("!", "."), intents=intents)
+# max_messages trimmed from discord.py's default of 1000 per channel. Nothing in
+# this bot reads message history (no history() calls, no cached .messages scans),
+# so the default was holding ~1000 messages per channel in RAM for no reason.
+bot = commands.Bot(command_prefix=("!", "."), intents=intents, max_messages=200)
 
 recent_boosts = {}
 pending_tasks = {}
@@ -571,7 +596,9 @@ async def getkey(interaction: discord.Interaction):
         await interaction.response.send_message("You need the Verified role to use this command.", ephemeral=True)
         return
 
-    key = create_key_for_user(interaction.user.id, interaction.user.name, DISCORD_KEY_EXPIRY_HOURS)
+    key = await asyncio.to_thread(
+        create_key_for_user, interaction.user.id, interaction.user.name, DISCORD_KEY_EXPIRY_HOURS,
+    )
 
     if not key:
         await interaction.response.send_message("Key generation failed. Database may be unavailable. Contact the owner.", ephemeral=True)
@@ -596,7 +623,9 @@ async def resetkey(interaction: discord.Interaction):
         await interaction.response.send_message("You need the Verified role to use this command.", ephemeral=True)
         return
 
-    count = delete_keys_by_discord_id(interaction.user.id)
+    count = await asyncio.to_thread(
+        delete_keys_by_discord_id, interaction.user.id,
+    )
     if count > 0:
         await interaction.response.send_message("\u267b\ufe0f Your old key has been wiped. Use `/getkey` to generate a fresh one.", ephemeral=True)
     else:
@@ -610,7 +639,9 @@ async def revokekey(interaction: discord.Interaction, user: discord.Member):
         await interaction.response.send_message("Only the owner can use this command.", ephemeral=True)
         return
 
-    count = delete_keys_by_discord_id(user.id)
+    count = await asyncio.to_thread(
+        delete_keys_by_discord_id, user.id,
+    )
     if count > 0:
         await interaction.response.send_message(f"\U0001f5d1\ufe0f Revoked {count} key(s) for {user.mention}.", ephemeral=True)
     else:
@@ -623,7 +654,9 @@ async def keystats(interaction: discord.Interaction):
         await interaction.response.send_message("Only the owner can use this command.", ephemeral=True)
         return
 
-    stats = get_stats()
+    stats = await asyncio.to_thread(
+        get_stats,
+    )
 
     embed = discord.Embed(title="\U0001f4ca Key System Stats", color=discord.Color.blurple())
     embed.add_field(name="Total Keys", value=str(stats["total"]), inline=True)
@@ -697,7 +730,9 @@ class KeyClaimView(discord.ui.View):
 
     @discord.ui.button(label="✅ Claim Key", style=discord.ButtonStyle.success)
     async def claim_key(self, interaction: discord.Interaction, button: discord.ui.Button):
-        session = get_session(self.session_token)
+        session = await asyncio.to_thread(
+            get_session, self.session_token,
+        )
 
         if not session:
             embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
@@ -733,22 +768,28 @@ class KeyClaimView(discord.ui.View):
             await interaction.response.send_message("⚠️ Key already claimed for this session.", ephemeral=True)
             return
 
-        profile = get_script_profile(self.profile_id)
+        profile = await asyncio.to_thread(
+            get_script_profile, self.profile_id,
+        )
         duration = profile.get('key_duration_hours', 24) if profile else 24
 
-        key = create_guild_key(
+        key = await asyncio.to_thread(
+            create_guild_key(
             self.guild_id,
             interaction.user.id,
             interaction.user.name,
             duration,
             self.profile_id
+            )
         )
 
         if not key:
             await interaction.response.send_message("❌ Failed to generate key. Try again or contact an admin.", ephemeral=True)
             return
 
-        update_session(self.session_token, {"key_claimed": True})
+        await asyncio.to_thread(
+            update_session, self.session_token, {'key_claimed': True},
+        )
 
         expires_ts = int(time.time() + (duration * 3600))
 
@@ -809,12 +850,14 @@ class ProfileSelectForKey(discord.ui.Select):
         if profile['key_type'] == 'discord':
             duration = profile.get('key_duration_hours', 24)
 
-            key = create_guild_key(
+            key = await asyncio.to_thread(
+                create_guild_key(
                 self.guild_id,
                 interaction.user.id,
                 interaction.user.name,
                 duration,
                 profile_id
+                )
             )
 
             if not key:
@@ -843,7 +886,9 @@ class ProfileSelectForKey(discord.ui.Select):
                     "❌ No verification links configured for this script. Ask an admin.", ephemeral=True)
                 return
 
-            pending = get_pending_session(interaction.user.id, self.guild_id, profile_id)
+            pending = await asyncio.to_thread(
+                get_pending_session, interaction.user.id, self.guild_id, profile_id,
+            )
             if pending:
                 gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{pending['token']}"
                 view = KeyClaimView(
@@ -859,11 +904,13 @@ class ProfileSelectForKey(discord.ui.Select):
                 await interaction.followup.edit_message(interaction.message.id, embed=embed, view=view)
                 return
 
-            token = create_session(
+            token = await asyncio.to_thread(
+                create_session(
                 self.guild_id,
                 interaction.user.id,
                 interaction.user.name,
                 profile_id
+                )
             )
 
             if not token:
@@ -1101,24 +1148,34 @@ class AddScriptModal(discord.ui.Modal):
 
         await interaction.response.defer(ephemeral=True)
 
-        if get_profile_by_name(interaction.guild.id, name):
+        if await asyncio.to_thread(
+            get_profile_by_name, interaction.guild.id, name,
+        ):
             await interaction.followup.send(f"❌ A script named **{name}** already exists.", ephemeral=True)
             return
-        profiles = get_script_profiles(interaction.guild.id)
+        profiles = await asyncio.to_thread(
+            get_script_profiles, interaction.guild.id,
+        )
         if len(profiles) >= 10:
             await interaction.followup.send("❌ Maximum 10 script profiles per server.", ephemeral=True)
             return
 
-        if self.first_time or not get_guild_config(interaction.guild.id):
-            config = init_guild_config(
+        if self.first_time or not await asyncio.to_thread(
+            get_guild_config, interaction.guild.id,
+        ):
+            config = await asyncio.to_thread(
+                init_guild_config(
                 interaction.guild.id, interaction.guild.name, interaction.user.id)
+            )
             if not config:
                 await interaction.followup.send(
                     "❌ Failed to initialize. Database may be unavailable.", ephemeral=True)
                 return
 
-        profile = create_script_profile(
+        profile = await asyncio.to_thread(
+            create_script_profile(
             interaction.guild.id, name, self.key_type, duration, role_id)
+        )
         if not profile:
             await interaction.followup.send("❌ Failed to create profile.", ephemeral=True)
             return
@@ -2069,7 +2126,9 @@ class SetupLinksModal(discord.ui.Modal, title="Set Monetization Links"):
         else:
             updates['linkvertise_url'] = ''
 
-        update_script_profile(self.profile['profile_id'], updates)
+        await asyncio.to_thread(
+            update_script_profile, self.profile['profile_id'], updates,
+        )
 
         result = "Set: " + ", ".join(set_links) if set_links else "All links cleared"
         await interaction.response.send_message(f"✅ Links updated for **{self.profile['name']}**. {result}", ephemeral=True)
@@ -2131,12 +2190,14 @@ async def ks_getkey(interaction: discord.Interaction):
         if profile['key_type'] == 'discord':
             duration = profile.get('key_duration_hours', 24)
 
-            key = create_guild_key(
+            key = await asyncio.to_thread(
+                create_guild_key(
                 interaction.guild.id,
                 interaction.user.id,
                 interaction.user.name,
                 duration,
                 profile['profile_id']
+                )
             )
 
             if not key:
@@ -2166,7 +2227,9 @@ async def ks_getkey(interaction: discord.Interaction):
                     "❌ No verification links configured. Ask an admin.", ephemeral=True)
                 return
 
-            pending = get_pending_session(interaction.user.id, interaction.guild.id, profile['profile_id'])
+            pending = await asyncio.to_thread(
+                get_pending_session, interaction.user.id, interaction.guild.id, profile['profile_id'],
+            )
             if pending:
                 gateway_url = f"{SERVER_BASE_URL}/ks/gateway/{pending['token']}"
                 view = KeyClaimView(
@@ -2182,11 +2245,13 @@ async def ks_getkey(interaction: discord.Interaction):
                 await interaction.followup.send(embed=embed, view=view, ephemeral=True)
                 return
 
-            token = create_session(
+            token = await asyncio.to_thread(
+                create_session(
                 interaction.guild.id,
                 interaction.user.id,
                 interaction.user.name,
                 profile['profile_id']
+                )
             )
 
             if not token:
@@ -2221,19 +2286,27 @@ async def ks_getkey(interaction: discord.Interaction):
 @ks_group.command(name="resetkey", description="Reset your key and HWID lock for a script.")
 @app_commands.describe(script_name="Name of the script (leave empty to reset all)")
 async def ks_resetkey(interaction: discord.Interaction, script_name: str = None):
-    config = get_guild_config(interaction.guild.id)
+    config = await asyncio.to_thread(
+        get_guild_config, interaction.guild.id,
+    )
     if not config:
         await interaction.response.send_message("❌ Key system not set up.", ephemeral=True)
         return
 
     if script_name:
-        profile = get_profile_by_name(interaction.guild.id, script_name)
+        profile = await asyncio.to_thread(
+            get_profile_by_name, interaction.guild.id, script_name,
+        )
         if not profile:
             await interaction.response.send_message(f"❌ No script named **{script_name}** found.", ephemeral=True)
             return
-        count = delete_guild_keys_by_user(interaction.guild.id, interaction.user.id, profile['profile_id'])
+        count = await asyncio.to_thread(
+            delete_guild_keys_by_user, interaction.guild.id, interaction.user.id, profile['profile_id'],
+        )
     else:
-        count = delete_guild_keys_by_user(interaction.guild.id, interaction.user.id)
+        count = await asyncio.to_thread(
+            delete_guild_keys_by_user, interaction.guild.id, interaction.user.id,
+        )
 
     if count > 0:
         await interaction.response.send_message(
@@ -2246,20 +2319,26 @@ async def ks_resetkey(interaction: discord.Interaction, script_name: str = None)
 @app_commands.describe(user="User whose key to revoke", script_name="Script name (optional)")
 @app_commands.checks.has_permissions(administrator=True)
 async def ks_revokekey(interaction: discord.Interaction, user: discord.Member, script_name: str = None):
-    config = get_guild_config(interaction.guild.id)
+    config = await asyncio.to_thread(
+        get_guild_config, interaction.guild.id,
+    )
     if not config:
         await interaction.response.send_message("❌ Key system not set up.", ephemeral=True)
         return
 
     profile_id = None
     if script_name:
-        profile = get_profile_by_name(interaction.guild.id, script_name)
+        profile = await asyncio.to_thread(
+            get_profile_by_name, interaction.guild.id, script_name,
+        )
         if not profile:
             await interaction.response.send_message(f"❌ No script named **{script_name}** found.", ephemeral=True)
             return
         profile_id = profile['profile_id']
 
-    count = delete_guild_keys_by_user(interaction.guild.id, user.id, profile_id)
+    count = await asyncio.to_thread(
+        delete_guild_keys_by_user, interaction.guild.id, user.id, profile_id,
+    )
     if count > 0:
         await interaction.response.send_message(f"🗑️ Revoked {count} key(s) for {user.mention}.", ephemeral=True)
     else:
@@ -2270,7 +2349,9 @@ async def ks_revokekey(interaction: discord.Interaction, user: discord.Member, s
 @app_commands.describe(script_name="Script name (optional)")
 @app_commands.checks.has_permissions(administrator=True)
 async def ks_stats(interaction: discord.Interaction, script_name: str = None):
-    config = get_guild_config(interaction.guild.id)
+    config = await asyncio.to_thread(
+        get_guild_config, interaction.guild.id,
+    )
     if not config:
         await interaction.response.send_message("❌ Key system not set up.", ephemeral=True)
         return
@@ -2278,14 +2359,18 @@ async def ks_stats(interaction: discord.Interaction, script_name: str = None):
     profile_id = None
     title_suffix = ""
     if script_name:
-        profile = get_profile_by_name(interaction.guild.id, script_name)
+        profile = await asyncio.to_thread(
+            get_profile_by_name, interaction.guild.id, script_name,
+        )
         if not profile:
             await interaction.response.send_message(f"❌ No script named **{script_name}** found.", ephemeral=True)
             return
         profile_id = profile['profile_id']
         title_suffix = f" — {script_name}"
 
-    stats = get_guild_key_stats(interaction.guild.id, profile_id)
+    stats = await asyncio.to_thread(
+        get_guild_key_stats, interaction.guild.id, profile_id,
+    )
 
     embed = discord.Embed(
         title=f"📊 Key Stats{title_suffix}",
@@ -2297,18 +2382,24 @@ async def ks_stats(interaction: discord.Interaction, script_name: str = None):
     embed.add_field(name="⌛ Expired", value=str(stats['expired']), inline=True)
     embed.add_field(name="🔒 HWID Locked", value=str(stats['hwid_locked']), inline=True)
     if not script_name:
-        profiles = get_script_profiles(interaction.guild.id)
+        profiles = await asyncio.to_thread(
+            get_script_profiles, interaction.guild.id,
+        )
         if profiles:
             lines = []
             for p in profiles:
-                pstats = get_guild_key_stats(interaction.guild.id, p['profile_id'])
+                pstats = await asyncio.to_thread(
+                    get_guild_key_stats, interaction.guild.id, p['profile_id'],
+                )
                 type_emoji = "🔗" if p['key_type'] == 'adlink' else "💬"
                 lines.append(
                     f"{type_emoji} **{p['name']}** — {pstats['active']} active / {pstats['total']} total"
                 )
             embed.add_field(name="Per Script", value="\n".join(lines), inline=False)
 
-    recent = list_recent_keys(interaction.guild.id, profile_id, limit=10)
+    recent = await asyncio.to_thread(
+        list_recent_keys, interaction.guild.id, profile_id, 10,
+    )
     if recent:
         rows = []
         for k in recent:
@@ -2345,10 +2436,12 @@ class AntiSpamChannelSelect(discord.ui.ChannelSelect):
             return
         await interaction.response.defer(ephemeral=True)
         channels = [str(c.id) for c in self.values]
-        update_settings(interaction.guild.id, {
+        await asyncio.to_thread(
+            update_settings(interaction.guild.id, {
             "antispam_enabled": True,
             "antispam_channels": channels,
-        })
+            })
+        )
         view = AntiSpamView()
         if channels:
             msg = ("🛡️ **Applied instantly.** Protection is now ON for the "
@@ -2371,8 +2464,10 @@ class AntiSpamView(discord.ui.View):
             await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        update_settings(interaction.guild.id, {
+        await asyncio.to_thread(
+            update_settings(interaction.guild.id, {
             "antispam_enabled": True, "antispam_channels": []})
+        )
         view = AntiSpamView()
         await interaction.followup.edit_message(
             interaction.message.id,
@@ -2385,7 +2480,9 @@ class AntiSpamView(discord.ui.View):
             await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        update_settings(interaction.guild.id, {"antispam_enabled": False})
+        await asyncio.to_thread(
+            update_settings, interaction.guild.id, {'antispam_enabled': False},
+        )
         view = AntiSpamView()
         await interaction.followup.edit_message(
             interaction.message.id,
@@ -2603,7 +2700,9 @@ async def antispam_setup(interaction: discord.Interaction):
 @bot.event
 async def on_member_remove(member):
     if is_owner_guild(member.guild.id):
-        count = delete_keys_by_discord_id(member.id)
+        count = await asyncio.to_thread(
+            delete_keys_by_discord_id, member.id,
+        )
         if count > 0:
             log_channel = bot.get_channel(LOG_CHANNEL_ID)
             if log_channel:
@@ -2613,9 +2712,13 @@ async def on_member_remove(member):
                 embed.add_field(name="Keys Revoked", value=str(count), inline=False)
                 await log_channel.send(embed=embed)
 
-    guild_config = get_guild_config(member.guild.id)
+    guild_config = await asyncio.to_thread(
+        get_guild_config, member.guild.id,
+    )
     if guild_config:
-        guild_count = delete_guild_keys_by_user(member.guild.id, member.id)
+        guild_count = await asyncio.to_thread(
+            delete_guild_keys_by_user, member.guild.id, member.id,
+        )
         if guild_count > 0:
             try:
                 guild_owner = member.guild.owner
@@ -2866,6 +2969,37 @@ async def before_renewal_email_reminder_loop():
     await bot.wait_until_ready()
 
 
+def _command_schema_digest():
+    """SHA256 of the registered slash-command schema. Used to skip re-syncing when
+    nothing changed, which is what caused the repeated 429s on every restart."""
+    def dump(c):
+        return [c.name, getattr(c, "description", "") or "",
+                sorted([(p.name, str(p.type)) for p in getattr(c, "_params", {}).values()]
+                       if hasattr(c, "_params") else [])]
+    payload = {
+        "global": sorted([dump(c) for c in bot.tree.get_commands(guild=None)], key=repr),
+        "owner": sorted([dump(c) for c in bot.tree.get_commands(guild=discord.Object(id=OWNER_GUILD_ID))], key=repr),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+def _load_synced_digest():
+    if _meta_collection is None:
+        return None
+    try:
+        doc = _meta_collection.find_one({"_id": "command_schema"})
+        return doc.get("digest") if doc else None
+    except Exception:
+        logger.exception("Could not read stored command schema digest")
+        return None
+
+def _store_synced_digest(digest):
+    if _meta_collection is None:
+        return
+    try:
+        _meta_collection.update_one({"_id": "command_schema"}, {"$set": {"digest": digest}}, upsert=True)
+    except Exception:
+        logger.exception("Could not store command schema digest")
+
 @bot.event
 async def on_disconnect():
     logger.warning("Main bot disconnected from the Discord gateway")
@@ -2877,11 +3011,15 @@ async def on_ready():
     if not renewal_email_reminder_loop.is_running():
         renewal_email_reminder_loop.start()
 
-    expired = cleanup_expired()
+    expired = await asyncio.to_thread(
+        cleanup_expired,
+    )
     if expired > 0:
         print(f"Cleaned up {expired} expired premium keys")
 
-    guild_expired = cleanup_expired_guild_keys()
+    guild_expired = await asyncio.to_thread(
+        cleanup_expired_guild_keys,
+    )
     if guild_expired > 0:
         print(f"Cleaned up {guild_expired} expired guild keys")
 
@@ -2904,15 +3042,26 @@ async def on_ready():
         }
         current_owner = await bot.http.get_guild_commands(bot.user.id, OWNER_GUILD_ID)
         stale_owner = [c["id"] for c in current_owner if c["name"] not in legacy_names]
-        for cmd_id in stale_owner:
-            await bot.http.delete_guild_command(bot.user.id, OWNER_GUILD_ID, cmd_id)
-            print(f"Deleted stale/duplicate owner-guild command {cmd_id}")
+        # Global command sync is rate limited hard. Doing it on every boot (and every
+        # gateway reconnect) is what produced the "too many requests" errors. Skip it
+        # unless the schema actually changed, something is stale, or FORCE_COMMAND_SYNC=1.
+        digest = _command_schema_digest()
+        stored = await asyncio.to_thread(_load_synced_digest)
+        force = os.environ.get("FORCE_COMMAND_SYNC") == "1"
+        if not force and digest == stored and not stale_global and not stale_owner:
+            print("Command schema unchanged, skipping sync (set FORCE_COMMAND_SYNC=1 to override)")
+        else:
+            for cmd_id in stale_owner:
+                await bot.http.delete_guild_command(bot.user.id, OWNER_GUILD_ID, cmd_id)
+                print(f"Deleted stale/duplicate owner-guild command {cmd_id}")
 
-        global_synced = await bot.tree.sync()
-        print(f"Synced {len(global_synced)} global commands (removed {len(stale_global)} stale)")
+            global_synced = await bot.tree.sync()
+            print(f"Synced {len(global_synced)} global commands (removed {len(stale_global)} stale)")
 
-        synced = await bot.tree.sync(guild=owner_guild)
-        print(f"Synced {len(synced)} legacy commands to owner guild (removed {len(stale_owner)} stale/duplicate)")
+            synced = await bot.tree.sync(guild=owner_guild)
+            print(f"Synced {len(synced)} legacy commands to owner guild (removed {len(stale_owner)} stale)")
+
+            await asyncio.to_thread(_store_synced_digest, digest)
 
     except discord.HTTPException as e:
         if e.status == 429:
