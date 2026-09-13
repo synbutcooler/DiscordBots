@@ -8,6 +8,9 @@ from config import DISCORD_TOKEN, DISCORD_KEY_API_SECRET
 from key_store import get_key, delete_key, lock_hwid, GUILD_ID
 from discord_bot import start_bot
 from stickied_message_bot import start_stickied_bot
+# Imported for the /health gateway probe only.
+from discord_bot import bot as main_bot
+from stickied_message_bot import bot as stickied_bot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,9 +34,47 @@ def keep_alive_loop():
             logger.warning(f"Keep-alive ping failed: {e}")
         time.sleep(600)
 
+def _run_forever(label, target):
+    """Keep a bot alive. Without this, one exception kills the daemon thread and
+    Flask goes on serving /health 200 while the bot is permanently offline."""
+    backoff = 5
+    while True:
+        try:
+            target()
+        except Exception:
+            logger.exception("%s stopped unexpectedly", label)
+        logger.warning("%s is down; restarting in %ss", label, backoff)
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 300)   # cap at 5 minutes
+        # A successful long run would ideally reset backoff, but bot.run() only
+        # returns when the client has already died, so we never see that here.
+
 @app.route('/health')
 def health():
-    return jsonify({"status": "healthy"}), 200
+    """Report real gateway state. A hardcoded 200 hides a dead bot from Render,
+    from uptime monitors, and from you."""
+    def probe(b):
+        """Gateway round-trip in ms, or None if this bot is not connected.
+        latency is NaN until the first heartbeat completes, and jsonify(nan)
+        emits invalid JSON, so NaN is mapped to None."""
+        try:
+            ws = getattr(b, "ws", None)
+            if ws is None or ws.is_closed():
+                return None
+            ms = b.latency * 1000
+            if ms != ms or ms in (float("inf"), float("-inf")):   # NaN / inf
+                return None
+            return round(ms, 1)
+        except Exception:
+            return None
+
+    main_ms, stickied_ms = probe(main_bot), probe(stickied_bot)
+    ok = main_ms is not None and stickied_ms is not None
+    return jsonify({
+        "status": "healthy" if ok else "degraded",
+        "main_bot_gateway_ms": main_ms,
+        "stickied_bot_gateway_ms": stickied_ms,
+    }), (200 if ok else 503)
 
 @app.route('/')
 def index():
@@ -111,14 +152,16 @@ if __name__ == '__main__':
                 "DISCORD_TOKEN and STICKIED_TOKEN are identical. They must be two different Discord bot tokens."
             )
         logger.info("Starting main bot...")
-        bot_thread = threading.Thread(target=start_bot, daemon=True, name="main-discord-bot")
+        bot_thread = threading.Thread(
+            target=_run_forever, args=("Main bot", start_bot),
+            daemon=True, name="main-discord-bot",
+        )
         bot_thread.start()
         time.sleep(10)
         logger.info("Starting stickied message bot...")
         stickied_bot_thread = threading.Thread(
-            target=start_stickied_bot,
-            daemon=True,
-            name="stickied-discord-bot",
+            target=_run_forever, args=("Stickied bot", start_stickied_bot),
+            daemon=True, name="stickied-discord-bot",
         )
         stickied_bot_thread.start()
 
