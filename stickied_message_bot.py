@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import hashlib
 import discord
 import asyncio
 import logging
@@ -15,7 +16,12 @@ stickied_collection = None
 
 try:
     if MONGODB_URI:
-        mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        mongo_client = MongoClient(
+            MONGODB_URI,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=10000,
+        )
         mongo_client.admin.command('ping')
         stickied_db = mongo_client["vadrifts_bots"]
         stickied_collection = stickied_db["stickied_messages"]
@@ -30,22 +36,30 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.webhooks = True
-bot = commands.Bot(command_prefix="?", intents=intents)
+# max_messages trimmed from the 1000 default; this bot never reads history.
+bot = commands.Bot(command_prefix="?", intents=intents, max_messages=200)
 
 stickied_messages = {}
 
-def save_data():
+def save_channel(channel_key):
+    """Persist one channel. Called from the event loop, so always via to_thread."""
     if stickied_collection is None:
         return
     try:
-        for channel_key, data in stickied_messages.items():
-            stickied_collection.update_one(
-                {"channel_key": channel_key},
-                {"$set": {"channel_key": channel_key, "data": data}},
-                upsert=True
-            )
+        stickied_collection.update_one(
+            {"channel_key": channel_key},
+            {"$set": {"channel_key": channel_key, "data": stickied_messages[channel_key]}},
+            upsert=True
+        )
     except Exception as e:
-        logger.error(f"MongoDB save failed: {e}")
+        logger.error(f"MongoDB save failed for {channel_key}: {e}")
+
+def save_data():
+    """Persist everything. Kept for callers that legitimately need a full flush."""
+    if stickied_collection is None:
+        return
+    for channel_key in list(stickied_messages.keys()):
+        save_channel(channel_key)
 
 def delete_data(channel_key):
     if stickied_collection is None:
@@ -75,14 +89,53 @@ async def on_disconnect():
     logger.warning("Stickied bot disconnected from the Discord gateway")
 
 
+def _command_schema_digest():
+    """SHA256 of the registered slash-command schema, so we can skip re-syncing
+    when nothing changed. Re-syncing global commands on every boot is what
+    produced the repeated 429 'too many requests' errors."""
+    def dump(c):
+        return [c.name, getattr(c, "description", "") or "",
+                sorted([(p.name, str(p.type)) for p in getattr(c, "_params", {}).values()]
+                       if hasattr(c, "_params") else [])]
+    payload = sorted([dump(c) for c in bot.tree.get_commands(guild=None)], key=repr)
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+def _load_synced_digest():
+    if stickied_collection is None:
+        return None
+    try:
+        doc = stickied_collection.database["bot_meta"].find_one({"_id": "stickied_command_schema"})
+        return doc.get("digest") if doc else None
+    except Exception:
+        logger.exception("Could not read stored command schema digest")
+        return None
+
+def _store_synced_digest(digest):
+    if stickied_collection is None:
+        return
+    try:
+        stickied_collection.database["bot_meta"].update_one(
+            {"_id": "stickied_command_schema"}, {"$set": {"digest": digest}}, upsert=True)
+    except Exception:
+        logger.exception("Could not store command schema digest")
+
 @bot.event
 async def on_ready():
-    load_data()
+    # load_data() hits Mongo; keep it off the event loop so the gateway heartbeat
+    # keeps flowing while it runs.
+    await asyncio.to_thread(load_data)
     print(f'Stickied bot logged in as {bot.user}')
     try:
         await asyncio.sleep(3)
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} global commands")
+        digest = _command_schema_digest()
+        stored = await asyncio.to_thread(_load_synced_digest)
+        force = os.environ.get("FORCE_COMMAND_SYNC") == "1"
+        if not force and digest == stored:
+            print("Command schema unchanged, skipping sync (set FORCE_COMMAND_SYNC=1 to override)")
+        else:
+            synced = await bot.tree.sync()
+            print(f"Synced {len(synced)} global commands")
+            await asyncio.to_thread(_store_synced_digest, digest)
     except discord.HTTPException as e:
         if e.status == 429:
             print("Rate limited - commands already synced, skipping")
@@ -154,7 +207,7 @@ async def stick(
         "webhook_name": webhook_name,
         "webhook_avatar": webhook_avatar
     }
-    save_data()
+    await asyncio.to_thread(save_channel, channel_key)
 
     try:
         if use_webhook:
@@ -170,7 +223,7 @@ async def stick(
 
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-        save_data()
+        await asyncio.to_thread(save_channel, channel_key)
 
         await interaction.followup.send(f"Stickied message set in {target_channel.mention}!")
     except Exception as e:
@@ -191,7 +244,7 @@ async def stick_prefix(ctx, *, message: str):
         "webhook_name": None,
         "webhook_avatar": None
     }
-    save_data()
+    await asyncio.to_thread(save_channel, channel_key)
 
     try:
         await ctx.message.delete()
@@ -202,7 +255,7 @@ async def stick_prefix(ctx, *, message: str):
         msg = await ctx.channel.send(message)
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-        save_data()
+        await asyncio.to_thread(save_channel, channel_key)
 
         confirm = await ctx.send("Stickied message set!")
         await confirm.delete(delay=3)
@@ -223,7 +276,7 @@ async def set_cooldown(ctx, seconds: int):
         return
 
     stickied_messages[channel_key]["cooldown"] = seconds
-    save_data()
+    await asyncio.to_thread(save_channel, channel_key)
 
     try:
         await ctx.message.delete()
@@ -248,7 +301,7 @@ async def stick_webhook_prefix(ctx, webhook_name: str, *, message: str):
         "webhook_name": webhook_name,
         "webhook_avatar": None
     }
-    save_data()
+    await asyncio.to_thread(save_channel, channel_key)
 
     try:
         await ctx.message.delete()
@@ -264,7 +317,7 @@ async def stick_webhook_prefix(ctx, webhook_name: str, *, message: str):
         )
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-        save_data()
+        await asyncio.to_thread(save_channel, channel_key)
 
         confirm = await ctx.send("Stickied webhook message set!")
         await confirm.delete(delay=3)
@@ -285,7 +338,7 @@ async def unstick_prefix(ctx):
                 pass
 
         del stickied_messages[channel_key]
-        delete_data(channel_key)
+        await asyncio.to_thread(delete_data, channel_key)
 
         try:
             await ctx.message.delete()
@@ -337,7 +390,7 @@ async def stickembed(
         "webhook_name": webhook_name,
         "webhook_avatar": webhook_avatar
     }
-    save_data()
+    await asyncio.to_thread(save_channel, channel_key)
 
     try:
         embed = create_embed_from_data(embed_data)
@@ -355,7 +408,7 @@ async def stickembed(
 
         stickied_messages[channel_key]["last_message"] = msg.id
         stickied_messages[channel_key]["last_sent"] = time.time()
-        save_data()
+        await asyncio.to_thread(save_channel, channel_key)
 
         await interaction.followup.send(f"Stickied embed set in {target_channel.mention}!")
     except Exception as e:
@@ -378,7 +431,7 @@ async def unstick(interaction: discord.Interaction, channel: discord.TextChannel
                 pass
 
         del stickied_messages[channel_key]
-        delete_data(channel_key)
+        await asyncio.to_thread(delete_data, channel_key)
         await interaction.followup.send(f"Stickied message removed from {target_channel.mention}.")
     else:
         await interaction.followup.send(f"No stickied message in {target_channel.mention}.")
@@ -540,7 +593,7 @@ async def on_message(message):
 
             stickied_messages[channel_key]["last_message"] = new_msg.id
             stickied_messages[channel_key]["last_sent"] = time.time()
-            save_data()
+            await asyncio.to_thread(save_channel, channel_key)
         except Exception as e:
             print(f"Error sending stickied message: {e}")
 
