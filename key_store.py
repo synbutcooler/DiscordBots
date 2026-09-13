@@ -18,7 +18,12 @@ def init_db():
         if not MONGODB_URI:
             logger.error("MONGODB_URI is not set!")
             return False
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        client = MongoClient(
+            MONGODB_URI,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=10000,
+        )
         client.admin.command('ping')
         db = client["vadrifts_bots"]
         keys_collection = db["discord_keys"]
