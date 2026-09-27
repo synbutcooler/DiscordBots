@@ -2809,6 +2809,12 @@ async def on_message(message):
                     )
                 await send_mommy_message_reply(message, reply, sticker_name)
                 mommy_handled = True
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    logger.warning("Hit global 429; dropping mommy reply")
+                    mommy_handled = True
+                    return
+                raise
             except MommyCooldownError as exc:
                 if exc.spam_count <= 2:
                     await message.reply(
